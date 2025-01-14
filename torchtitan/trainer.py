@@ -17,7 +17,7 @@ import torch
 import torch.distributed.checkpoint.stateful
 import tyro
 from torch.distributed.elastic.multiprocessing.errors import record
-
+from torchtitan.hf_datasets.text_datasets import inter_snapshot_every_n_steps
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX, LossFunction
@@ -191,9 +191,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         torch._C._log_api_usage_once("torchtitan.train")
 
         self.config = config
-        assert (
-            config.model_spec is not None
-        ), "model_spec must be set before creating Trainer"
+        assert config.model_spec is not None, (
+            "model_spec must be set before creating Trainer"
+        )
         model_spec = config.model_spec
 
         device_module, device_type = utils.device_module, utils.device_type
@@ -218,7 +218,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.gc_handler = utils.GarbageCollection(
             gc_freq=config.training.gc_freq, debug=config.training.gc_debug
         )
-
         # Set random seed, and maybe enable deterministic mode
         # (mainly for debugging, expect perf loss).
         dist_utils.set_determinism(
@@ -228,11 +227,38 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             distinct_seed_mesh_dims=["pp"],
         )
 
+        # verify batch sizes
+        global_batch_size = config.training.global_batch_size
+        if global_batch_size < 0:
+            # This global batch size results in 1 gradient accumulation
+            # step.
+            global_batch_size = config.training.local_batch_size * batch_degree
+        assert global_batch_size > 0
+        assert (
+            global_batch_size % (config.training.local_batch_size * batch_degree) == 0
+        ), (
+            f"global batch size must be multiple of local batch size times "
+            f"data-parallel degree ({global_batch_size} "
+            f"% ({config.training.local_batch_size} * {batch_degree}) != 0)"
+        )
+
+        # calculate gradient accumulation steps
+        self.gradient_accumulation_steps = global_batch_size // (
+            config.training.local_batch_size * batch_degree
+        )
+        assert self.gradient_accumulation_steps > 0
+
         # build tokenizer
         self.tokenizer = (
             config.tokenizer.build(tokenizer_path=config.hf_assets_path)
             if config.tokenizer is not None
             else None
+        )
+
+        snapshot_every_n_steps = inter_snapshot_every_n_steps(
+            checkpoint_enabled=config.checkpoint.enable,
+            checkpoint_interval=config.checkpoint.interval,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
         )
 
         # build dataloader
@@ -242,6 +268,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             tokenizer=self.tokenizer,
             seq_len=config.training.seq_len,
             local_batch_size=config.training.local_batch_size,
+            snapshot_every_n_steps=snapshot_every_n_steps,
+            seed=config.debug.seed,
         )
 
         # build model (using meta init)
@@ -307,27 +335,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.loss_fn = model_spec.build_loss_fn(
             config.compile, parallel_dims=parallel_dims
         )
-
-        # verify batch sizes
-        global_batch_size = config.training.global_batch_size
-        if global_batch_size < 0:
-            # This global batch size results in 1 gradient accumulation
-            # step.
-            global_batch_size = config.training.local_batch_size * batch_degree
-        assert global_batch_size > 0
-        assert (
-            global_batch_size % (config.training.local_batch_size * batch_degree) == 0
-        ), (
-            f"global batch size must be multiple of local batch size times "
-            f"data-parallel degree ({global_batch_size} "
-            f"% ({config.training.local_batch_size} * {batch_degree}) != 0)"
-        )
-
-        # calculate gradient accumulation steps
-        self.gradient_accumulation_steps = global_batch_size // (
-            config.training.local_batch_size * batch_degree
-        )
-        assert self.gradient_accumulation_steps > 0
 
         # apply parallelisms and initialization
         if parallel_dims.pp_enabled:
@@ -591,9 +598,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         attn_config = getattr(layer, "attention", None) if layer else None
         attn_backend = getattr(attn_config, "attn_backend", "sdpa")
         if attn_backend in ["flex", "varlen"]:
-            assert (
-                self.tokenizer is not None
-            ), "tokenizer is required for flex/varlen attention"
+            assert self.tokenizer is not None, (
+                "tokenizer is required for flex/varlen attention"
+            )
             model = cast(Decoder, self.model_parts[0])
             extra_kwargs["attention_masks"] = model.get_attention_masks(
                 input_batch=inputs,
