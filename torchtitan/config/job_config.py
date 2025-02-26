@@ -245,6 +245,9 @@ class Training:
     dataset_inner_name: str | None = None
     """Dataset name to use (`name` argument of `datasets.load_dataset`)"""
 
+    dataset_files: list[str] | None = None
+    """Dataset files to use (only necessary for certain types of datasets)"""
+
     dataset_split: str = "train"
     """Dataset split to use"""
 
@@ -948,6 +951,9 @@ class Validation:
 
     dataset_inner_name: str | None = None
     """Dataset name to use for validation (`name` argument of `datasets.load_dataset`)"""
+
+    dataset_files: list[str] | None = None
+    """Dataset files to use for validation (only necessary for certain types of datasets)"""
 
     dataset_split: str = "train"
     """Dataset split to use for validation"""
