@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from random import Random
 
@@ -87,7 +87,7 @@ DATASETS = {
         loader=partial(_load_simple_dataset, dataset_split="train"),
         text_processor=partial(_process_simple_text, key="text"),
     ),
-    "c4_validation": DatasetConfig(
+    "c4_validation": DatasetArgs(
         path="allenai/c4",
         loader=partial(_load_c4_dataset, dataset_split="validation"),
         text_processor=partial(_process_simple_text, key="text"),
@@ -520,6 +520,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         dp_world_size: int = 1,
         infinite: bool = False,
         dataset_inner_name: str | None = None,
+        dataset_files: str | Sequence[str] | None = None,
         dataset_split: str = "train",
         dataset_streaming: bool = False,
         dataset_key: str = "text",
@@ -531,6 +532,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
             dataset_name=dataset_name,
             dataset_path=dataset_path,
             dataset_inner_name=dataset_inner_name,
+            dataset_files=dataset_files,
             dataset_split=dataset_split,
             dataset_streaming=dataset_streaming,
             dataset_key=dataset_key,
