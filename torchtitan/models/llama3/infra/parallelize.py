@@ -29,7 +29,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
-from torchtitan.models.llama3.model.model import BitNetTransformerBlock
+from torchtitan.models.llama3.model.bitnet_model import BitNetTransformerBlock
 from torchtitan.tools.logging import logger
 
 
