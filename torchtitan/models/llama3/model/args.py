@@ -44,6 +44,7 @@ class TransformerModelArgs(BaseModelArgs):
     # If `True`, then each transformer block init uses its layer ID, and if
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
+    qk_norm: bool = False
 
     attn_type: str = "sdpa"
     attn_mask_type: str = "causal"
