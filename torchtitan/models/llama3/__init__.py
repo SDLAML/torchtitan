@@ -57,7 +57,7 @@ llama3_args = {
         multiple_of=1024,
         rope_theta=500000,
     ),
-    "8B_flex": TransformerModelArgs(
+    "8B_qk": TransformerModelArgs(
         dim=4096,
         n_layers=32,
         n_heads=32,
@@ -65,19 +65,7 @@ llama3_args = {
         ffn_dim_multiplier=1.3,
         multiple_of=1024,
         rope_theta=500000,
-        attn_type="flex",
-        attn_mask_type="block_causal",
-    ),
-    "8B_varlen": TransformerModelArgs(
-        dim=4096,
-        n_layers=32,
-        n_heads=32,
-        n_kv_heads=8,
-        ffn_dim_multiplier=1.3,
-        multiple_of=1024,
-        rope_theta=500000,
-        attn_type="varlen",
-        attn_mask_type="block_causal",
+        qk_norm=True,
     ),
     "70B": TransformerModelArgs(
         dim=8192,
