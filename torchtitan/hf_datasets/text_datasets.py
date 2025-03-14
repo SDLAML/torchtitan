@@ -92,6 +92,14 @@ DATASETS = {
         loader=partial(_load_c4_dataset, dataset_split="validation"),
         text_processor=partial(_process_simple_text, key="text"),
     ),
+    "fineweb": DatasetArgs(
+        path="HuggingFaceFW/fineweb",
+        name="default",
+        files=None,
+        split="train",
+        streaming=True,
+        key="text",
+    ),
     "simple_custom": None,
 }
 
