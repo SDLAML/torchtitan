@@ -454,6 +454,7 @@ class MetricsProcessor(Configurable):
         global_max_loss: float,
         grad_norm: float,
         extra_metrics: dict[str, Any] | None = None,
+        extra_print_data: str = "",
     ):
         """
         Log training metrics including loss, throughput, and memory statistics.
@@ -521,6 +522,7 @@ class MetricsProcessor(Configurable):
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
             f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
+            f"{extra_print_data}"
         )
 
         self.ntokens_since_last_log = 0
