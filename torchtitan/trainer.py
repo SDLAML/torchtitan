@@ -412,7 +412,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
 
         # build optimizer after applying parallelisms to the model
-        self.optimizers = config.optimizer.build(model_parts=self.model_parts)
+        self.optimizers = config.optimizer.build(
+            model_parts=self.model_parts, parallel_dims=parallel_dims
+        )
         if model_spec.post_optimizer_build_fn is not None:
             model_spec.post_optimizer_build_fn(
                 self.optimizers, self.model_parts, parallel_dims
