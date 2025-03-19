@@ -527,6 +527,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
+        num_mtp_tokens: int = 0,
         dataset_inner_name: str | None = None,
         dataset_files: str | Sequence[str] | None = None,
         dataset_split: str = "train",
@@ -552,6 +553,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         self._tokenizer = tokenizer
         self.seq_len = seq_len
         self.infinite = infinite
+        self.num_mtp_tokens = num_mtp_tokens
         self._text_processor = text_processor
 
         # Variables for checkpointing
@@ -570,7 +572,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         return iter(self._data)
 
     def __iter__(self):
-        max_buffer_token_len = 1 + self.seq_len
+        max_buffer_token_len = 1 + self.seq_len + self.num_mtp_tokens
 
         while True:
             for sample in self._get_data_iter():
