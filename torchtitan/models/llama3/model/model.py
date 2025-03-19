@@ -497,6 +497,17 @@ class Transformer(ModelProtocol):
         )
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
 
+        # Optionally add MTP modules.
+        if model_args.num_mtp_modules > 0:
+            self.mtp_layers = torch.nn.ModuleDict()
+            for mtp_layer_id in range(model_args.num_mtp_modules):
+                layer_id = mtp_layer_id + model_args.n_layers
+                self.mtp_layers[str(mtp_layer_id)] = MTPModule(
+                    layer_id,
+                    model_args,
+                    self,
+                )
+
     def init_weights(
         self,
         buffer_device: torch.device | None = None,
@@ -532,6 +543,10 @@ class Transformer(ModelProtocol):
                 a=-cutoff_factor * final_out_std,
                 b=cutoff_factor * final_out_std,
             )
+        if self.model_args.num_mtp_modules > 0:
+            for layer in self.mtp_layers.values():
+                if layer is not None:
+                    layer.init_weights()
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
         return precompute_freqs_cis(
@@ -591,25 +606,38 @@ class Transformer(ModelProtocol):
 
     def forward(
         self,
-        tokens: torch.Tensor,
+        tokens_list: list[torch.Tensor | None] | torch.Tensor,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
+        prev_embed: torch.Tensor | None = None,
     ):
         """
         Perform a forward pass through the Transformer model.
 
         Args:
-            tokens (torch.Tensor): Input token indices if pipeline parallelism is not enabled.
+            tokens_list (Union[list[torch.Tensor | None], torch.Tensor]):
+                Input token indices if pipeline parallelism is not enabled.
                 If pipeline parallelism is enabled, this will be the input token indices
                 for the ranks on the first pipeline stage. This will be the activation of the
                 previous pipeline stage if the current rank is not on the first stage.
             attention_masks (AttentionMasksType | None): Masks used when calculating attention scores.
             positions (torch.Tensor | None): Position indices used to access/shuffle RoPE cache. Defaults to None.
+            prev_embed (torch.Tensor | None): Output token embeddings of
+                previous Transformer layer (after output norm, before
+                unembedding).
 
         Returns:
-            torch.Tensor: Output logits after applying the Transformer model.
+            list[torch.Tensor | None]: Output logits after applying the
+                Transformer model for each output token.
 
         """
+        if not isinstance(tokens_list, list):
+            tokens = tokens_list
+            tokens_list = [None] * (1 + self.model_args.num_mtp_modules)
+            tokens_list[0] = tokens
+        else:
+            tokens = tokens_list[0]
+
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 

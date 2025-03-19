@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 import dataclasses
 import importlib
 import json
@@ -537,8 +538,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     output = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
                     # Compute loss sum (reduction='sum')
                     if isinstance(output, tuple):
-                        assert len(output) == 2
-                        pred, aux_loss = output
+                        if self.job_config.training.num_mtp_tokens > 0:
+                            pred = output[0]
+                        else:
+                            assert len(output) == 2
+                            pred, aux_loss = output
                     else:
                         pred = output
                     loss_sum = self.loss_fn(pred, labels)
