@@ -9,7 +9,7 @@ from typing import Callable, TypeAlias
 import torch
 
 from torchtitan.config import JobConfig
-from torchtitan.models.inputs import MTPInputsDict, TransformerInputsDict
+from torchtitan.models.inputs import MoEInputsDict
 from torchtitan.tools.logging import logger
 
 # PyTorch's default ignore index for cross-entropy loss
@@ -35,6 +35,20 @@ def build_cross_entropy_loss(job_config: JobConfig, **kwargs):
         logger.info("Compiling the loss function with torch.compile")
         loss_fn = torch.compile(loss_fn, backend=job_config.compile.backend)
     return loss_fn
+
+
+def moe_loss(
+    pred: MoEInputsDict,
+    labels: torch.Tensor,
+    loss_fn: LossFunction,
+) -> torch.Tensor:
+    """Sequence-wise auxiliary loss-enhanced loss function for MoE Transformer
+    model training.
+    """
+    assert isinstance(pred, dict)
+    loss = loss_fn(pred, labels)
+    loss += pred["aux_loss"]
+    return loss
 
 
 def mse_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:

@@ -20,13 +20,14 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderExhaustedError
-from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.components.loss import IGNORE_INDEX, moe_loss
 from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
 )
 from torchtitan.config import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.models.MoEllama.model.model import Transformer as MoETransformer
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.protocols import ModelProtocol
 from torchtitan.protocols.model_converter import build_model_converters
@@ -194,8 +195,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             buffer_device = None
 
         self.loss_fn = self.train_spec.build_loss_fn(
-            job_config, parallel_dims=parallel_dims
+            job_config, parallel_dims=parallel_dims, ft_manager=self.ft_manager
         )
+
+        if issubclass(self.train_spec.model_cls, MoETransformer):
+            pre_moe_loss_fn = self.loss_fn
+            self.loss_fn = functools.partial(
+                moe_loss,
+                loss_fn=pre_moe_loss_fn,
+            )
 
         # verify batch sizes
         global_batch_size = job_config.training.global_batch_size
@@ -540,17 +548,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     aux_loss = pred.get("aux_loss", None)
 
                     loss = self.loss_fn(pred, labels)
-                    if aux_loss is not None:
-                        if isinstance(aux_loss, float):
-                            aux_loss = torch.tensor(
-                                aux_loss, dtype=loss.dtype, device=loss.device
-                            )
-                        loss += aux_loss / self.gradient_accumulation_steps
-
                 # need to free pred before bwd to avoid peaking memory
                 del pred
                 loss.backward()
 
+        if isinstance(aux_loss, float):
+            aux_loss = torch.tensor(aux_loss, dtype=loss.dtype, device=loss.device)
         return loss, aux_loss
 
     def train_step(
