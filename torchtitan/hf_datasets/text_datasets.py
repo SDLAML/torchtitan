@@ -306,11 +306,14 @@ def build_text_dataloader(
         dataset_key=dataset_key,
     )
 
+    rng = torch.Generator()
+    if job_config.training.seed is not None:
+        rng.manual_seed(job_config.training.seed)
     dataloader_kwargs = {
         **asdict(job_config.training.dataloader),
         "batch_size": batch_size,
+        "generator": rng,
     }
-
     return ParallelAwareDataloader(
         hf_ds,
         dp_rank=dp_rank,
@@ -360,9 +363,13 @@ def build_text_validation_dataloader(
         dataset_key=dataset_key,
     )
 
+    rng = torch.Generator()
+    if job_config.validation.seed is not None:
+        rng.manual_seed(job_config.validation.seed)
     dataloader_kwargs = {
         **asdict(job_config.validation.dataloader),
         "batch_size": batch_size,
+        "generator": rng,
     }
 
     return ParallelAwareDataloader(

@@ -38,8 +38,7 @@ class BaseDataLoader(Stateful, ABC):
     """
 
     @abstractmethod
-    def __iter__(self):
-        ...
+    def __iter__(self): ...
 
 
 # pyrefly: ignore [inconsistent-inheritance]
@@ -54,9 +53,8 @@ class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):
         dataset (IterableDataset): The dataset to iterate over.
         dp_rank: Data parallelism rank for this dataloader.
         dp_world_size: The world size of the data parallelism.
-        **kwargs: Additional keyword arguments passed to StatefulDataLoader (e.g.,
-            batch_size, collate_fn, num_workers, persistent_workers, prefetch_factor,
-            pin_memory).
+        data_loader_kwargs: Additional arguments to pass to the
+            ``torchdata.stateful_dataloader.StatefulDataLoader`` constructor.
     """
 
     dp_rank: int
