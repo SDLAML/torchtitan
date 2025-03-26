@@ -535,21 +535,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             assert len(model_parts) == 1
             with self.train_context():
                 with self.maybe_enable_amp:
-                    output = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-                    # Compute loss sum (reduction='sum')
-                    if isinstance(output, tuple):
-                        if self.job_config.training.num_mtp_tokens > 0:
-                            pred = output[0]
-                        else:
-                            assert len(output) == 2
-                            pred, aux_loss = output
-                    else:
-                        pred = output
-                    loss_sum = self.loss_fn(pred, labels)
+                    pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
 
-                    # Scale the loss by the inverse of the total weight denominator before backward
-                    # This ensures gradients are properly normalized across all microbatches
-                    loss = loss_sum / global_valid_tokens
+                    aux_loss = pred.get("aux_loss", None)
+
+                    loss = self.loss_fn(pred, labels)
                     if aux_loss is not None:
                         if isinstance(aux_loss, float):
                             aux_loss = torch.tensor(

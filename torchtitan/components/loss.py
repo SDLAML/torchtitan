@@ -9,6 +9,7 @@ from typing import Callable, TypeAlias
 import torch
 
 from torchtitan.config import JobConfig
+from torchtitan.models.inputs import MTPInputsDict, TransformerInputsDict
 from torchtitan.tools.logging import logger
 
 # PyTorch's default ignore index for cross-entropy loss
