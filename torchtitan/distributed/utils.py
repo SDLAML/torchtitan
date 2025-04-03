@@ -233,13 +233,19 @@ class TrainContext(Protocol):
 
 def get_train_context(enable_loss_parallel: bool) -> TrainContext:
     @contextlib.contextmanager
-    def context(cp_context: contextlib.AbstractContextManager[None] | None = None):
+    def context(
+        cp_context: contextlib.AbstractContextManager[None] | None = None,
+        activations_handling_ctx: contextlib.AbstractContextManager | None = None,
+    ):
         with contextlib.ExitStack() as stack:
             if enable_loss_parallel:
                 stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
 
             if cp_context:
                 stack.enter_context(cp_context)
+
+            if activations_handling_ctx is not None:
+                stack.enter_context(activations_handling_ctx)
 
             yield
 
@@ -540,9 +546,7 @@ def _clip_grad_norm_with_ep(
     if math.isinf(norm_type):
         total_norm = torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm)
     else:
-        total_norm = (
-            ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
-        )
+        total_norm = ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
         total_norm **= 1.0 / norm_type
 
     if pp_mesh is not None:
