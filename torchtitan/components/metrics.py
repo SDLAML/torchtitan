@@ -133,10 +133,18 @@ class WandBLogger(BaseLogger):
     """Logger implementation for Weights & Biases."""
 
     def __init__(
+        
         self,
+       
         log_dir: str,
+       
         config_dict: dict[str, Any] | None = None,
+       
         tag: str | None = None,
+    ,
+        project: str | None = None,
+        group: str | None = None,
+        name: str | None = None,
     ):
         # Import wandb here to avoid startup import
         import wandb
@@ -258,7 +266,7 @@ def _get_metrics_rank(
     return (world_size // pp_size) * (pp_size - 1)
 
 
-class MetricsProcessor(Configurable):
+class MetricsProcessor:
     """Metrics processor to processes the metrics and log metrics.
 
     The current MetricsProcessor log some metrics to STDOUT and some metrics to
@@ -280,6 +288,20 @@ class MetricsProcessor(Configurable):
         log_freq: int = 10
         """How often to log metrics to TensorBoard, in iterations"""
 
+        log_norm_freq: int = 0
+        """How often to log parameter norm metrics to TensorBoard, in iterations"""
+
+        norms_to_log: list[str] = field(default_factory=lambda: ["default"])
+        """
+        Which parameter norms to log. If "all" or "everything" is specified,
+        log all available norms. If "default" is specified, use the following:
+        - "rms_to_rms"
+        - "l1_to_rms"
+        - "rms_to_inf"
+        - "supremum"
+        - "condition_number"
+        """
+
         enable_tensorboard: bool = False
         """Whether to log metrics to TensorBoard"""
 
@@ -297,8 +319,30 @@ class MetricsProcessor(Configurable):
         only stage that computes loss metrics.
         """
 
+        save_first_dp_and_tp: bool = False
+        """
+        Whether to save metrics only for DP+CP+TP rank 0, meaning that the
+        0th rank of all PP stages will end up saving metrics.
+        """
+
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
+
+        wandb_project: str | None = None
+        """
+        Weights & Biases project name. Use "torchtitan" if neither this is given
+        nor the `WANDB_PROJECT` environment variable set.
+        """
+
+        wandb_group: str | None = None
+        """Weights & Biases group name"""
+
+        wandb_name: str | None = None
+        """
+        Weights & Biases run name. Use `None` if neither this is given
+        nor the `WANDB_RUN_NAME` environment variable set.
+        """
+
 
     config: Config
     logger: BaseLogger
@@ -393,6 +437,22 @@ class MetricsProcessor(Configurable):
             )
             should_log = torch.distributed.get_rank() == metrics_rank
 
+
+        if metrics_config.save_first_dp_and_tp and should_log:
+            # The first data-parallel group
+
+            is_dp_rank_0 = (
+                parallel_dims.get_optional_mesh("loss").get_local_rank() == 0
+                if parallel_dims.dp_cp_enabled
+                else True
+            )
+            is_tp_rank_0 = (
+                (parallel_dims.get_optional_mesh("tp").get_local_rank() == 0)
+                if parallel_dims.tp_enabled
+                else True
+            )
+            should_log = is_dp_rank_0 and is_tp_rank_0
+
         logger.debug(
             f"Logging decision: has_logging_enabled={has_logging_enabled}, should_log={should_log}"
         )
@@ -425,9 +485,12 @@ class MetricsProcessor(Configurable):
         # Create loggers in priority order
         if config.enable_wandb:
             logger.debug("Attempting to create WandB logger")
+            project = config.wandb_project
+            group = config.wandb_group
+            name = config.wandb_name
             try:
                 wandb_logger = WandBLogger(
-                    base_log_dir, config_dict=config_dict, tag=tag
+                    base_log_dir, config_dict, tag=tag, project=project, group=group, name=name
                 )
                 logger_container.add_logger(wandb_logger)
             except Exception as e:
