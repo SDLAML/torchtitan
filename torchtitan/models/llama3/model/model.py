@@ -27,7 +27,6 @@ from torchtitan.models.attention import (
 )
 from torchtitan.models.utils import trunc_normal_
 from torchtitan.protocols.model import AttentionMasksType
-from torchtitan.models.inputs import MTPInputs, MTPInputsDict
 from torchtitan.models.norms import build_norm
 from torchtitan.protocols.train_spec import ModelProtocol
 
@@ -260,6 +259,19 @@ class Attention(nn.Module):
             for norm in (self.v_norm, self.o_norm):
                 norm.reset_parameters()
 
+    def init_kv_cache(
+        self, max_batch_size: int, max_seq_length: int, dtype: torch.dtype
+    ):
+        device = self.wk.weight.device
+        self._kv_cache = KVCache(
+            batch_size=max_batch_size,
+            seq_length=max_seq_length,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+            dtype=dtype,
+            device=device,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -392,12 +404,12 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
         if norm_everywhere:
-            assert (
-                norm_type is not None
-            ), "`norm_type` needs to be passed when `norm_everywhere=True`"
-            assert (
-                norm_eps is not None
-            ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            assert norm_type is not None, (
+                "`norm_type` needs to be passed when `norm_everywhere=True`"
+            )
+            assert norm_eps is not None, (
+                "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            )
             self.out_norm = build_norm(
                 norm_type,
                 dim=hidden_dim,
@@ -547,17 +559,6 @@ class Transformer(ModelProtocol):
         )
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
 
-        # Optionally add MTP modules.
-        if model_args.num_mtp_modules > 0:
-            self.mtp_layers = torch.nn.ModuleDict()
-            for mtp_layer_id in range(model_args.num_mtp_modules):
-                layer_id = mtp_layer_id + model_args.n_layers
-                self.mtp_layers[str(mtp_layer_id)] = MTPModule(
-                    layer_id,
-                    model_args,
-                    self,
-                )
-
     def init_weights(
         self,
         buffer_device: torch.device | None = None,
@@ -593,10 +594,6 @@ class Transformer(ModelProtocol):
                 a=-cutoff_factor * final_out_std,
                 b=cutoff_factor * final_out_std,
             )
-        if self.model_args.num_mtp_modules > 0:
-            for layer in self.mtp_layers.values():
-                if layer is not None:
-                    layer.init_weights()
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
         return precompute_freqs_cis(
@@ -656,48 +653,25 @@ class Transformer(ModelProtocol):
 
     def forward(
         self,
-        inputs: MTPInputs,
+        tokens: torch.Tensor,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
-    ) -> MTPInputsDict:
+    ):
         """
         Perform a forward pass through the Transformer model.
 
         Args:
-            inputs (MTPInputs): Single tensor or dictionary containing the
-                following keys and values:
-                - tokens_list (Union[list[torch.Tensor | None], torch.Tensor]):
-                  Input token indices if pipeline parallelism is not enabled.
-                  If pipeline parallelism is enabled, this will be the input token indices
-                  for the ranks on the first pipeline stage. This will be the activation of the
-                  previous pipeline stage if the current rank is not on the first stage.
+            tokens (torch.Tensor): Input token indices if pipeline parallelism is not enabled.
+                If pipeline parallelism is enabled, this will be the input token indices
+                for the ranks on the first pipeline stage. This will be the activation of the
+                previous pipeline stage if the current rank is not on the first stage.
             attention_masks (AttentionMasksType | None): Masks used when calculating attention scores.
             positions (torch.Tensor | None): Position indices used to access/shuffle RoPE cache. Defaults to None.
-                - prev_embed (torch.Tensor | None): Output token embeddings
-                  of previous Transformer layer (after output norm, before
-                  unembedding).
 
         Returns:
-            MTPInputsDict: Dictionary containing the following keys and
-                values:
-                - tokens_list (list[torch.Tensor | None]): Output logits
-                  after applying the Transformer model for each output token.
-                - prev_embed (torch.Tensor | None): Output token embeddings
-                  of previous Transformer layer (after output norm, before
-                  unembedding).
+            torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        if not isinstance(inputs, dict):
-            inputs = {"tokens_list": inputs}
-        tokens_list = inputs["tokens_list"]
-        prev_embed = inputs.get("prev_embed", None)
-        if not isinstance(tokens_list, list):
-            tokens = tokens_list
-            tokens_list = [None] * (1 + self.model_args.num_mtp_modules)
-            tokens_list[0] = tokens
-        else:
-            tokens = tokens_list[0]
-
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 
