@@ -14,6 +14,7 @@ from torch import nn
 from torch.nn.attention.flex_attention import and_masks, BlockMask
 
 from torchtitan.components.tokenizer import BaseTokenizer
+from torchtitan.distributed.utils import get_param_dtype
 from torchtitan.models.attention import (
     create_attention_mask,
     create_varlen_metadata_for_document,
@@ -181,6 +182,39 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
+class KVCache(nn.Module):
+    def __init__(
+        self,
+        batch_size: int,
+        seq_length: int,
+        n_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        super().__init__()
+        cache_shape = (batch_size, seq_length, n_kv_heads, head_dim)
+        self.register_buffer(
+            "cache_k",
+            torch.zeros(cache_shape, dtype=dtype, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "cache_v",
+            torch.zeros(cache_shape, dtype=dtype, device=device),
+            persistent=False,
+        )
+
+    def update(self, start_pos, xk, xv):
+        assert start_pos >= 0
+        bsz, seqlen, _ = xk.shape
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        xk = self.cache_k[:bsz, : start_pos + seqlen]
+        xv = self.cache_v[:bsz, : start_pos + seqlen]
+        return xk, xv
+
+
 class Attention(nn.Module):
     """
     Multi-head attention module.
@@ -269,6 +303,19 @@ class Attention(nn.Module):
         if self.norm_everywhere:
             for norm in (self.v_norm, self.o_norm):
                 norm.reset_parameters()
+
+    def init_kv_cache(
+        self, max_batch_size: int, max_seq_length: int, dtype: torch.dtype
+    ):
+        device = self.wk.weight.device
+        self._kv_cache = KVCache(
+            batch_size=max_batch_size,
+            seq_length=max_seq_length,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+            dtype=dtype,
+            device=device,
+        )
 
     def forward(
         self,
@@ -391,12 +438,12 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
         if norm_everywhere:
-            assert (
-                norm_type is not None
-            ), "`norm_type` needs to be passed when `norm_everywhere=True`"
-            assert (
-                norm_eps is not None
-            ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            assert norm_type is not None, (
+                "`norm_type` needs to be passed when `norm_everywhere=True`"
+            )
+            assert norm_eps is not None, (
+                "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            )
             self.out_norm = build_norm(
                 norm_type,
                 dim=hidden_dim,
@@ -501,6 +548,11 @@ class TransformerBlock(nn.Module):
             norm.reset_parameters()
         self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
+
+    def init_kv_cache(
+        self, max_batch_size: int, max_seq_length: int, dtype: torch.dtype
+    ):
+        self.attention.init_kv_cache(max_batch_size, max_seq_length, dtype=dtype)
 
 
 class MTPModule(nn.Module):
@@ -720,6 +772,31 @@ class Transformer(nn.Module, ModelProtocol):
                     "Only varlen and flex attn masks are supported"
                 )
 
+    def get_attention_masks(
+        self,
+        input_batch: torch.Tensor,
+        tokenizer: BaseTokenizer,
+        extra_inputs: dict[str, torch.Tensor] | None = None,
+    ) -> AttentionMasksType:
+        match self.model_args.attn_type:
+            case "flex":
+                return self._get_flex_attention_masks(
+                    input_batch, tokenizer, extra_inputs
+                )
+            case "varlen":
+                if self.model_args.attn_mask_type != "block_causal":
+                    raise ValueError(
+                        f"varlen attention is only supported with block_causal \
+                        attention mask type, got {self.model_args.attn_mask_type}"
+                    )
+                return create_varlen_metadata_for_document(
+                    input_batch, tokenizer.eos_id
+                )
+            case _:
+                raise NotImplementedError(
+                    "Only varlen and flex attn masks are supported"
+                )
+
     def forward(
         self,
         inputs: MTPInputs,
@@ -756,6 +833,7 @@ class Transformer(nn.Module, ModelProtocol):
         if not isinstance(inputs, dict):
             inputs = {"tokens_list": inputs}
         tokens_list = inputs["tokens_list"]
+        start_pos = -1
         prev_embed = inputs.get("prev_embed", None)
         if not isinstance(tokens_list, list):
             tokens = tokens_list
