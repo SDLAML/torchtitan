@@ -647,13 +647,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if aux_loss is not None:
                 accumulated_aux_losses.append(aux_loss.detach())
 
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.model_parts for p in m.parameters()],
-            self.job_config.training.max_norm,
-            foreach=True,
-            pp_mesh=parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=parallel_dims.ep_enabled,
-        )
+        grad_norm = None
+        if self.job_config.training.max_norm > 0:
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.model_parts for p in m.parameters()],
+                self.job_config.training.max_norm,
+                foreach=True,
+                pp_mesh=parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=parallel_dims.ep_enabled,
+            )
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
         self.lr_schedulers.step()
@@ -708,7 +710,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.step,
             global_avg_loss,
             global_max_loss,
-            grad_norm.item(),
+            grad_norm.item() if grad_norm is not None else grad_norm,
             extra_metrics=extra_metrics,
         )
 
