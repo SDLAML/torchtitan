@@ -887,7 +887,7 @@ class Transformer(nn.Module, ModelProtocol):
         if not isinstance(inputs, dict):
             inputs = {"tokens_list": inputs}
         tokens_list = inputs["tokens_list"]
-        start_pos = -1
+        start_pos = inputs.get("start_pos", -1)
         prev_embed = inputs.get("prev_embed", None)
         if not isinstance(tokens_list, list):
             tokens = tokens_list
