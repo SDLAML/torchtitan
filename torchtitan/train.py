@@ -20,7 +20,6 @@ import torch.distributed.checkpoint.stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 
 import torchtitan.protocols.train_spec as train_spec_module
-from torchtitan.components.activation_offload import get_act_offloading_ctx_manager
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX, moe_loss
@@ -713,9 +712,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
+        config_lrs = [sched.base_lrs for sched in self.lr_schedulers.schedulers]
 
         self.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}")
+
+        # This is a hack to ensure that, when resuming from a
+        # checkpoint, and the LR is changed in the `JobConfig`, the
+        # loaded LR is correctly modified to the one specified in the
+        # `JobConfig`.
+        for sched, lr in zip(self.lr_schedulers.schedulers, config_lrs):
+            sched.base_lrs = lr
 
         with (
             maybe_enable_profiling(
