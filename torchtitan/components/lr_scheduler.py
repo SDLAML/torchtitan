@@ -156,18 +156,18 @@ class LRSchedulersContainer(Stateful, Configurable):
                     # linear warmup
                     # 0-indexed step, hence + 1 adjustments
                     current_step += 1
-                    assert (
-                        warmup_steps != 0
-                    ), "warmup_steps must not be zero to reach this branch"
+                    assert warmup_steps != 0, (
+                        "warmup_steps must not be zero to reach this branch"
+                    )
                     curr_adjustment = float(current_step / warmup_steps)
                 elif current_step < warmup_stable_steps:
                     curr_adjustment = 1.0
                 else:
                     # 0-indexed step, hence + 1 adjustments
                     current_step += 1
-                    assert (
-                        decay_steps != 0
-                    ), "decay_steps must not be zero to reach this branch"
+                    assert decay_steps != 0, (
+                        "decay_steps must not be zero to reach this branch"
+                    )
                     progress = float(current_step - warmup_stable_steps) / decay_steps
 
                     if lr_decay_type == "linear":
@@ -196,10 +196,11 @@ class LRSchedulersContainer(Stateful, Configurable):
     schedulers: list[LRScheduler]
 
     def __init__(self, optimizers: OptimizersContainer, lr_lambda: Callable) -> None:
-        assert (
-            len(optimizers) > 0
-        ), "Must have at least one optimizer to create LRScheduler"
+        assert len(optimizers) > 0, (
+            "Must have at least one optimizer to create LRScheduler"
+        )
 
+        self.preserve_lrs_when_loading = False
         self.schedulers = [LambdaLR(optimizer, lr_lambda) for optimizer in optimizers]
 
     def __iter__(self) -> Iterator[LRScheduler]:
@@ -219,10 +220,24 @@ class LRSchedulersContainer(Stateful, Configurable):
         return self.schedulers[0].state_dict()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if self.preserve_lrs_when_loading:
+            # Store current learning rates
+            prev_lrs = [sched.base_lrs for sched in self.schedulers]
+
         # Load the same state_dict for all schedulers. The key value we're concerned
         # within ``LRScheduler.state_dict()`` is ``last_epoch``, which is an integer
         # that is immutable. As long as ``training.steps`` and ``lr_scheduler.warmup_steps``
-        # in the config remain unchanged when resuming from a checkpoint, this
+        # in ``job_config`` remain unchanged when resuming from a checkpoint, this
         # approach is safe. We call ``copy()`` here to ensure extra safety.
         for scheduler in self.schedulers:
             scheduler.load_state_dict(copy.deepcopy(state_dict))
+
+        if self.preserve_lrs_when_loading:
+            # This is a hack to ensure that, when resuming from a
+            # checkpoint, and the LR is changed in the `JobConfig`, the
+            # loaded LR is correctly modified to the one specified in
+            # the `JobConfig`.
+
+            # Restore the original learning rates
+            for sched, prev_lr in zip(self.schedulers, prev_lrs):
+                sched.base_lrs = prev_lr

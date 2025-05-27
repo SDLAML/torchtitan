@@ -229,12 +229,174 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if self.preserve_lrs_when_loading:
+            # Store current learning rates
+            prev_lrs = []
+            for optimizer in self.optimizers:
+                prev_lrs.append([group["lr"] for group in optimizer.param_groups])
+
         func = functools.partial(
             set_optimizer_state_dict,
             optim_state_dict=state_dict,
             options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
         list(map(func, self.model_parts, self.optimizers))
+
+        if self.preserve_lrs_when_loading:
+            # Restore the original learning rates
+            for optimizer, optim_prev_lrs in zip(self.optimizers, prev_lrs):
+                for param_group, prev_lr in zip(optimizer.param_groups, optim_prev_lrs):
+                    if param_group["lr"] != prev_lr:
+                        logger.warning(
+                            f"Restoring lr from {param_group['lr']} to {prev_lr} | "
+                            f"for {param_group['param_names']}"
+                        )
+                        param_group["lr"] = prev_lr
+
+    @staticmethod
+    def compute_grad(p, optimizer=None, **kwargs):
+        if isinstance(optimizer, (Scion, DistributedScion)):
+            momentum = kwargs.pop("momentum")
+            nesterov = kwargs.pop("nesterov")
+            g = optimizer.get_momentum_or_grad(
+                p,
+                momentum,
+                nesterov,
+                update_buffer=False,
+                gather_to_local=optimizer.fsdp_enabled,
+            )
+            if g is None:
+                return None
+            else:
+                return optimizer.lmo(g, **kwargs)
+        elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+            if p.ndim == 3:
+                warnings.warn(
+                    f"Optimizer {optimizer.__class__.__name__} does not support "
+                    f"gradient computation for 3D tensors for logging."
+                )
+                return None
+
+            eps = kwargs["eps"]
+            weight_decay = kwargs["weight_decay"]
+            beta1, beta2 = kwargs["betas"]
+            assert weight_decay == 0.0, (
+                "Weight decay not supported for grad computation."
+            )
+
+            param_optim_state = optimizer.state[p]
+            if "step" not in param_optim_state:
+                step = 0
+            else:
+                step = param_optim_state["step"].item()
+            if "exp_avg_sq" in param_optim_state and "exp_avg" in param_optim_state:
+                bias_correction1 = 1 - beta1**step
+                bias_correction2 = 1 - beta2**step
+                denom = (
+                    param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)
+                ) + eps
+                step_size = 1 / bias_correction1
+                g = step_size * param_optim_state["exp_avg"].div(denom)
+            else:
+                # TODO(JSC): if we shard the MoE model, we need to remove the following code
+                g = p.grad
+
+            assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
+            return g.redistribute(placements=[Replicate()] * g.device_mesh.ndim)
+        else:
+            raise TypeError(
+                f"Optimizer {optimizer.__class__.__name__} does not support "
+                f"gradient computation."
+            )
+
+    def get_parameter_norms(self):
+        norms = {}
+        for i, _ in enumerate(self.model_parts):
+            # NB: assumes correspondences between model parts and optimizers
+            optimizer = self.optimizers[i]
+            for group in optimizer.param_groups:
+                if isinstance(optimizer, (Scion, DistributedScion)):
+                    param_kwargs = {
+                        "momentum": group["momentum"],
+                        "nesterov": group["nesterov"],
+                        "eps": group["eps"],
+                        "norm_factor": group["norm_factor"],
+                        "zeropower_backend": zeropower_backends[group["backend"]],
+                        "backend_steps": group["backend_steps"],
+                    }
+                elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+                    param_kwargs = {
+                        "eps": group["eps"],
+                        "betas": group["betas"],
+                        "weight_decay": group["weight_decay"],
+                    }
+                else:
+                    warnings.warn(
+                        f"Optimizer {optimizer.__class__.__name__} does not support "
+                        f"norm computation."
+                    )
+                    continue
+
+                for p_name, p in zip(group["param_names"], group["params"]):
+                    """
+                    the module name usally named
+                    track_update_condition_number/model_part_0/layers.0._orig_mod.attention.wo.weight
+                    we can remove '._orig_mod' and '.weight' to get the clean layer name
+                    """
+                    cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(p_name)
+                    g = self.compute_grad(p, optimizer, **param_kwargs)
+                    if g is not None:
+                        p = (
+                            p.redistribute(
+                                placements=[Replicate()] * p.device_mesh.ndim,
+                            ).to_local()
+                            if isinstance(p, DTensor)
+                            else p
+                        )
+                        g = g.to_local() if isinstance(g, DTensor) else g
+                        update = -group["lr"] * g
+                        if "tok_embeddings" in p_name:
+                            p, update = p.T, update.T
+                        for norm_name, norm_func in NORM_FUNCTIONS.items():
+                            if norm_name != "supremum" and (
+                                p.ndim < 2 or update.ndim < 2
+                            ):
+                                # Operator norms require a matrix.
+                                continue
+                            elif p.ndim == 3 or update.ndim == 3:
+                                # Special handling for grouped MoE.
+                                for ep_idx in range(p.shape[0]):
+                                    norms[
+                                        f"track_update_{norm_name}/model_part_{i}/ep_{ep_idx}/{cleaned_p_name}"
+                                    ] = norm_func(update[ep_idx])
+
+                                    norms[
+                                        f"track_param_{norm_name}/model_part_{i}/ep_{ep_idx}/{cleaned_p_name}"
+                                    ] = norm_func(p[ep_idx])
+
+                            else:
+                                if p.ndim > 2 or update.ndim > 2:
+                                    warnings.warn(
+                                        f"Encountered parameter or update {cleaned_p_name} with shape "
+                                        f"{p.shape} or {update.shape}, respectively; "
+                                        f"this may not be an issue, but please ensure its "
+                                        f"norms are calculated correctly."
+                                    )
+                                norms[
+                                    f"track_param_{norm_name}/model_part_{i}/{cleaned_p_name}"
+                                ] = norm_func(p)
+                                norms[
+                                    f"track_update_{norm_name}/model_part_{i}/{cleaned_p_name}"
+                                ] = norm_func(update)
+
+        return norms
+
+    def get_lrs(self):
+        lrs = {}
+        for i, optimizer in enumerate(self.optimizers):
+            for k, group in enumerate(optimizer.param_groups):
+                lrs[f"lr/opt_{i}/group_{k}"] = group["lr"]
+        return lrs
 
     def _validate_length(self, expected_length: int) -> None:
         assert expected_length == len(self.optimizers), (
