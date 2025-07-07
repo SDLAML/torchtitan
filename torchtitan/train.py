@@ -19,6 +19,8 @@ import torch
 import torch.distributed.checkpoint.stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 
+import torchtitan.models  # noqa: F401
+
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderExhaustedError
