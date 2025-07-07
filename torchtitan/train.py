@@ -62,6 +62,7 @@ def main() -> None:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
         logger.info("Process group destroyed")
+    os._exit(0)
 
 
 if __name__ == "__main__":
