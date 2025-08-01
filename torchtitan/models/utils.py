@@ -114,9 +114,9 @@ class MoEStateDictAdapter(StateDictAdapter):
         start_index, end_index = 0, dim_size
         if len(dim_i_placements) == 2:
             # Handle StridedShard(i) + Shard(i) case
-            assert isinstance(
-                dim_i_placements[0], _StridedShard
-            ), "Expected StridedShard as first placement"
+            assert isinstance(dim_i_placements[0], _StridedShard), (
+                "Expected StridedShard as first placement"
+            )
 
             strided_shard_mesh = device_mesh[mesh_names[0]]
             shard_mesh = device_mesh[mesh_names[1]]
@@ -132,9 +132,9 @@ class MoEStateDictAdapter(StateDictAdapter):
 
         elif len(dim_i_placements) == 1:
             # Handle single Shard(i) case
-            assert not isinstance(
-                dim_i_placements[0], _StridedShard
-            ), "Expected regular Shard, not StridedShard"
+            assert not isinstance(dim_i_placements[0], _StridedShard), (
+                "Expected regular Shard, not StridedShard"
+            )
 
             shard_mesh = device_mesh[mesh_names[0]]
             shard_degree = shard_mesh.size()
@@ -235,9 +235,9 @@ class MoEStateDictAdapter(StateDictAdapter):
         sub_mesh = device_mesh[tuple(sub_mesh_names)] if sub_mesh_names else None
 
         # Step 5: Create individual expert tensors
-        assert isinstance(
-            grouped_expert_weight, DTensor
-        ), "Expected DTensor for grouped expert weight"
+        assert isinstance(grouped_expert_weight, DTensor), (
+            "Expected DTensor for grouped expert weight"
+        )
 
         local_grouped_weights = grouped_expert_weight._local_tensor
         expected_local_experts = end_index - start_index
@@ -402,7 +402,8 @@ def get_dense_model_nparams_and_flops(
         seq_len: The sequence length in training configs.
 
     Returns:
-        Tuple of (nparams, num_flops_per_token):
+        Tuple of (active_params, nparams, num_flops_per_token):
+            active_params: Total number of [activate] model parameters.
             nparams: Total number of model parameters.
             num_flops_per_token: Estimated number of floating point operations per token.
     """
@@ -434,7 +435,8 @@ def get_dense_model_nparams_and_flops(
     ):
         nparams = nparams - nparams_embedding
 
-    return nparams, num_flops_per_token
+    active_params = nparams
+    return active_params, nparams, num_flops_per_token
 
 
 def get_moe_model_nparams_and_flops(
@@ -511,4 +513,6 @@ def get_moe_model_nparams_and_flops(
     ):
         nparams = nparams - nparams_embedding
 
-    return nparams, num_flops_per_token
+    active_params = nparams_sparse_active + nparams_embedding
+
+    return active_params, nparams, num_flops_per_token
