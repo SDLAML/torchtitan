@@ -19,7 +19,11 @@ def maybe_enable_async_tp(
     if not parallelism.enable_async_tensor_parallel:
         return
 
-    if not (compile_config.enable and "model" in compile_config.components):
+    if not (
+        compile_config.enable
+        and "model" in compile_config.components
+        and parallelism.tensor_parallel_only_attention
+    ):
         raise RuntimeError(
             "Async TP requires 'model' in --compile.components and --compile.enable"
         )
