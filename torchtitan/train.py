@@ -150,6 +150,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         ):
             model = self.train_spec.model_cls(model_args)
 
+        logger.info(f"model: {model}")
+
         # Build the collection of model converters. No-op if `model.converters` empty
         model_converters = build_model_converters(job_config, parallel_dims)
         model_converters.convert(model)
@@ -167,13 +169,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # calculate model size and flops per token
         (
+            model_active_param_count,
             model_param_count,
             self.metrics_processor.num_flops_per_token,
         ) = model_args.get_nparams_and_flops(model, job_config.training.seq_len)
 
         logger.info(
-            f"{color.blue}Model {job_config.model.name} {job_config.model.flavor} "
-            f"{color.red}size: {model_param_count:,} total parameters{color.reset}"
+            f"{color.blue}Model {self.train_spec.name} {job_config.model.flavor} "
+            f"{color.red}size: {model_param_count:,} total parameters, "
+            f"{model_active_param_count:,} active parameters{color.reset}"
         )
 
         # move sharded model to CPU/GPU and initialize weights via DTensor
@@ -456,9 +460,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         attn_type = getattr(self.model_args, "attn_type", "sdpa")
         if attn_type in ["flex", "varlen"]:
-            assert (
-                self.tokenizer is not None
-            ), "tokenizer is required for flex/varlen attention"
+            assert self.tokenizer is not None, (
+                "tokenizer is required for flex/varlen attention"
+            )
             model = cast(ModelProtocol, self.model_parts[0])
             extra_kwargs["attention_masks"] = model.get_attention_masks(
                 input_batch=inputs,
@@ -491,6 +495,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         inputs, labels, extra_inputs, extra_kwargs = self.post_dataloading_process(
             input_dict, labels
         )
+        aux_loss = None
 
         if parallel_dims.pp_enabled:
             # Pipeline Parallel forward / backward inside step() call
@@ -529,20 +534,30 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             assert len(model_parts) == 1
             with self.train_context():
                 with self.maybe_enable_amp:
-                    pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+                    output = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
                     # Compute loss sum (reduction='sum')
+                    if isinstance(output, tuple):
+                        assert len(output) == 2
+                        pred, aux_loss = output
+                    else:
+                        pred = output
                     loss_sum = self.loss_fn(pred, labels)
 
                     # Scale the loss by the inverse of the total weight denominator before backward
                     # This ensures gradients are properly normalized across all microbatches
                     loss = loss_sum / global_valid_tokens
+                    if aux_loss is not None:
+                        if isinstance(aux_loss, float):
+                            aux_loss = torch.tensor(
+                                aux_loss, dtype=loss.dtype, device=loss.device
+                            )
+                        loss += aux_loss / self.gradient_accumulation_steps
 
                 # need to free pred before bwd to avoid peaking memory
                 del pred
                 loss.backward()
 
-        # The returned loss here is local SUM loss / global_valid_tokens
-        return loss
+        return loss, aux_loss
 
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -574,6 +589,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
+        accumulated_aux_losses = []
         for input_dict, labels in microbatches:
             # Move tensors to GPU
             for k, v in input_dict.items():
@@ -581,13 +597,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     input_dict[k] = v.to(self.device)
             labels = labels.to(self.device)
 
-            loss = self.forward_backward_step(
+            loss, aux_loss = self.forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
                 # pyrefly: ignore [bad-argument-type]
                 global_valid_tokens=global_valid_tokens,
             )
             accumulated_losses.append(loss.detach())
+            if aux_loss is not None:
+                accumulated_aux_losses.append(aux_loss.detach())
 
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
@@ -602,6 +620,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
+        if len(accumulated_aux_losses) > 0:
+            aux_loss = torch.sum(torch.stack(accumulated_aux_losses))
 
         # log metrics
         if not self.metrics_processor.should_log(self.step):
@@ -631,6 +651,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     loss_mesh,
                 ),
             )
+            if aux_loss is not None:
+                aux_loss = dist_utils.dist_mean(
+                    aux_loss, parallel_dims.world_mesh["dp_cp"], ft_pg
+                )
         else:
             global_avg_loss = global_max_loss = loss.detach().item()
             global_ntokens_seen = self.ntokens_seen
@@ -639,6 +663,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+        if aux_loss is not None:
+            extra_metrics["loss_metrics/aux_loss"] = aux_loss
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
@@ -682,9 +709,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
 
                 # Run validation if validator is available
-                if (
-                    self.job_config.validation.enable
-                    and self.validator.should_validate(self.step)
+                if self.job_config.validation.enable and self.validator.should_validate(
+                    self.step
                 ):
                     self.validator.validate(self.model_parts, self.step)
 
@@ -756,12 +782,12 @@ def main(trainer_class: type[Trainer]) -> None:
             return
 
         if config.checkpoint.create_seed_checkpoint:
-            assert (
-                int(os.environ["WORLD_SIZE"]) == 1
-            ), "Must create seed checkpoint using a single device, to disable sharding."
-            assert (
-                config.checkpoint.enable
-            ), "Must enable checkpointing when creating a seed checkpoint."
+            assert int(os.environ["WORLD_SIZE"]) == 1, (
+                "Must create seed checkpoint using a single device, to disable sharding."
+            )
+            assert config.checkpoint.enable, (
+                "Must enable checkpointing when creating a seed checkpoint."
+            )
             trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
         else:
