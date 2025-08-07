@@ -234,6 +234,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         assert self.gradient_accumulation_steps > 0
 
+        # Figure out whether model will be loaded, so that we can skip
+        # weight initialization.
+        skip_weight_init = CheckpointManager.can_skip_weight_init(job_config)
+
         # apply parallelisms and initialization
         if parallel_dims.pp_enabled:
             if not self.train_spec.pipelining_fn:
@@ -263,8 +267,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             for m in self.model_parts:
                 m.to_empty(device=init_device)
-                with torch.no_grad():
-                    cast(ModelProtocol, m).init_weights(buffer_device=buffer_device)
+                if not skip_weight_init:
+                    with torch.no_grad():
+                        cast(ModelProtocol, m).init_weights(buffer_device=buffer_device)
                 m.train()
 
             # confirm that user will be able to view loss metrics on the console
@@ -274,8 +279,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             model = self.train_spec.parallelize_fn(model, parallel_dims, job_config)
 
             model.to_empty(device=init_device)
-            with torch.no_grad():
-                cast(ModelProtocol, model).init_weights(buffer_device=buffer_device)
+            if not skip_weight_init:
+                with torch.no_grad():
+                    cast(ModelProtocol, model).init_weights(buffer_device=buffer_device)
             model.train()
 
             self.model_parts = [model]
