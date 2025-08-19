@@ -611,6 +611,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Collect all microbatches on CPU and count total valid tokens
         microbatches = []
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+
         for _microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
@@ -628,6 +629,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
         accumulated_aux_losses = []
+        fwd_bwd_start = time.perf_counter()
         for input_dict, labels in microbatches:
             # Move tensors to GPU
             for k, v in input_dict.items():
@@ -644,6 +646,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             accumulated_losses.append(loss.detach())
             if aux_loss is not None:
                 accumulated_aux_losses.append(aux_loss.detach())
+        self.metrics_processor.fwd_bwd_times.append(time.perf_counter() - fwd_bwd_start)
 
         grad_norm = None
         if self.job_config.training.max_norm > 0:
@@ -668,8 +671,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if need_to_calculate_norm:
             self.optimizers.calculate_norm_at_next_step()
 
+        optim_step_start = time.perf_counter()
         self.optimizers.step()
         self.lr_schedulers.step()
+        self.metrics_processor.optim_step_times.append(
+            time.perf_counter() - optim_step_start
+        )
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
