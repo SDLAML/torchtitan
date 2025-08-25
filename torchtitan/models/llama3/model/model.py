@@ -10,11 +10,11 @@ import math
 from typing import cast
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.flex_attention import and_masks, BlockMask
 
 from torchtitan.components.tokenizer import BaseTokenizer
+from torchtitan.models.activations import build_activation
 from torchtitan.models.attention import (
     create_attention_mask,
     create_varlen_metadata_for_document,
@@ -390,6 +390,7 @@ class FeedForward(nn.Module):
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: float | None,
+        activation_type: str = "silu",
         norm_everywhere: bool = False,
         norm_type: str | None = None,
         norm_eps: float | None = None,
@@ -404,6 +405,8 @@ class FeedForward(nn.Module):
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+
+        self.act_fn = build_activation(activation_type)
 
         if norm_everywhere:
             assert norm_type is not None, (
@@ -421,7 +424,7 @@ class FeedForward(nn.Module):
             self.out_norm = nn.Identity()
 
     def forward(self, x):
-        return self.w2(self.out_norm(F.silu(self.w1(x)) * self.w3(x)))
+        return self.w2(self.out_norm(self.act_fn(self.w1(x)) * self.w3(x)))
 
     def init_weights(
         self,
@@ -473,6 +476,7 @@ class TransformerBlock(nn.Module):
             hidden_dim=4 * model_args.dim,
             multiple_of=model_args.multiple_of,
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+            activation_type=model_args.activation_type,
             norm_type=model_args.norm_type,
             norm_everywhere=model_args.norm_everywhere,
             norm_eps=model_args.norm_eps,
