@@ -119,6 +119,67 @@ class Model:
     flavor: str = "debugmodel"
     """Which model config to train"""
 
+    depth_init: Literal["identity", "depth", "total_depth"] = "identity"
+    """
+    Method to use for depth-wise residual initialization of Transformer blocks.
+    - "identity": disable depth-wise initialization.
+    - "depth": scale each block's initialization by its own depth in the model.
+    - "total_depth": scale each block's initialization by the total number of layers.
+    """
+
+    first_in_init_fn_type: str = "normal"
+    """Weight initialization method to use for the first input layer."""
+
+    first_in_init_std: float = 1.0
+    """Standard deviation multiplier for first input layer's weight initialization."""
+
+    first_in_exp: float = 0.0
+    """
+    Exponent applied to the first input layer's input dimensionality to obtain its init std factor.
+    """
+
+    router_init_fn_type: str = "normal"
+    """Weight initialization method to use for router layers."""
+
+    intermediate_init_fn_type: str = "normal"
+    """Weight initialization method to use for the intermediate layers."""
+
+    intermediate_init_std: float = 0.02
+    """Standard deviation multiplier for intermediate layers' weight initialization."""
+
+    intermediate_exp: float = 0.0
+    """
+    Exponent applied to the model's hidden dimensionality to obtain intermediate layers' init std
+    factors.
+    """
+
+    init_gate_as_residual = True
+    """Whether to initialize the GLU gate as if it was a residual layer."""
+
+    final_out_init_fn_type: str = "trunc_normal"
+    """Weight initialization method to use for the final output layer."""
+
+    final_out_init_std: float = 1.0
+    """Standard deviation multiplier for final output layer's weight initialization."""
+
+    final_out_exp: float = -0.5
+    """
+    Exponent applied to the final output layer's input dimensionality to obtain its init std factor.
+    """
+
+    residual_scale: Literal["identity", "depth_scale", "complete_p"] = "identity"
+    """
+    Which method to use for scaling residual connections in the forward pass.
+    - "identity": no scaling
+    - "depth_scale": see Modular Norms paper (arXiv:2405.14813)
+    - "complete_p": see CompleteP paper (arXiv:2505.01618)
+    """
+
+    activation_type: str = "silu"
+    """Type of activation function to use
+    [silu, squared_relu, elu, relu, selu, gelu, approx_gelu, quick_gelu, sigmoid]
+    """
+
     norm_type: str = "rmsnorm"
     """
     Type of layer normalization to use
@@ -1109,9 +1170,9 @@ class Validation:
     """DataLoader configuration"""
 
     def __post_init__(self):
-        assert (
-            self.steps > 0 or self.steps == -1
-        ), "validation steps must be positive or -1"
+        assert self.steps > 0 or self.steps == -1, (
+            "validation steps must be positive or -1"
+        )
 
 
 @dataclass
