@@ -683,6 +683,11 @@ def build_optimizers_with_moe_load_balancing(
         loss_mesh = parallel_dims.get_optional_mesh("loss")
 
         # above is adapted from the upstream code
+        is_dp_rank_0 = (
+            torch.distributed.get_rank(loss_mesh.get_group()) == 0
+            if loss_mesh is not None
+            else True
+        )
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
         # default compute stream. Need to assess if this is OK performance-wise.
 
@@ -785,18 +790,19 @@ def build_optimizers_with_moe_load_balancing(
                 for t in ent_buffers:
                     t.zero_()
 
-            all_usages_cpu = usage_flat.cpu().tolist()
-            all_biases_cpu = torch.cat(bias_params).cpu().tolist()
-            all_entropies_cpu = all_entropies.cpu().float().tolist()
+            if is_dp_rank_0:
+                all_usages_cpu = usage_flat.cpu().tolist()
+                all_biases_cpu = torch.cat(bias_params).cpu().tolist()
+                all_entropies_cpu = all_entropies.cpu().float().tolist()
 
-            payload = (
-                moe_layers_info,
-                all_usages_cpu,
-                all_biases_cpu,
-                all_entropies_cpu,
-                num_experts,
-            )
-            log_queue.put(payload)
+                payload = (
+                    moe_layers_info,
+                    all_usages_cpu,
+                    all_biases_cpu,
+                    all_entropies_cpu,
+                    num_experts,
+                )
+                log_queue.put(payload)
 
     if _should_register_moe_balancing_hook(model_parts):
         optimizers.register_step_pre_hook(
