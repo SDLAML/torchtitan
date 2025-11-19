@@ -16,5 +16,4 @@ _supported_models = frozenset(
         "MoEllama",
     ]
 )
-from . import llama3
-from . import MoEllama
+from . import llama3, MoEllama
