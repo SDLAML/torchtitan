@@ -20,7 +20,6 @@ from torch.utils.data import IterableDataset
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import JobConfig
-from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 
 
@@ -161,10 +160,10 @@ def _validate_dataset(
 
     path = dataset_path or config.path
     logger.info(f"Preparing {dataset_name} dataset from {path}")
-    return path, config.loader, config.sample_processor
+    return path, config.loader, config.text_processor
 
 
-class HuggingFaceTextDataset(IterableDataset, Stateful):
+class HuggingFaceDataset(IterableDataset, Stateful):
     def __init__(
         self,
         dataset_name: str,
@@ -412,6 +411,99 @@ class GreedyPackedDataset(IterableDataset, Stateful):
         }
 
 
+class WindowShuffledDataset(IterableDataset, Stateful):
+    # Implementation highly inspired by
+    # `torch.utils.data.datapipes.iter.ShufflerIterDataPipe`.
+
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        *,
+        buffer_size: int = 10000,
+        seed: int | None = 0,
+    ) -> None:
+        assert buffer_size > 0, "buffer_size should be larger than 0"
+        self.dataset = dataset
+        self._buffer = []
+        self.buffer_size = buffer_size
+        self._enabled = True
+        self._initial_seed = seed
+        self._rng = Random(self._initial_seed)
+
+    def set_shuffle(self, shuffle: bool = True):
+        self._enabled = shuffle
+        return self
+
+    def set_initial_seed(self, seed: int | None = None):
+        self._initial_seed = seed
+        self._rng.seed(self._initial_seed)
+        return self
+
+    def __iter__(self):
+        if not self._enabled:
+            yield from self.dataset
+        else:
+            for x in self.dataset:
+                if len(self._buffer) >= self.buffer_size:
+                    idx = self._rng.randint(0, len(self._buffer) - 1)
+                    val, self._buffer[idx] = self._buffer[idx], x
+                    yield val
+                else:
+                    self._buffer.append(x)
+            while self._buffer:
+                idx = self._rng.randint(0, len(self._buffer) - 1)
+                yield self._buffer.pop(idx)
+
+    def reset(self) -> None:
+        self._buffer = []
+        self._rng.seed(self._initial_seed)
+
+    def load_state_dict(self, state_dict):
+        def list_tree_to_tuple(obj):
+            if isinstance(obj, list):
+                return tuple(list_tree_to_tuple(x) for x in obj)
+            return obj
+
+        # This should not be required and doesn't pop up during testing,
+        # but we add it for safety.
+        state_dict["rng_state"] = list_tree_to_tuple(state_dict["rng_state"])
+
+        self._buffer = state_dict["shuffle_buffer"]
+        self._initial_seed = state_dict["initial_seed"]
+        self._enabled = state_dict["enabled"]
+        self._rng.setstate(state_dict["rng_state"])
+        self.dataset.load_state_dict(state_dict["dataset"])
+
+    def state_dict(self):
+        return {
+            "shuffle_buffer": self._buffer,
+            "initial_seed": self._initial_seed,
+            "enabled": self._enabled,
+            "rng_state": self._rng.getstate(),
+            "dataset": self.dataset.state_dict(),
+        }
+
+
+def _normalize_list(
+    xs: list[str | None] | None,
+    length: int,
+    duplicate: bool = False,
+) -> list[str | None]:
+    if xs is None:
+        xs = [None] * length
+    elif duplicate and len(xs) == 1:
+        xs = [xs[0] for _ in range(length)]
+    return xs
+
+
+def _replace_none_with_literal(xs: list[str] | None) -> list[str | None] | None:
+    if xs is None:
+        xs = None
+    else:
+        xs = [None if x == "None" else x for x in xs]
+    return xs
+
+
 def build_hf_dataloader(
     dp_world_size: int,
     dp_rank: int,
@@ -429,40 +521,100 @@ def build_hf_dataloader(
         infinite: Whether to loop the dataset infinitely.
     """
     dataset_name = job_config.training.dataset
-    dataset_path = job_config.training.dataset_path
+    dataset_path = _replace_none_with_literal(job_config.training.dataset_path)
     batch_size = job_config.training.local_batch_size
     seq_len = job_config.training.seq_len
     num_mtp_tokens = job_config.training.num_mtp_tokens
-    dataset_inner_name = job_config.training.dataset_inner_name
+    dataset_weights = job_config.training.dataset_weights
+    dataset_mix_in_seq = job_config.training.dataset_mix_in_seq
+    dataset_inner_name = _replace_none_with_literal(
+        job_config.training.dataset_inner_name
+    )
     dataset_files = job_config.training.dataset_files
     dataset_split = job_config.training.dataset_split
     dataset_streaming = job_config.training.dataset_streaming
     dataset_key = job_config.training.dataset_key
 
-    hf_ds = HuggingFaceTextDataset(
-        dataset_name=dataset_name,
-        dataset_path=dataset_path,
-        tokenizer=tokenizer,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        infinite=infinite,
-        dataset_inner_name=dataset_inner_name,
-        dataset_files=dataset_files,
-        dataset_split=dataset_split,
-        dataset_streaming=dataset_streaming,
-        dataset_key=dataset_key,
+    normed_list_length = len(dataset_name)
+    dataset_path = _normalize_list(dataset_path, normed_list_length)
+    dataset_inner_name = _normalize_list(dataset_inner_name, normed_list_length)
+    dataset_split = _normalize_list(dataset_split, normed_list_length)
+    dataset_key = _normalize_list(dataset_key, normed_list_length)
+    dataset_weights = (
+        [1.0] * normed_list_length
+        if dataset_weights is None
+        # Convert to floats.
+        else list(map(float, dataset_weights))
     )
 
-    hf_ds = GreedyPackedDataset(
-        dataset=hf_ds,
-        seq_len=seq_len,
-        infinite=infinite,
-        num_mtp_tokens=num_mtp_tokens,
-    )
+    if len(dataset_name) > 1:
+        assert dataset_files is None, (
+            "cannot supply dataset files when using multiple datasets"
+        )
+    for d in [
+        dataset_path,
+        dataset_inner_name,
+        dataset_split,
+        dataset_key,
+        dataset_weights,
+    ]:
+        assert len(d) == normed_list_length, (
+            f"list {d} does not match length of list of datasets (length = {normed_list_length})"
+        )
+    hf_datasets = []
+    for d_name, d_path, d_inner_name, d_split, d_key in zip(
+        dataset_name,
+        dataset_path,
+        dataset_inner_name,
+        dataset_split,
+        dataset_key,
+    ):
+        hf_ds = HuggingFaceDataset(
+            dataset_name=d_name,
+            dataset_path=d_path,
+            tokenizer=tokenizer,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            infinite=infinite,
+            dataset_inner_name=d_inner_name,
+            dataset_files=dataset_files,
+            dataset_split=d_split,
+            dataset_streaming=dataset_streaming,
+            dataset_key=d_key,
+        )
+        if not dataset_mix_in_seq:
+            hf_ds = GreedyPackedDataset(
+                dataset=hf_ds,
+                seq_len=seq_len,
+                infinite=infinite,
+                num_mtp_tokens=num_mtp_tokens,
+            )
+        hf_datasets.append(hf_ds)
+
+    # First pack, then mix → data is only mixed in batch dimension.
+    # First mix, then pack → data is also mixed inside packed sample.
+    hf_ds = MixedDataset(hf_datasets, dataset_weights)
+    if dataset_mix_in_seq:
+        hf_ds = GreedyPackedDataset(
+            dataset=hf_ds,
+            seq_len=seq_len,
+            infinite=infinite,
+            num_mtp_tokens=num_mtp_tokens,
+        )
+
+    if job_config.training.dataset_seed is None:
+        job_config.training.dataset_seed = job_config.training.seed
+
+    if job_config.training.dataset_shuffle_buffer_size:
+        hf_ds = WindowShuffledDataset(
+            hf_ds,
+            buffer_size=job_config.training.dataset_shuffle_buffer_size,
+            seed=job_config.training.dataset_seed,
+        )
 
     rng = torch.Generator()
-    if job_config.training.seed is not None:
-        rng.manual_seed(job_config.training.seed)
+    if job_config.training.dataset_seed is not None:
+        rng.manual_seed(job_config.training.dataset_seed)
     dataloader_kwargs = {
         **asdict(job_config.training.dataloader),
         "batch_size": batch_size,
@@ -476,7 +628,7 @@ def build_hf_dataloader(
     )
 
 
-def build_text_validation_dataloader(
+def build_hf_validation_dataloader(
     dp_world_size: int,
     dp_rank: int,
     tokenizer: BaseTokenizer,
@@ -502,7 +654,7 @@ def build_text_validation_dataloader(
     dataset_streaming = job_config.validation.dataset_streaming
     dataset_key = job_config.validation.dataset_key
 
-    hf_ds = HuggingFaceTextDataset(
+    hf_ds = HuggingFaceDataset(
         dataset_name=dataset_name,
         dataset_path=dataset_path,
         tokenizer=tokenizer,
