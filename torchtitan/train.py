@@ -32,7 +32,6 @@ from torchtitan.components.metrics import (
 )
 from torchtitan.config import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
-from torchtitan.models.MoEllama.model.model import Transformer as MoETransformer
 from torchtitan.optimizers import norm_helper
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.protocols import ModelProtocol
@@ -206,12 +205,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             job_config, parallel_dims=parallel_dims, ft_manager=self.ft_manager
         )
 
-        if issubclass(self.train_spec.model_cls, MoETransformer):
-            pre_moe_loss_fn = self.loss_fn
-            self.loss_fn = functools.partial(
-                moe_loss,
-                loss_fn=pre_moe_loss_fn,
-            )
+        # better with some flag to enable/disable this
+        pre_moe_loss_fn = self.loss_fn
+        self.loss_fn = functools.partial(
+            moe_loss,
+            loss_fn=pre_moe_loss_fn,
+        )
 
         # verify batch sizes
         global_batch_size = job_config.training.global_batch_size
@@ -562,7 +561,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         inputs, labels, extra_inputs, extra_kwargs = self.post_dataloading_process(
             input_dict, labels
         )
-        aux_loss = None
 
         if parallel_dims.pp_enabled:
             # Pipeline Parallel forward / backward inside step() call
@@ -602,18 +600,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with self.train_context():
                 with self.maybe_enable_amp:
                     pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-
-                    if isinstance(pred, dict):
-                        aux_loss = pred.get("aux_loss", None)
-
                     loss = self.loss_fn(pred, labels)
                 # need to free pred before bwd to avoid peaking memory
                 del pred
                 loss.backward()
 
-        if isinstance(aux_loss, float):
-            aux_loss = torch.tensor(aux_loss, dtype=loss.dtype, device=loss.device)
-        return loss, aux_loss
+        return loss
 
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -646,7 +638,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
-        accumulated_aux_losses = []
+
         fwd_bwd_start = time.perf_counter()
         for input_dict, labels in microbatches:
             # Move tensors to GPU
@@ -655,15 +647,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     input_dict[k] = v.to(self.device)
             labels = labels.to(self.device)
 
-            loss, aux_loss = self.forward_backward_step(
+            loss = self.forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
                 # pyrefly: ignore [bad-argument-type]
                 global_valid_tokens=global_valid_tokens,
             )
             accumulated_losses.append(loss.detach())
-            if aux_loss is not None:
-                accumulated_aux_losses.append(aux_loss.detach())
+
         self.metrics_processor.fwd_bwd_times.append(time.perf_counter() - fwd_bwd_start)
 
         grad_norm = None
@@ -698,8 +689,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
-        if len(accumulated_aux_losses) > 0:
-            aux_loss = torch.sum(torch.stack(accumulated_aux_losses))
 
         # log metrics
         if not self.metrics_processor.should_log(self.step):
@@ -729,10 +718,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     loss_mesh,
                 ),
             )
-            if aux_loss is not None:
-                aux_loss = dist_utils.dist_mean(
-                    aux_loss, parallel_dims.world_mesh["dp_cp"], ft_pg
-                )
+
         else:
             global_avg_loss = global_max_loss = loss.detach().item()
             global_ntokens_seen = self.ntokens_seen
@@ -746,9 +732,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if need_to_calculate_norm:
             param_norms = self.optimizers.get_parameter_norms()
             extra_metrics.update(param_norms)
-
-        if aux_loss is not None:
-            extra_metrics["loss_metrics/aux_loss"] = aux_loss
 
         self.optimizers.join_log_queue()
         for model_part in self.model_parts:

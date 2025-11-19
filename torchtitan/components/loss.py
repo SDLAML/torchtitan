@@ -45,9 +45,17 @@ def moe_loss(
     """Sequence-wise auxiliary loss-enhanced loss function for MoE Transformer
     model training.
     """
-    loss = loss_fn(pred, labels)
-    if isinstance(pred, dict):
-        loss += pred["aux_loss"]
+    if isinstance(pred, dict) and "load_balance_loss" in pred:
+        loss = loss_fn(pred["tokens_list"][0], labels)
+        aux_loss = pred["load_balance_loss"]
+        # USE STE to make the magnitude of loss remain the same
+        loss = loss + (aux_loss - aux_loss.detach())
+    elif isinstance(pred, tuple):
+        pred, aux_loss = pred
+        loss = loss_fn(pred, labels)
+        loss = loss + (aux_loss - aux_loss.detach())
+    else:
+        loss = loss_fn(pred, labels)
     return loss
 
 
