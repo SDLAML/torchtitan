@@ -11,11 +11,11 @@ from torchtitan.components.tokenizer import build_hf_byte_tokenizer, build_hf_to
 from torchtitan.components.validate import build_validator
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.hf_datasets.text_datasets import build_text_dataloader
-from torchtitan.protocols.train_spec import TrainSpec
+from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
 from .infra.parallelize import parallelize_llama
 from .model.args import TransformerModelArgs
-from .model.bitnet_model import BitNetTransformer
+
 from .model.model import Transformer
 from .model.state_dict_adapter import Llama3StateDictAdapter
 
@@ -55,7 +55,6 @@ llama3_args = {
         n_heads=16,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
         norm_eps=1e-30,
     ),
     # 14M parameters
@@ -64,11 +63,9 @@ llama3_args = {
         n_layers=16,
         n_heads=4,
         n_kv_heads=None,
-        init_gate_as_residual=False,
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
         norm_eps=1e-30,
     ),
     # 55M parameters
@@ -77,11 +74,9 @@ llama3_args = {
         n_layers=16,
         n_heads=8,
         n_kv_heads=None,
-        init_gate_as_residual=False,
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
         norm_eps=1e-30,
     ),
     # 206M parameters
@@ -90,11 +85,9 @@ llama3_args = {
         n_layers=16,
         n_heads=16,
         n_kv_heads=None,
-        init_gate_as_residual=False,
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
         norm_eps=1e-30,
     ),
     # 824M parameters
@@ -103,11 +96,9 @@ llama3_args = {
         n_layers=16,
         n_heads=32,
         n_kv_heads=None,
-        init_gate_as_residual=False,
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
         norm_eps=1e-30,
     ),
     # 3.2B parameters
@@ -116,11 +107,9 @@ llama3_args = {
         n_layers=16,
         n_heads=64,
         n_kv_heads=None,
-        init_gate_as_residual=False,
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
         norm_eps=1e-30,
     ),
     # 1.9M parameters
@@ -129,11 +118,9 @@ llama3_args = {
         n_layers=2,
         n_heads=4,
         n_kv_heads=None,
-        init_gate_as_residual=False,
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
         norm_eps=1e-30,
     ),
     # 609M parameters
@@ -142,11 +129,9 @@ llama3_args = {
         n_layers=2,
         n_heads=16,
         n_kv_heads=None,
-        init_gate_as_residual=False,
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
         norm_eps=1e-30,
     ),
     # 2.4B parameters
@@ -155,11 +140,9 @@ llama3_args = {
         n_layers=2,
         n_heads=32,
         n_kv_heads=None,
-        init_gate_as_residual=False,
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
         norm_eps=1e-30,
     ),
     "debugmodel-2layers-multiplier-16": TransformerModelArgs(
@@ -167,11 +150,9 @@ llama3_args = {
         n_layers=2,
         n_heads=64,
         n_kv_heads=None,
-        init_gate_as_residual=False,
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
         norm_eps=1e-30,
     ),
     "1B-Proxy-2layers": TransformerModelArgs(
@@ -184,7 +165,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -198,7 +178,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -212,7 +191,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -226,7 +204,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -240,7 +217,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -254,7 +230,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -268,7 +243,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -282,7 +256,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -333,7 +306,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -347,7 +319,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -361,7 +332,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -376,7 +346,6 @@ llama3_args = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -407,7 +376,6 @@ byte_llama3_configs = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -454,20 +422,10 @@ byte_llama3_configs = {
     ),
 }
 
-llama2_configs = {
-    "debugmodel": llama3_configs["debugmodel"],
-    "7B": TransformerModelArgs(
-        dim=4096,
-        n_layers=32,
-        n_heads=32,
-        vocab_size=32000,
-    ),
-}
-
 
 register_train_spec(
+    "llama3",
     TrainSpec(
-        name="llama3",
         model_cls=Transformer,
         model_args=llama3_args,
         parallelize_fn=parallelize_llama,
@@ -479,41 +437,22 @@ register_train_spec(
         build_loss_fn=build_cross_entropy_loss,
         build_validator_fn=build_validator,
         state_dict_adapter=Llama3StateDictAdapter,
-    )
+    ),
 )
 
 register_train_spec(
+    "byte_llama3",
     TrainSpec(
-        name="byte_llama3",
         model_cls=Transformer,
         model_args=byte_llama3_configs,
         parallelize_fn=parallelize_llama,
-        pipelining_fn=pipeline_llama,
+        pipelining_fn=pipeline_llm,
         build_optimizers_fn=build_optimizers,
         build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_hf_dataloader,
+        build_dataloader_fn=build_text_dataloader,
         build_tokenizer_fn=build_hf_byte_tokenizer,
         build_loss_fn=build_cross_entropy_loss,
         build_validator_fn=build_validator,
         state_dict_adapter=Llama3StateDictAdapter,
-    )
-)
-
-register_train_spec(
-    TrainSpec(
-        name="llama2",
-        model_cls=Transformer,
-        model_args=llama2_configs,
-        parallelize_fn=parallelize_llama,
-        pipelining_fn=pipeline_llama,
-        build_optimizers_fn=build_optimizers,
-        build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_hf_dataloader,
-        build_tokenizer_fn=build_hf_tokenizer,
-        build_loss_fn=build_cross_entropy_loss,
-        build_validator_fn=build_validator,
-        # TODO Not tested, but we expect that the
-        #      `Llama3StateDictAdapter` works for Llama-2 as well.
-        state_dict_adapter=Llama3StateDictAdapter,
-    )
+    ),
 )
