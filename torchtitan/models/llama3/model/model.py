@@ -203,6 +203,11 @@ class Attention(nn.Module):
         self.head_dim = model_args.dim // model_args.n_heads
         self.enable_gqa = self.n_heads > self.n_kv_heads
 
+        if model_args.head_dim is not None:
+            # If we want to explicitly set the head dimension,
+            # we use it instead of the default calculation.
+            self.head_dim = model_args.head_dim
+
         self.wq = nn.Linear(
             model_args.dim, model_args.n_heads * self.head_dim, bias=False
         )
@@ -388,6 +393,11 @@ class FeedForward(nn.Module):
         if ffn_dim_multiplier is not None:
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        if model_args.intermediate_size is not None:
+            # If we want to explicitly set the intermediate dimension,
+            # we use it instead of the default calculation.
+            hidden_dim = model_args.intermediate_size
 
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
