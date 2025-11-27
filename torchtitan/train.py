@@ -24,6 +24,10 @@ import torchtitan.models  # noqa: F401
 
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.data_mix_scheduler import (
+    build_data_mix_scheduler,
+    DataMixScheduler,
+)
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX, moe_loss
 from torchtitan.components.metrics import (
@@ -55,6 +59,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     dataloader: train_spec_module.BaseDataLoader | None
     # TODO: we should make this list[ModelProtocol] but this will affect many components.
     # will do this in a separate PR
+    data_mix_scheduler: DataMixScheduler
     model_parts: list[torch.nn.Module]
     loss_fn: train_spec_module.LossFunction
     optimizers: train_spec_module.OptimizersContainer
@@ -142,6 +147,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             else None
         )
 
+        logger.info(f"dataloader: {self.dataloader.dataset.weights}")
+        self.data_mix_scheduler = build_data_mix_scheduler(self.dataloader, job_config)
         # build model (using meta init)
         model_args = self.train_spec.model_args[job_config.model.flavor]
         # set the model args from training job configs
@@ -684,6 +691,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         optim_step_start = time.perf_counter()
         self.optimizers.step()
         self.lr_schedulers.step()
+        self.data_mix_scheduler.step(self.step + 1)
         self.metrics_processor.optim_step_times.append(
             time.perf_counter() - optim_step_start
         )
@@ -729,6 +737,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "lr": lr,
         }
         extra_metrics.update(self.optimizers.get_lrs())
+        extra_metrics.update(
+            {
+                f"data_mixing/{data_i}": weights_for_data_i
+                for data_i, weights_for_data_i in enumerate(
+                    self.data_mix_scheduler.get_weights_at_step(self.step)
+                )
+            }
+        )
 
         if need_to_calculate_norm:
             param_norms = self.optimizers.get_parameter_norms()
@@ -757,6 +773,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}")
+
+        self.data_mix_scheduler.step(self.step)
+        # lets over write the weights for the first step in case the weights are not set in configs
+        # cause for now the data mixing scheduler is stateless
 
         with (
             maybe_enable_profiling(
