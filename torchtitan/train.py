@@ -123,7 +123,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info(
             f"Building {job_config.model.name} {job_config.model.flavor}"
-            f"with {json.dumps(dataclasses.asdict(model_args), indent=2, ensure_ascii=False)}"
+            f""
+            f"with {json.dumps(dataclasses.asdict(json.dumps(dataclasses.asdict(model_args), indent=2, ensure_ascii=False)), indent=2, ensure_ascii=False)}"
         )
         with (
             torch.device("meta"),
