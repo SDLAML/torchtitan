@@ -246,9 +246,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         assert self.gradient_accumulation_steps > 0
 
-        # Figure out whether model will be loaded, so that we can skip
-        # weight initialization.
-        skip_weight_init = CheckpointManager.can_skip_weight_init(job_config)
+        # Figure out whether model will be loaded, so that we can skip weight initialization.
+        """
+        Comment: *Important*:
+        Scince we have some `persistent=False` buffers, such as `freqs_cis`,
+        we *CANNOT* skip weight initialization. because they will not be loaded from the checkpoint.
+        """
+        # skip_weight_init = CheckpointManager.can_skip_weight_init(job_config)
+        skip_weight_init = False
 
         # apply parallelisms and initialization
         if parallel_dims.pp_enabled:
