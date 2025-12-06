@@ -166,7 +166,6 @@ def parallelize_llama(
             model,
             world_mesh,
             enable_compile=model_compile_enabled,
-            enable_compiled_autograd=job_config.parallelism.enable_compiled_autograd,
         )
 
     return model
