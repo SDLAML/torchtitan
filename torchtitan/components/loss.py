@@ -17,6 +17,10 @@ IGNORE_INDEX = -100
 
 LossFunction: TypeAlias = Callable[..., torch.Tensor]
 
+IGNORE_INDEX = -100
+# Pytorch's default for F.cross_entropy
+# Used in VLM and SFT training
+
 
 def cross_entropy_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Cross-entropy loss with sum reduction for token-based normalization."""
