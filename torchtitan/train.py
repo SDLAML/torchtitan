@@ -249,7 +249,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Figure out whether model will be loaded, so that we can skip weight initialization.
         """
         Comment: *Important*:
-        Scince we have some `persistent=False` buffers, such as `freqs_cis`,
+        Science we have some `persistent=False` buffers, such as `freqs_cis`,
         we *CANNOT* skip weight initialization. because they will not be loaded from the checkpoint.
         """
         # skip_weight_init = CheckpointManager.can_skip_weight_init(job_config)
@@ -489,6 +489,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 raise DataloaderExhaustedError() from ex
             input_dict, labels = batch
             ntokens_batch = labels.numel()
+            # check if there are -100 in labels because it means the token is ignored
+            n_ignored_tokens = (labels == -100).sum().item()
+            # TODO (JSC):            # TODO! FIXME: Not sure if this is necessary, but just in case.
+            if self.job_config.training.running_sft_training:
+                ntokens_batch -= n_ignored_tokens
+
             self.ntokens_seen += ntokens_batch
             self.metrics_processor.ntokens_since_last_log += ntokens_batch
             self.metrics_processor.data_loading_times.append(
