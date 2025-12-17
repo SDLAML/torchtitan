@@ -275,9 +275,9 @@ class MixedDataset(IterableDataset, Stateful):
         return dataset_index
 
     def set_weights(self, weights: list[float]):
-        assert len(weights) == len(
-            self.datasets
-        ), "weights must have the same length as datasets"
+        assert len(weights) == len(self.datasets), (
+            "weights must have the same length as datasets"
+        )
         self.weights = weights
 
     def _get_next(self, dataset_index: int):
@@ -286,7 +286,9 @@ class MixedDataset(IterableDataset, Stateful):
             return next(data_iter)
         except StopIteration:
             dataset = self.datasets[dataset_index]
-            logger.warning(f"Removing {dataset.dataset_name} from data mix.")
+            logger.warning(
+                f"Removing {dataset.dataset_name} | {dataset.dataset_path} from data mix."
+            )
             self.weights[dataset_index] = 0.0
             return None
 
