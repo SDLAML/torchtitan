@@ -300,6 +300,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             job_config.metrics.norms_to_log
         )
 
+        logger.info("Finished optimizer initialization")
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
@@ -321,6 +322,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             ),
             base_folder=job_config.job.dump_folder,
         )
+
+        logger.info("Finished checkpoint manager initialization")
 
         loss_parallel_enabled = (
             parallel_dims.tp_enabled
