@@ -647,6 +647,15 @@ def build_text_dataloader(
         "generator": rng,
     }
 
+    rng = torch.Generator()
+    if job_config.training.dataset_seed is not None:
+        rng.manual_seed(job_config.training.dataset_seed)
+    dataloader_kwargs = {
+        **asdict(job_config.training.dataloader),
+        "batch_size": batch_size,
+        "generator": rng,
+    }
+
     return ParallelAwareDataloader(
         hf_ds,
         dp_rank=dp_rank,
