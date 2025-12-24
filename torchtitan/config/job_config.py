@@ -359,7 +359,6 @@ class LRScheduler:
 
 
 @dataclass
-<<<<<<< ours
 class DataLoader:
     """
     Configuration for PyTorch DataLoader settings.
@@ -391,38 +390,12 @@ class DataLoader:
     Number of batches loaded in advance by each worker. Only valid when num_workers > 0.
     Default is 2 when num_workers > 0, otherwise None.
     """
-=======
-class SFTDataConfig:
-    split: str = "train"
-    dataset_subset: str | None = None
-    messages_key: str = "messages"
-    prompt_key: str = "question"
-    response_key: str = "answer"
-    tools_key: str = "tools"
-    thinking_key: str = "enable_thinking"
-    always_thinking: bool = False
-    is_multiturn: bool = False
-    apply_chat_template: bool = False
-    greedy_packing: bool = True
-    pad_mode: Literal["right", "no_padding"] = "right"
-    truncation: Literal["left", "right", "error"] = "right"
-    chat_template_kwargs: dict = field(default_factory=dict)
-    ignore_input_ids_mismatch: bool = False
-    pretend_as_text_dataset: bool = False
-    custom_message_mapping_function: str | None = None
->>>>>>> theirs
 
 
 @dataclass
 class Training:
     dataset: list[str] = field(default_factory=lambda: ["c4_test"])
     """Dataset to use"""
-
-    running_sft_training: bool = False
-    """
-    If True, we are running SFT training. And we will overwrite the dataset config
-    from the sft_data_config.
-    """
 
     dataset_path: list[str] | None = None
     """
@@ -1294,7 +1267,6 @@ class JobConfig:
     profiling: Profiling = field(default_factory=Profiling)
     metrics: Metrics = field(default_factory=Metrics)
     model: Model = field(default_factory=Model)
-    sft_data_config: SFTDataConfig = field(default_factory=SFTDataConfig)
     optimizer: Optimizer = field(default_factory=Optimizer)
     lr_scheduler: LRScheduler = field(default_factory=LRScheduler)
     training: Training = field(default_factory=Training)

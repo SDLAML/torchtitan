@@ -279,9 +279,9 @@ class MixedDataset(IterableDataset, Stateful):
         return dataset_index
 
     def set_weights(self, weights: list[float]):
-        assert len(weights) == len(
-            self.datasets
-        ), "weights must have the same length as datasets"
+        assert len(weights) == len(self.datasets), (
+            "weights must have the same length as datasets"
+        )
         self.weights.copy_(torch.tensor(weights, dtype=torch.float64))
 
     def _get_next(self, dataset_index: int):
@@ -551,43 +551,6 @@ def build_text_dataloader(
     if job_config.training.dataset_seed is not None:
         rng.manual_seed(job_config.training.dataset_seed)
 
-    if job_config.training.running_sft_training:
-        from torchtitan.hf_datasets.sft_text_datasets import SFTDataset
-
-        sft_data_config = job_config.sft_data_config
-        # TODO: Improving the dataset loading, its easy to fix
-        dataset_split = sft_data_config.split
-        dataset_subset = sft_data_config.dataset_subset
-        dataset_path = (
-            dataset_path[0] if isinstance(dataset_path, list) else dataset_path
-        )
-        dataset = load_dataset(
-            dataset_path,
-            dataset_subset,
-            split=dataset_split,
-            streaming=dataset_streaming,
-        )
-        hf_ds = SFTDataset(
-            dataset=dataset,
-            tokenizer=tokenizer,
-            seq_len=seq_len,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            infinite=infinite,
-            sft_data_config=sft_data_config,
-        )
-        collate_fn = hf_ds.collate_fn
-        return ParallelAwareDataloader(
-            dataset=hf_ds,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            batch_size=batch_size,
-            num_workers=job_config.training.dataset_num_workers,
-            pin_memory=job_config.training.dataset_pin_memory,
-            generator=rng,
-            collate_fn=collate_fn,
-        )
-
     num_mtp_tokens = job_config.training.num_mtp_tokens
     dataset_weights = job_config.training.dataset_weights
     dataset_mix_in_seq = job_config.training.dataset_mix_in_seq
@@ -611,9 +574,9 @@ def build_text_dataloader(
     )
 
     if len(dataset_name) > 1:
-        assert (
-            dataset_files is None
-        ), "cannot supply dataset files when using multiple datasets"
+        assert dataset_files is None, (
+            "cannot supply dataset files when using multiple datasets"
+        )
     for d in [
         dataset_path,
         dataset_inner_name,
@@ -621,9 +584,9 @@ def build_text_dataloader(
         dataset_key,
         dataset_weights,
     ]:
-        assert (
-            len(d) == normed_list_length
-        ), f"list {d} does not match length of list of datasets (length = {normed_list_length})"
+        assert len(d) == normed_list_length, (
+            f"list {d} does not match length of list of datasets (length = {normed_list_length})"
+        )
     hf_datasets = []
     for d_name, d_path, d_inner_name, d_split, d_key in zip(
         dataset_name,
@@ -675,7 +638,6 @@ def build_text_dataloader(
             seed=job_config.training.dataset_seed,
         )
 
-<<<<<<< ours
     rng = torch.Generator()
     if job_config.training.dataset_seed is not None:
         rng.manual_seed(job_config.training.dataset_seed)
@@ -684,8 +646,7 @@ def build_text_dataloader(
         "batch_size": batch_size,
         "generator": rng,
     }
-=======
->>>>>>> theirs
+
     return ParallelAwareDataloader(
         hf_ds,
         dp_rank=dp_rank,
@@ -720,50 +681,25 @@ def build_text_validation_dataloader(
     dataset_streaming = job_config.validation.dataset_streaming
     dataset_key = job_config.validation.dataset_key
 
-    collate_fn = None
-    if not job_config.training.running_sft_training:
-        hf_ds = HuggingFaceDataset(
-            dataset_name=dataset_name,
-            dataset_path=dataset_path,
-            tokenizer=tokenizer,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            infinite=infinite,
-            dataset_inner_name=dataset_inner_name,
-            dataset_files=dataset_files,
-            dataset_split=dataset_split,
-            dataset_streaming=dataset_streaming,
-            dataset_key=dataset_key,
-        )
+    hf_ds = HuggingFaceDataset(
+        dataset_name=dataset_name,
+        dataset_path=dataset_path,
+        tokenizer=tokenizer,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        infinite=infinite,
+        dataset_inner_name=dataset_inner_name,
+        dataset_files=dataset_files,
+        dataset_split=dataset_split,
+        dataset_streaming=dataset_streaming,
+        dataset_key=dataset_key,
+    )
 
-        hf_ds = GreedyPackedDataset(
-            dataset=hf_ds,
-            seq_len=seq_len,
-            infinite=False,
-        )
-    else:
-        from torchtitan.hf_datasets.sft_text_datasets import SFTDataset
-
-        sft_data_config = job_config.sft_data_config
-        # TODO: Improving the dataset loading, its easy to fix
-        dataset_split = sft_data_config.split
-        dataset_subset = sft_data_config.dataset_subset
-        dataset = load_dataset(
-            dataset_path,
-            dataset_subset,
-            split=dataset_split,
-            streaming=dataset_streaming,
-        )
-        hf_ds = SFTDataset(
-            dataset=dataset,
-            tokenizer=tokenizer,
-            seq_len=seq_len,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            infinite=infinite,
-            sft_data_config=sft_data_config,
-        )
-        collate_fn = hf_ds.collate_fn
+    hf_ds = GreedyPackedDataset(
+        dataset=hf_ds,
+        seq_len=seq_len,
+        infinite=False,
+    )
 
     rng = torch.Generator()
     if job_config.validation.seed is not None:
@@ -778,12 +714,5 @@ def build_text_validation_dataloader(
         hf_ds,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
-<<<<<<< ours
         **dataloader_kwargs,
-=======
-        batch_size=batch_size,
-        num_workers=job_config.validation.dataset_num_workers,
-        pin_memory=job_config.validation.dataset_pin_memory,
-        collate_fn=collate_fn,
->>>>>>> theirs
     )
