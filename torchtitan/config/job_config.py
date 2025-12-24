@@ -404,12 +404,6 @@ class Training:
     Entries with string "None" will be replaced with the Python literal `None`.
     """
 
-    dataset_num_workers: int = 0
-    """Number of data loader workers"""
-
-    dataset_pin_memory: bool = False
-    """Whether to use memory pinning in the data loader"""
-
     dataset_seed: int | None = None
     """
     Choose the base RNG seed used for data shuffling. By default,
