@@ -277,6 +277,7 @@ class MixedDataset(IterableDataset, Stateful):
         self._sample_idx = 0
         self._data_iters = None
         self._rng = Random(seed + dp_rank)
+        self._dp_rank = dp_rank
 
     @property
     def normed_weights(self):
@@ -679,20 +680,30 @@ def build_text_dataloader(
     rng = torch.Generator()
     if job_config.training.dataset_seed is not None:
         rng.manual_seed(job_config.training.dataset_seed)
+    
+    if job_config.checkpoint.enable:
+        global_batch_size = job_config.training.global_batch_size
+        if global_batch_size < 0:
+            global_batch_size = job_config.training.local_batch_size * dp_world_size
+        gradient_accumulation_steps = global_batch_size // (
+            job_config.training.local_batch_size * dp_world_size
+        )
+        ckpt_freq = job_config.checkpoint.interval * gradient_accumulation_steps
+    elif len(dataset_name) == 1:
+        ckpt_freq = 1
+    else:
+        ckpt_freq = 999999999999
+    logger.info(f" [DataLoader] snapshot_every_n_steps is set to {ckpt_freq}")
+
     dataloader_kwargs = {
         **asdict(job_config.training.dataloader),
         "batch_size": batch_size,
         "generator": rng,
+        "snapshot_every_n_steps": ckpt_freq,
+
     }
 
-    rng = torch.Generator()
-    if job_config.training.dataset_seed is not None:
-        rng.manual_seed(job_config.training.dataset_seed)
-    dataloader_kwargs = {
-        **asdict(job_config.training.dataloader),
-        "batch_size": batch_size,
-        "generator": rng,
-    }
+
 
     return ParallelAwareDataloader(
         hf_ds,
@@ -751,11 +762,23 @@ def build_text_validation_dataloader(
     rng = torch.Generator()
     if job_config.validation.seed is not None:
         rng.manual_seed(job_config.validation.seed)
+
+    if job_config.checkpoint.enable:
+        ckpt_freq = job_config.checkpoint.interval
+    elif len(dataset_name) == 1:
+        ckpt_freq = 1
+    else:
+        ckpt_freq = 999999999999
+    logger.info(f" [DataLoader] snapshot_every_n_steps is set to {ckpt_freq}")
+
+
     dataloader_kwargs = {
         **asdict(job_config.validation.dataloader),
         "batch_size": batch_size,
         "generator": rng,
+        "snapshot_every_n_steps": ckpt_freq,
     }
+    
 
     return ParallelAwareDataloader(
         hf_ds,
