@@ -8,14 +8,18 @@ import torch
 from torch import nn
 from torch.nn.attention.flex_attention import and_masks
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.distributed.utils import get_param_dtype
 from torchtitan.models.attention import (
     create_attention_mask,
+    create_varlen_metadata_for_document,
     get_causal_mask_mod,
     get_document_mask_mod,
 )
 
-from torchtitan.models.inits import build_init_fn
+from torchtitan.models.inits import (
+    build_init_fn,
+    setup_depth_init,
+    setup_residual_scale,
+)
 from torchtitan.models.inputs import MoEInputs, MoEInputsDict
 from torchtitan.models.llama3.model.model import (
     # apply_rotary_emb,
@@ -30,6 +34,7 @@ from torchtitan.tools.logging import logger
 
 from .args import MoEModelArgs
 from .moe import FeedForward, MoE
+from .moe_deepep import DeepEPMoE
 from .moe_utils import calc_gate_scaling_factor
 
 
@@ -81,7 +86,6 @@ class TransformerBlock(nn.Module):
         self.moe_enabled = layer_id >= model_args.n_dense_layers
 
         if self.moe_enabled:
-
             match_dim_with_dense = True
             if match_dim_with_dense:
                 ratio = 1.0 / (moe_args.top_k + moe_args.num_shared_experts)
@@ -97,7 +101,12 @@ class TransformerBlock(nn.Module):
             if model_args.moe_intermediate_size is not None:
                 hidden_dim = model_args.moe_intermediate_size
 
-            self.moe = MoE(
+            if model_args.moe_impl == "deepep":
+                moe_cls = DeepEPMoE
+            else:
+                moe_cls = MoE
+
+            self.moe = moe_cls(
                 layer_id,
                 model_args.dim,
                 hidden_dim,
@@ -143,35 +152,12 @@ class TransformerBlock(nn.Module):
 
         # x  = identity_scale * x + block_scale * block(x)
 
-        match model_init_args.depth_init:
-            case "relative_depth":
-                self.residual_div_attn = (2 * (layer_id + 1)) ** 0.5
-                self.residual_div_ffn = (2 * (layer_id + 2)) ** 0.5
-            case "total_depth":
-                self.residual_div_attn = (2 * model_args.n_layers) ** 0.5
-                self.residual_div_ffn = (2 * model_args.n_layers) ** 0.5
-            case None:
-                self.residual_div_attn = 1.0
-                self.residual_div_ffn = 1.0
-            case _:
-                raise ValueError(f"Invalid depth_init: {model_init_args.depth_init}")
-
-        match model_init_args.residual_scale:
-            case "depth_scale":
-                total_depth = 2 * model_args.n_layers
-                self.block_scale = 1 / total_depth
-                self.identity_scale = (total_depth - 1) / total_depth
-            case "complete_p":
-                total_depth = 2 * model_args.n_layers
-                self.block_scale = 1 / total_depth
-                self.identity_scale = 1.0
-            case "identity":
-                self.block_scale = 1.0
-                self.identity_scale = 1.0
-            case _:
-                raise ValueError(
-                    f"Invalid residual_scale: {model_init_args.residual_scale}"
-                )
+        self.residual_div_attn, self.residual_div_ffn = setup_depth_init(
+            model_init_args.depth_init, layer_id, model_args.n_layers
+        )
+        self.block_scale, self.identity_scale = setup_residual_scale(
+            model_init_args.residual_scale, model_args.n_layers
+        )
 
     def forward(
         self,
@@ -179,7 +165,7 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         accumulated_load_balance_loss: torch.Tensor,
         attention_masks: AttentionMasksType | None,
-        start_pos: int = -1,
+        positions: torch.Tensor | None = None,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -194,7 +180,7 @@ class TransformerBlock(nn.Module):
         """
 
         h = self.identity_scale * x + self.block_scale * self.attention(
-            self.attention_norm(x), freqs_cis, attention_masks, start_pos=start_pos
+            self.attention_norm(x), freqs_cis, attention_masks, positions
         )
 
         if self.moe_enabled:
@@ -233,9 +219,6 @@ class TransformerBlock(nn.Module):
                 init_gate_as_residual=self.init_gate_as_residual,
                 init_fn_type=self.weight_init_fn_type,
             )
-
-    def init_kv_cache(self, max_batch_size: int, max_seq_length: int):
-        self.attention.init_kv_cache(max_batch_size, max_seq_length)
 
 
 class Transformer(nn.Module, ModelProtocol):
@@ -372,13 +355,14 @@ class Transformer(nn.Module, ModelProtocol):
             self.model_args.rope_scaling_args,
         )
 
-    def get_attention_masks(
+    def _get_flex_attention_masks(
         self,
         input_batch: torch.Tensor,
         tokenizer: BaseTokenizer,
         extra_inputs: dict[str, torch.Tensor] | None = None,
     ) -> AttentionMasksType:
         mask_mods = [get_causal_mask_mod()]
+
         match self.model_args.attn_mask_type:
             case "causal":
                 B = 1
@@ -389,25 +373,42 @@ class Transformer(nn.Module, ModelProtocol):
                 raise ValueError(
                     f"Unknown attention mask type: {self.model_args.attn_mask_type}"
                 )
+
         return create_attention_mask(
             and_masks(*mask_mods), B, None, input_batch.shape[1], input_batch.shape[1]
         )
 
-    def init_kv_cache(self, max_batch_size: int, max_seq_length: int):
-        dtype = get_param_dtype(self)
-        for layer in self.layers.values():
-            if layer is not None:
-                layer.init_kv_cache(max_batch_size, max_seq_length, dtype=dtype)
-        if self.model_args.num_mtp_modules > 0:
-            for layer in self.mtp_layers.values():
-                if layer is not None:
-                    layer.init_kv_cache(max_batch_size, max_seq_length, dtype=dtype)
+    def get_attention_masks(
+        self,
+        input_batch: torch.Tensor,
+        tokenizer: BaseTokenizer,
+        extra_inputs: dict[str, torch.Tensor] | None = None,
+    ) -> AttentionMasksType:
+        match self.model_args.attn_type:
+            case "flex":
+                return self._get_flex_attention_masks(
+                    input_batch, tokenizer, extra_inputs
+                )
+            case "varlen":
+                if self.model_args.attn_mask_type != "block_causal":
+                    raise ValueError(
+                        f"varlen attention is only supported with block_causal \
+                        attention mask type, got {self.model_args.attn_mask_type}"
+                    )
+                return create_varlen_metadata_for_document(
+                    input_batch, tokenizer.eos_id
+                )
+            case _:
+                raise NotImplementedError(
+                    "Only varlen and flex attn masks are supported"
+                )
 
     def forward(
         self,
         inputs: MoEInputs,
         accumulated_load_balance_loss: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
+        positions: torch.Tensor | None = None,
     ) -> MoEInputsDict:
         """
         Perform a forward pass through the Transformer model.
@@ -437,29 +438,12 @@ class Transformer(nn.Module, ModelProtocol):
         if not isinstance(inputs, dict):
             inputs = {"tokens_list": inputs}
         tokens = inputs["tokens_list"]
-        start_pos = inputs.get("start_pos", -1)
-        prev_embed = inputs.get("prev_embed", None)
+        # prev_embed = inputs.get("prev_embed", None)
         if isinstance(tokens, list):
             tokens = tokens[0]
 
-        if not self.model_args.use_flex_attn and start_pos >= 0:
-            raise ValueError(
-                "`start_pos >= 0`, but cannot use caching without FlexAttention"
-            )
-
-        seqlen = tokens.shape[1]
-
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-        h = (
-            self.tok_embeddings(tokens[:, : self.model_args.max_seq_len])
-            if self.tok_embeddings
-            else tokens
-        )
-
-        if start_pos >= 0:
-            freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
-        else:
-            freqs_cis = self.freqs_cis
+        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
         accumulated_load_balance_loss = (
             torch.zeros((), device=h.device, dtype=torch.float32)
@@ -470,10 +454,10 @@ class Transformer(nn.Module, ModelProtocol):
         for layer in self.layers.values():
             h, accumulated_load_balance_loss = layer(
                 h,
-                freqs_cis,
+                self.freqs_cis,
                 accumulated_load_balance_loss,
                 attention_masks,
-                start_pos=start_pos,
+                positions,
             )
 
         h = self.norm(h) if self.norm else h

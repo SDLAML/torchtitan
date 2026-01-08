@@ -14,6 +14,6 @@ _supported_models = frozenset(
         "llama4",
         "qwen3",
         "MoEllama",
+        "MoEllama3",
     ]
 )
-from . import llama3, MoEllama

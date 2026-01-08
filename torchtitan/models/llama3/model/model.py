@@ -14,7 +14,6 @@ from torch import nn
 from torch.nn.attention.flex_attention import and_masks, BlockMask
 
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.distributed.utils import get_param_dtype
 from torchtitan.models.activations import build_activation
 from torchtitan.models.attention import (
     create_attention_mask,
@@ -26,7 +25,11 @@ from torchtitan.models.attention import (
     VarlenAttentionWrapper,
     VarlenMetadata,
 )
-from torchtitan.models.inits import build_init_fn
+from torchtitan.models.inits import (
+    build_init_fn,
+    setup_depth_init,
+    setup_residual_scale,
+)
 from torchtitan.models.inputs import MTPInputs, MTPInputsDict
 from torchtitan.models.norms import build_norm
 from torchtitan.protocols.model import AttentionMasksType
@@ -185,39 +188,6 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
-class KVCache(nn.Module):
-    def __init__(
-        self,
-        batch_size: int,
-        seq_length: int,
-        n_kv_heads: int,
-        head_dim: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ):
-        super().__init__()
-        cache_shape = (batch_size, seq_length, n_kv_heads, head_dim)
-        self.register_buffer(
-            "cache_k",
-            torch.zeros(cache_shape, dtype=dtype, device=device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "cache_v",
-            torch.zeros(cache_shape, dtype=dtype, device=device),
-            persistent=False,
-        )
-
-    def update(self, start_pos, xk, xv):
-        assert start_pos >= 0
-        bsz, seqlen, _ = xk.shape
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-        xk = self.cache_k[:bsz, : start_pos + seqlen]
-        xv = self.cache_v[:bsz, : start_pos + seqlen]
-        return xk, xv
-
-
 class Attention(nn.Module):
     """
     Multi-head attention module.
@@ -303,19 +273,6 @@ class Attention(nn.Module):
         for norm in (self.q_norm, self.k_norm, self.v_norm, self.mid_norm):
             if not isinstance(norm, nn.Identity):
                 norm.reset_parameters()
-
-    def init_kv_cache(
-        self, max_batch_size: int, max_seq_length: int, dtype: torch.dtype
-    ):
-        device = self.wk.weight.device
-        self._kv_cache = KVCache(
-            batch_size=max_batch_size,
-            seq_length=max_seq_length,
-            n_kv_heads=self.n_kv_heads,
-            head_dim=self.head_dim,
-            dtype=dtype,
-            device=device,
-        )
 
     def forward(
         self,
@@ -519,36 +476,15 @@ class TransformerBlock(nn.Module):
             model_init_args.intermediate_init_std
             * model_args.dim**model_init_args.intermediate_exp
         )
-        match model_init_args.depth_init:
-            case "relative_depth":
-                self.residual_div_attn = (2 * (layer_id + 1)) ** 0.5
-                self.residual_div_ffn = (2 * (layer_id + 2)) ** 0.5
-            case "total_depth":
-                self.residual_div_attn = (2 * model_args.n_layers) ** 0.5
-                self.residual_div_ffn = (2 * model_args.n_layers) ** 0.5
-            case None:
-                self.residual_div_attn = 1.0
-                self.residual_div_ffn = 1.0
-            case _:
-                raise ValueError(f"Invalid depth_init: {model_init_args.depth_init}")
         self.init_gate_as_residual = model_init_args.init_gate_as_residual
 
-        match model_init_args.residual_scale:
-            case "depth_scale":
-                total_depth = 2 * model_args.n_layers
-                self.block_scale = 1 / total_depth
-                self.identity_scale = (total_depth - 1) / total_depth
-            case "complete_p":
-                total_depth = 2 * model_args.n_layers
-                self.block_scale = 1 / total_depth
-                self.identity_scale = 1.0
-            case "identity":
-                self.block_scale = 1.0
-                self.identity_scale = 1.0
-            case _:
-                raise ValueError(
-                    f"Invalid residual_scale: {model_init_args.residual_scale}"
-                )
+        self.residual_div_attn, self.residual_div_ffn = setup_depth_init(
+            model_init_args.depth_init, layer_id, model_args.n_layers
+        )
+
+        self.block_scale, self.identity_scale = setup_residual_scale(
+            model_init_args.residual_scale, model_args.n_layers
+        )
 
     def forward(
         self,
@@ -592,11 +528,6 @@ class TransformerBlock(nn.Module):
             init_gate_as_residual=self.init_gate_as_residual,
             init_fn_type=self.weight_init_fn_type,
         )
-
-    def init_kv_cache(
-        self, max_batch_size: int, max_seq_length: int, dtype: torch.dtype
-    ):
-        self.attention.init_kv_cache(max_batch_size, max_seq_length, dtype=dtype)
 
 
 class MTPModule(nn.Module):
@@ -854,31 +785,6 @@ class Transformer(nn.Module, ModelProtocol):
                     "Only varlen and flex attn masks are supported"
                 )
 
-    def get_attention_masks(
-        self,
-        input_batch: torch.Tensor,
-        tokenizer: BaseTokenizer,
-        extra_inputs: dict[str, torch.Tensor] | None = None,
-    ) -> AttentionMasksType:
-        match self.model_args.attn_type:
-            case "flex":
-                return self._get_flex_attention_masks(
-                    input_batch, tokenizer, extra_inputs
-                )
-            case "varlen":
-                if self.model_args.attn_mask_type != "block_causal":
-                    raise ValueError(
-                        f"varlen attention is only supported with block_causal \
-                        attention mask type, got {self.model_args.attn_mask_type}"
-                    )
-                return create_varlen_metadata_for_document(
-                    input_batch, tokenizer.eos_id
-                )
-            case _:
-                raise NotImplementedError(
-                    "Only varlen and flex attn masks are supported"
-                )
-
     def forward(
         self,
         inputs: MTPInputs,
@@ -915,7 +821,6 @@ class Transformer(nn.Module, ModelProtocol):
         if not isinstance(inputs, dict):
             inputs = {"tokens_list": inputs}
         tokens_list = inputs["tokens_list"]
-        start_pos = inputs.get("start_pos", -1)
         prev_embed = inputs.get("prev_embed", None)
         if not isinstance(tokens_list, list):
             tokens = tokens_list
@@ -943,21 +848,21 @@ class Transformer(nn.Module, ModelProtocol):
         if self.model_args.num_mtp_modules > 0:
             # Check if output norm is in this stage. If yes, assign the
             # hidden embedding.
-            if self.norm and prev_embed is None:
-                prev_embed = h
+            # if self.norm and prev_embed is None:
+            #     prev_embed = h
 
-            for mtp_layer_id, mtp_layer in self.mtp_layers.items():
-                mtp_layer_id = int(mtp_layer_id)
-                token_offset = mtp_layer_id + 1
-                output, prev_embed = mtp_layer(
-                    tokens[
-                        :, token_offset : token_offset + self.model_args.max_seq_len
-                    ],
-                    prev_embed,
-                    freqs_cis,
-                    start_pos=start_pos,
-                )
-                tokens_list[mtp_layer_id + 1] = output
+            # for mtp_layer_id, mtp_layer in self.mtp_layers.items():
+            #     mtp_layer_id = int(mtp_layer_id)
+            #     token_offset = mtp_layer_id + 1
+            #     output, prev_embed = mtp_layer(
+            #         tokens[
+            #             :, token_offset : token_offset + self.model_args.max_seq_len
+            #         ],
+            #         prev_embed,
+            #         freqs_cis,
+            #     )
+            #     tokens_list[mtp_layer_id + 1] = output
+            pass
 
         # PP compatibility hack
         if self.model_args.num_mtp_modules > 0:

@@ -510,6 +510,13 @@ def build_optimizers_with_moe_load_balancing(
             g = g / torch.clamp(norms, min=epsilon)
             g = g.squeeze(0) if is_flat else g
             return g
+        elif norm_factor in ["rms", "rms_zero_mean"]:
+            is_flat = g.dim() == 1
+            g = g.unsqueeze(0) if is_flat else g
+            rms = torch.sqrt(torch.mean(g.square(), dim=1, keepdim=True))
+            g = g / torch.clamp(rms, min=epsilon)
+            g = g.squeeze(0) if is_flat else g
+            return g
 
     def need_rescale_stats(module):
         return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT

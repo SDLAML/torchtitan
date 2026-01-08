@@ -85,13 +85,14 @@ class MoEModelArgs(BaseModelArgs):
     # If this is True, it implies `qk_norm=True`.
     norm_everywhere: bool = False
 
-    use_flex_attn: bool = False
+    attn_type: str = "sdpa"
     attn_mask_type: str = "causal"
     eos_id: int = 0
     pad_id: int = -1
 
     # MoE
     moe_args: MoEArgs = field(default_factory=MoEArgs)
+    moe_impl: str = "standard"  # by default, we use standard communication backend
 
     # Number of additional modules to insert for multi-token prediction.
     num_mtp_modules: int = 0
@@ -155,6 +156,19 @@ class MoEModelArgs(BaseModelArgs):
                 f"Padded vocab size from {orig_vocab_size} to {self.vocab_size}."
             )
 
+        self.attn_type = job_config.model.attn_type
+        self.attn_mask_type = job_config.model.attn_mask_type
+
+        if job_config.parallelism.expert_parallel_degree == 1:
+            self.moe_impl = "standard"
+            # if we are not using expert parallelism, we use standard communication backend
+            if job_config.parallelism.expert_parallel_comm_backend == "deepep":
+                logger.warning(
+                    " !! Expert parallelism is disabled, using standard communication backend."
+                )
+        else:
+            self.moe_impl = job_config.parallelism.expert_parallel_comm_backend
+
         seq_len = job_config.training.seq_len
         if seq_len > self.max_seq_len:
             logger.warning(
@@ -162,7 +176,10 @@ class MoEModelArgs(BaseModelArgs):
             )
         self.max_seq_len = seq_len
 
-        if job_config.parallelism.context_parallel_degree > 1 and self.use_flex_attn:
+        if (
+            job_config.parallelism.context_parallel_degree > 1
+            and self.attn_type != "sdpa"
+        ):
             raise NotImplementedError(
                 "CP support for FlexAttention is still in progress."
             )

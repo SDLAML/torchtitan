@@ -98,6 +98,7 @@ class GroupedExperts(nn.Module):
         dim_in: int,
         dim_hidden: int,
         num_experts: int = 1,
+        use_grouped_mm: bool = True,
         activation_type: str = "silu",
         norm_everywhere: bool = False,
         norm_type: str | None = None,
@@ -114,7 +115,7 @@ class GroupedExperts(nn.Module):
         self.w2 = nn.Parameter(torch.empty(num_experts, dim_in, dim_hidden))
         self.w3 = nn.Parameter(torch.empty(num_experts, dim_hidden, dim_in))
 
-        self.use_grouped_mm = True
+        self.use_grouped_mm = use_grouped_mm
 
         self.act_fn = build_activation(activation_type)
 
@@ -201,7 +202,6 @@ class GroupedExperts(nn.Module):
         init_gate_as_residual: bool,
         init_fn_type: str,
     ):
-
         init_fn = build_init_fn(init_fn_type)
         gate_init_std = init_std / residual_div if init_gate_as_residual else init_std
 

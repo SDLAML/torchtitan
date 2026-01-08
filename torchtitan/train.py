@@ -7,17 +7,12 @@
 import dataclasses
 import datetime
 import functools
-import dataclasses
 import importlib
 import json
 import os
 import time
 from datetime import timedelta
-<<<<<<< ours
 from typing import Any, Iterable
-=======
-from typing import Any, Generator, Iterable
->>>>>>> theirs
 
 import tomli_w
 import torch
@@ -90,6 +85,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     # additional training states
     step: int
     ntokens_seen: int
+
+    # used for loggering, not need to put it in the stateful class
+    prev_data_sampled_tensor: torch.Tensor
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -168,7 +166,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info(
             f"Building {job_config.model.name} {job_config.model.flavor}"
             f""
-            f"with {json.dumps(dataclasses.asdict(json.dumps(dataclasses.asdict(model_args), indent=2, ensure_ascii=False)), indent=2, ensure_ascii=False)}"
+            f"with {json.dumps(dataclasses.asdict(model_args), indent=2, ensure_ascii=False)}"
         )
         with (
             torch.device("meta"),
@@ -235,9 +233,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         if job_config.training.num_mtp_tokens > 0:
-            assert self.train_spec.build_loss_fn is build_cross_entropy_loss, (
-                "MTP requires cross-entropy loss"
-            )
+            assert (
+                self.train_spec.build_loss_fn is build_cross_entropy_loss
+            ), "MTP requires cross-entropy loss"
             pre_mtp_loss_fn = self.loss_fn
             self.loss_fn = functools.partial(
                 multi_token_cross_entropy_loss,
@@ -373,6 +371,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.step = 0
         self.ntokens_seen = 0
 
+        self.prev_data_sampled_tensor = None
+
         self.checkpointer = CheckpointManager(
             dataloader=self.dataloader,
             model_parts=self.model_parts,
@@ -487,6 +487,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             model_args_dict.pop("_enforced")
             with open(model_args_save_path, "w") as f:
                 json.dump(model_args_dict, f, indent=4)
+
+            data_mix_scheduler_save_path = os.path.join(
+                self.job_config.job.dump_folder,
+                "data_mix_scheduler_"
+                + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+                + ".json",
+            )
+            with open(data_mix_scheduler_save_path, "w") as f:
+                json.dump(self.data_mix_scheduler.mixing_configs, f, indent=4)
 
     def init_distributed(self) -> ParallelDims:
         job_config = self.job_config
@@ -765,17 +774,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.device
             )
 
-            torch.distributed.all_reduce(
+            sum_data_sampled = dist_utils.dist_sum(
                 sum_data_sampled,
-                group=parallel_dims.world_mesh["dp_cp"].get_group(),
-                op=torch.distributed.ReduceOp.SUM,
+                parallel_dims.get_optional_mesh("loss"),
+                ft_pg,
+                keep_tensor=True,
             )
-            total_data_sampled = sum_data_sampled.sum() / 100
+            if self.prev_data_sampled_tensor is None:
+                self.prev_data_sampled_tensor = torch.zeros_like(sum_data_sampled)
+            delta_data_sampled = sum_data_sampled - self.prev_data_sampled_tensor
+            self.prev_data_sampled_tensor = sum_data_sampled.clone()
+
+            total_data_sampled = delta_data_sampled.sum() / 100 + 1e-20
 
             data_sampled = {
                 k: int(sum_data_sampled[i].item()) for i, k in enumerate(keys)
             }
-            actual_sample_ratio = sum_data_sampled / total_data_sampled
+            actual_sample_ratio = delta_data_sampled / total_data_sampled
             actual_sample_ratio_dict = {
                 k: actual_sample_ratio[i].item()
                 for i, k in enumerate(keys_actual_sample_ratio)
@@ -879,8 +894,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
 
                 # Run validation if validator is available
-                if self.job_config.validation.enable and self.validator.should_validate(
-                    self.step
+                if (
+                    self.job_config.validation.enable
+                    and self.validator.should_validate(self.step)
                 ):
                     # pyrefly: ignore [missing-attribute]
                     with self.loss_fn.no_rescale():
@@ -960,12 +976,12 @@ def main(trainer_class: type[Trainer]) -> None:
             return
 
         if config.checkpoint.create_seed_checkpoint:
-            assert int(os.environ["WORLD_SIZE"]) == 1, (
-                "Must create seed checkpoint using a single device, to disable sharding."
-            )
-            assert config.checkpoint.enable, (
-                "Must enable checkpointing when creating a seed checkpoint."
-            )
+            assert (
+                int(os.environ["WORLD_SIZE"]) == 1
+            ), "Must create seed checkpoint using a single device, to disable sharding."
+            assert (
+                config.checkpoint.enable
+            ), "Must enable checkpointing when creating a seed checkpoint."
             trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
         else:

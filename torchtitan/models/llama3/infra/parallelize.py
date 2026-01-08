@@ -64,7 +64,9 @@ def parallelize_llama(
     # TODO: TP currently cannot handle uneven seq_len because we set
     #       `use_local_output=True` to use plain Tensors for legacy reasons.
     #       Need to revisit this.
-    assert job_config.training.seq_len % parallel_dims.seq_len_divisor == 0, f"""
+    assert (
+        job_config.training.seq_len % parallel_dims.seq_len_divisor == 0
+    ), f"""
         Sequence length {job_config.training.seq_len} must be divisible by the product of TP degree
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
@@ -210,30 +212,27 @@ def apply_tp(
     #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
     # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
-        if isinstance(transformer_block, TransformerBlock):
-            layer_plan = {
-                "attention_norm": SequenceParallel(),
-                # NOTE: when the fourth argument (positions) is not None, its input layout
-                # and desired input layout should be Replicate()
-                "attention": prepare_module_input(
-                    input_layouts=(Shard(1), None, None, None),
-                    desired_input_layouts=(Replicate(), None, None, None),
-                ),
-                "attention.wq": colwise_parallel(),
-                "attention.wk": colwise_parallel(),
-                "attention.wv": colwise_parallel(),
-                "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
-                "ffn_norm": SequenceParallel(),
-                "feed_forward": prepare_module_input(
-                    input_layouts=(Shard(1),),
-                    desired_input_layouts=(Replicate(),),
-                ),
-                "feed_forward.w1": colwise_parallel(),
-                "feed_forward.w2": rowwise_parallel(output_layouts=Shard(1)),
-                "feed_forward.w3": colwise_parallel(),
-            }
-        else:
-            raise TypeError("unknown transformer block type")
+        layer_plan = {
+            "attention_norm": SequenceParallel(),
+            # NOTE: when the fourth argument (positions) is not None, its input layout
+            # and desired input layout should be Replicate()
+            "attention": prepare_module_input(
+                input_layouts=(Shard(1), None, None, None),
+                desired_input_layouts=(Replicate(), None, None, None),
+            ),
+            "attention.wq": colwise_parallel(),
+            "attention.wk": colwise_parallel(),
+            "attention.wv": colwise_parallel(),
+            "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
+            "ffn_norm": SequenceParallel(),
+            "feed_forward": prepare_module_input(
+                input_layouts=(Shard(1),),
+                desired_input_layouts=(Replicate(),),
+            ),
+            "feed_forward.w1": colwise_parallel(),
+            "feed_forward.w2": rowwise_parallel(output_layouts=Shard(1)),
+            "feed_forward.w3": colwise_parallel(),
+        }
 
         """
         PrepareMidNormInputOutput() is the "correct" way to do it,

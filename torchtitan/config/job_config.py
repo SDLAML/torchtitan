@@ -235,6 +235,18 @@ class Model:
     given value (e.g., 128).
     """
 
+    attn_type: Literal["sdpa", "flex", "varlen"] = "sdpa"
+    """
+    Type of attention to use
+    [sdpa, flex, varlen]
+    """
+
+    attn_mask_type: Literal["causal", "block_causal"] = "causal"
+    """
+    Type of attention mask to use
+    [causal, block_causal]
+    """
+
     converters: list[str] = field(default_factory=list)
     """
     Comma separated list of converters to apply to the model.
@@ -1208,9 +1220,9 @@ class Validation:
     """DataLoader configuration"""
 
     def __post_init__(self):
-        assert self.steps > 0 or self.steps == -1, (
-            "validation steps must be positive or -1"
-        )
+        assert (
+            self.steps > 0 or self.steps == -1
+        ), "validation steps must be positive or -1"
 
 
 @dataclass
