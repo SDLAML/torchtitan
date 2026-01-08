@@ -27,6 +27,7 @@ class MoEArgs:
 
     # router
     scaling_factor: float | None = None
+    score_before_experts: bool = False
 
     use_grouped_mm: bool = True  # grouped mm or for-loop for the experts computation
     # TODO(JSC): Need ablation about the learning rate of the router bias
@@ -166,18 +167,16 @@ class TokenChoiceTopKRouter(nn.Module):
 
         scores = torch.sigmoid(scores.to(torch.float32))
 
+        scores_for_choice = scores if expert_bias is None else scores + expert_bias
+        _, selected_experts_indices = torch.topk(
+            scores_for_choice, k=self.top_k, dim=-1, sorted=False
+        )
+
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
-        if expert_bias is not None:
-            _, selected_experts_indices = torch.topk(
-                scores + expert_bias, k=self.top_k, dim=1
-            )
-            top_scores = scores.gather(dim=1, index=selected_experts_indices)
-        else:
-            top_scores, selected_experts_indices = torch.topk(
-                scores, k=self.top_k, dim=1
-            )
+        top_scores = scores.gather(dim=1, index=selected_experts_indices)
+
         if need_aux_loss:
             indices_for_load_balance = torch.topk(scores, k=self.top_k, dim=1)[1]
         else:
@@ -192,10 +191,21 @@ class TokenChoiceTopKRouter(nn.Module):
 
         top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-20)
 
-        detached_top_scores = top_scores.detach()
-        experts_entropy = (
-            -(detached_top_scores * detached_top_scores.log()).sum(dim=-1).mean()
-        )
+        # TODO(JSC):  entropy - Do we want the entropy on the top-K experts or all experts?
+        # detached_top_scores = top_scores.detach()
+        # experts_entropy = (
+        #     -(detached_top_scores * detached_top_scores.log()).sum(dim=-1).mean()
+        # )
+
+        idx = selected_experts_indices.reshape(-1)  # (T*K,)
+        detached_top_scores = top_scores.detach().reshape(
+            -1
+        )  # (T*K,)  (already per-token normalized over K)
+
+        mass = torch.zeros(self.num_experts, device=x.device, dtype=torch.bfloat16)
+        mass.scatter_add_(0, idx, detached_top_scores.to(torch.bfloat16))
+        p = mass / (mass.sum() + 1e-20)
+        experts_entropy = -(p * (p + 1e-20).log()).sum()
 
         top_scores = top_scores * self.route_scale
 
@@ -244,7 +254,7 @@ class TokenReorderer(nn.Module):
 
         Args:
             top_scores (torch.Tensor): Routing scores for selected experts,
-                shape (batch_size*seq_len, top_k)
+                shape (batch_size * seq_len, top_k)
             selected_experts_indices (torch.Tensor): Expert indices selected for each token,
                 shape (batch_size*seq_len, top_k)
 
@@ -269,7 +279,6 @@ class TokenReorderer(nn.Module):
         )
 
         top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
-        token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
 
         return (
             top_scores_experts_sorted,
@@ -292,7 +301,6 @@ class MoE(nn.Module):
         norm_type: Optional[str] = None,
         norm_eps: Optional[float] = None,
     ):
-
         super().__init__()
         """
         match_dim_with_dense.
@@ -304,7 +312,7 @@ class MoE(nn.Module):
         self.layer_id = layer_id
 
         self.num_experts = moe_args.num_experts
-        self.topk = moe_args.top_k
+        self.top_k = moe_args.top_k
 
         self.load_balance_loss_weight = (
             moe_args.load_balance_loss_weight
@@ -313,15 +321,17 @@ class MoE(nn.Module):
         self.bias_update_norm_factor = moe_args.bias_update_norm_factor
         self.load_balance_loss_type = moe_args.load_balance_loss_type
 
+        self.score_before_experts = moe_args.score_before_experts
+
         # Use updated Gate with DeepSeekMoE-style routing and bias balancing
         self.router = TokenChoiceTopKRouter(
             dim=dim,
             num_experts=self.num_experts,
-            top_k=self.topk,
+            top_k=self.top_k,
             route_scale=moe_args.scaling_factor,
             _debug_force_load_balance=moe_args._debug_force_load_balance,
         )
-        self.reorderer = TokenReorderer(num_experts=self.num_experts, top_k=self.topk)
+        self.reorderer = TokenReorderer(num_experts=self.num_experts, top_k=self.top_k)
         self.shared_experts = (
             FeedForward(
                 dim,
@@ -342,6 +352,7 @@ class MoE(nn.Module):
             dim_in=dim,
             dim_hidden=hidden_dim,
             num_experts=self.num_experts,
+            use_grouped_mm=moe_args.use_grouped_mm,
             activation_type=activation_type,
             norm_everywhere=norm_everywhere,
             norm_type=norm_type,
@@ -388,7 +399,7 @@ class MoE(nn.Module):
         self.load_balance_loss.zero_()
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        bz, slen, dim = x.shape
+        bs, slen, dim = x.shape
         x = x.view(-1, dim)
         # TODO@JSC: check if we want to use FP32 remix
         (
@@ -418,16 +429,16 @@ class MoE(nn.Module):
                 load_balance_loss = MoE.sequence_wise_aux_loss(
                     sigmoid_scores,
                     indices_for_load_balance.long(),
-                    bz,
+                    bs,
                     slen,
-                    self.topk,
+                    self.top_k,
                     self.load_balance_loss_weight,
                 )
             elif self.load_balance_loss_type == "batch_wise":
                 load_balance_loss = MoE.batch_wise_aux_loss(
                     sigmoid_scores,
                     num_tokens_per_expert,
-                    self.topk,
+                    self.top_k,
                     self.load_balance_loss_weight,
                 )
             else:
@@ -442,32 +453,44 @@ class MoE(nn.Module):
 
         # ====
 
-        token_indices_experts_sorted = token_indices_experts_sorted.reshape(
-            -1, 1
-        ).expand(-1, dim)
+        routed_input = x[token_indices_experts_sorted // self.top_k]
+        if self.score_before_experts:
+            routed_input = (
+                routed_input.to(torch.float32)
+                * top_scores_experts_sorted.reshape(-1, 1)
+            ).to(x.dtype)
 
-        # shape (bs*slen*top_k, dim)
-        routed_input = torch.gather(x, dim=0, index=token_indices_experts_sorted)
         routed_output = self.experts(routed_input, num_tokens_per_expert)
 
         # shared expert
         # Note: we execute the shared expert before scoring the output of the routed expert
         # to "implicitly" overlap the shared expert compute with token combine communication
-        if self.shared_experts is not None:
-            out = self.shared_experts(x)
-        else:
-            out = torch.zeros_like(x)
+        out = self.shared_experts(x) if self.shared_experts is not None else None
 
-        routed_output = (
-            routed_output.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)
-        ).to(x.dtype)
-
-        out = out.scatter_add(
-            dim=0, index=token_indices_experts_sorted, src=routed_output
+        # Unsort routed outputs
+        routed_output_unsorted = torch.zeros(
+            (bs * slen * self.top_k, dim),
+            dtype=routed_output.dtype,
+            device=routed_output.device,
         )
+        routed_output_unsorted[token_indices_experts_sorted] = routed_output
+        routed_output_unsorted = routed_output_unsorted.reshape(-1, self.top_k, dim)
 
-        output = out.reshape(bz, slen, dim).to(x.dtype)
-        return output, load_balance_loss
+        if not self.score_before_experts:
+            out_experts = (
+                torch.bmm(
+                    top_scores.reshape(-1, 1, self.router.top_k),
+                    routed_output_unsorted.float(),
+                )
+                .to(x.dtype)
+                .squeeze(1)
+            )
+        else:
+            out_experts = routed_output_unsorted.sum(dim=1)
+
+        if out is None:
+            return out_experts.reshape(bs, slen, dim), load_balance_loss
+        return (out + out_experts).reshape(bs, slen, dim), load_balance_loss
 
     @staticmethod
     @torch.compile(fullgraph=True)

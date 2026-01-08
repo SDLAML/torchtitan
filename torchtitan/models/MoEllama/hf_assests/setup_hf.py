@@ -60,7 +60,14 @@ def overwrite_config(model, model_args):
     if len(model.layers) > model_args.n_dense_layers:
         moe = model.layers[str(len(model.layers) - 1)].moe
         default_config["moe_intermediate_size"] = moe.experts.dim_hidden
-        default_config["n_active_experts"] = moe.topk
+        if hasattr(moe, "topk"):
+            default_config["n_active_experts"] = moe.topk
+        elif hasattr(moe, "top_k"):
+            default_config["n_active_experts"] = moe.top_k
+        else:
+            raise ValueError(
+                "MoE top_k or topk is not found in the model. Please check the model."
+            )
         default_config["n_total_experts"] = moe.num_experts
         default_config["moe_scaling_factor"] = moe.router.route_scale
         default_config["n_shared_experts"] = model_args.moe_args.num_shared_experts

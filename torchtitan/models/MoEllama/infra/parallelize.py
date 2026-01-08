@@ -7,6 +7,8 @@
 # This file applies the PT-D parallelisms (except pipeline parallelism) and various
 # training techniques (e.g. activation checkpointing and compile) to the Llama model.
 
+from typing import Callable
+
 import torch
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -25,15 +27,24 @@ from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.config.job_config import Compile as CompileConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
-from torchtitan.distributed.expert_parallel import ExpertParallel, TensorParallel
+from torchtitan.distributed.dual_pipe_v import (
+    DualPipeExpertParallel,
+    get_dual_pipe_v_flag,
+)
+from torchtitan.distributed.expert_parallel import (
+    BaseExpertParallel,
+    DeepEPExpertParallel,
+    ExpertParallel,
+    TensorParallel,
+)
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.models.llama3.infra.parallelize import (
     apply_ddp,
     PrepareMidNormInputOutput,
 )
 from torchtitan.models.llama4.infra.parallelize import apply_fsdp
-from torchtitan.models.MoEllama.model import (
-    GroupedExperts as grouped_experts_module,
+from torchtitan.models.MoEllama.model import (  # noqa: N813
+    GroupedExperts as grouped_experts_module,  # noqa: N813
     moe as moe_module,
 )
 from torchtitan.tools.logging import logger
@@ -43,6 +54,9 @@ _op_sac_save_list = {
     torch.ops.aten.mm.default,
     torch.ops.aten._scaled_dot_product_efficient_attention.default,
     torch.ops.aten._scaled_dot_product_flash_attention.default,
+    torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+    torch.ops.aten._scaled_dot_product_attention_math.default,
+    torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default,
     torch.ops._c10d_functional.reduce_scatter_tensor.default,
     torch.ops._c10d_functional.all_to_all_single.default,
     # for low precision training, it's useful to always save
@@ -50,6 +64,7 @@ _op_sac_save_list = {
     # used to compute the scaling factor for quantization.
     torch.ops.aten.max.default,
     torch._higher_order_ops.flex_attention,
+    torch._higher_order_ops.inductor_compiled_code,
 }
 
 
@@ -58,7 +73,6 @@ def parallelize_llama(
     parallel_dims: ParallelDims,
     job_config: JobConfig,
 ):
-    world_mesh = parallel_dims.world_mesh
     # TODO: TP currently cannot handle uneven seq_len because we set
     #       `use_local_output=True` to use plain Tensors for legacy reasons.
     #       Need to revisit this.
@@ -69,12 +83,9 @@ def parallelize_llama(
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
 
-    use_flex_attn = getattr(model.model_args, "use_flex_attn", False)
-    if job_config.parallelism.context_parallel_degree > 1 and use_flex_attn:
-        raise NotImplementedError("CP support for FlexAttention is still in progress.")
-
     tp_only_attention = job_config.parallelism.tensor_parallel_only_attention
 
+    tp_mesh = None
     if parallel_dims.tp_enabled:
         if "bitnet" in job_config.model.converters:
             raise RuntimeError("BitNet currently does not support tensor parallelism")
@@ -90,31 +101,44 @@ def parallelize_llama(
         enable_approx_mid_norm_for_tensor_parallel = (
             job_config.parallelism.enable_approx_mid_norm_for_tensor_parallel
         )
+        tp_mesh = parallel_dims.get_mesh("tp")
         apply_non_moe_tp(
             model,
-            world_mesh["tp"],
+            tp_mesh,
             loss_parallel=not job_config.parallelism.disable_loss_parallel,
             enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
             tensor_parallel_only_attention=tp_only_attention,
             enable_approx_mid_norm_for_tensor_parallel=enable_approx_mid_norm_for_tensor_parallel,
         )
-        maybe_enable_async_tp(job_config, world_mesh["tp"])
+        maybe_enable_async_tp(job_config, tp_mesh)
+
+    # Check if using DeepEP for MoE communication
+    ep_backend = job_config.parallelism.expert_parallel_comm_backend
+    if not parallel_dims.ep_enabled and not parallel_dims.etp_enabled:
+        ep_backend = "standard"
+
+    if ep_backend == "deepep":
+        use_deepep = True
+
+        # Import deepep module to register custom ops before accessing them
+        import torchtitan.distributed.deepep  # noqa: F401 - registers torch.ops.deepep
+
+        _op_sac_save_list.add(torch.ops.deepep.dispatch.default)
+        _op_sac_save_list.add(torch.ops.deepep.combine.default)
+    else:
+        use_deepep = False
 
     # I dont think we need to apply TP for MOE?
-
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
+        dual_pipe_v = get_dual_pipe_v_flag(job_config, parallel_dims)
         apply_moe_ep_tp(
             model,
-            tp_mesh=world_mesh["tp"] if parallel_dims.tp_enabled else None,
-            ep_mesh=world_mesh["ep"] if parallel_dims.ep_enabled else None,
-            ep_tp_mesh=(
-                world_mesh["ep", "tp"]
-                if parallel_dims.tp_enabled
-                and parallel_dims.ep_enabled
-                and parallel_dims.etp_enabled
-                else None
-            ),
-            etp_enabled=parallel_dims.etp_enabled,
+            tp_mesh=parallel_dims.get_optional_mesh("tp"),
+            ep_mesh=parallel_dims.get_optional_mesh("ep"),
+            etp_mesh=parallel_dims.get_optional_mesh("etp"),
+            ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
+            dual_pipe_v=dual_pipe_v,
+            use_deepep=use_deepep,
             tp_only_attention=tp_only_attention,
         )
 
@@ -123,38 +147,40 @@ def parallelize_llama(
     )
 
     if job_config.activation_checkpoint.mode != "none":
+        if job_config.activation_checkpoint.selective_ac_option == "op":
+            logger.info(
+                f"SAC save list contains {len(_op_sac_save_list)} ops: "
+                f"{sorted([str(op) for op in _op_sac_save_list])}"
+            )
         apply_ac(
             model,
             job_config.activation_checkpoint,
             model_compile_enabled=model_compile_enabled,
-            use_flex_attn=use_flex_attn,
+            # pyrefly: ignore [bad-argument-type]
             op_sac_save_list=_op_sac_save_list,
             base_folder=job_config.job.dump_folder,
         )
 
     if model_compile_enabled:
         if parallel_dims.ep_enabled:
-            apply_compile(model, compile_config=job_config.compile)
+            apply_compile(model, job_config.compile, parallel_dims.ep_enabled)
         else:
-            apply_compile_wo_ep(model, compile_config=job_config.compile)
-
-    dp_mesh: DeviceMesh | None = None
+            apply_compile_wo_ep(model, job_config.compile)
 
     if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
-        # apply FSDP or HSDP, potentially with Context Parallel
-        if parallel_dims.dp_replicate_enabled:
-            dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
-        else:
-            dp_mesh_dim_names = ("dp_shard_cp",)
-
-        dp_mesh = world_mesh[tuple(dp_mesh_dim_names)]
+        # dp_mesh is the mesh for FSDP/HSDP
+        dp_mesh_names = (
+            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
+        )
+        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
 
         # the mesh dim names of which the MoE params are sharded on via FSDP/HSDP
-        dp_mod_ep_mesh_dim_names = []
-        if parallel_dims.ep_enabled:
-            if parallel_dims.dp_replicate_enabled:
-                dp_mod_ep_mesh_dim_names.append("dp_replicate")
-            dp_mod_ep_mesh_dim_names.append("dp_shard_mod_ep")
+        edp_mesh_names = (
+            ["dp_replicate", "efsdp"]
+            if parallel_dims.dp_replicate_enabled
+            else ["efsdp"]
+        )
+        edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
         apply_fsdp(
             model,
@@ -165,11 +191,7 @@ def parallelize_llama(
             cpu_offload=job_config.training.enable_cpu_offload,
             reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
             ep_degree=parallel_dims.ep,
-            dp_mod_ep_mesh=(
-                world_mesh[tuple(dp_mod_ep_mesh_dim_names)]
-                if parallel_dims.ep_enabled
-                else None
-            ),
+            edp_mesh=edp_mesh,
             gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor,
         )
 
@@ -184,9 +206,9 @@ def parallelize_llama(
         if job_config.training.enable_cpu_offload:
             logger.info("Applied CPU Offloading to the model")
     elif parallel_dims.dp_replicate_enabled:
-        if world_mesh.ndim > 1:
+        dp_mesh = parallel_dims.get_mesh("dp_replicate")
+        if parallel_dims.world_size != dp_mesh.size():
             raise RuntimeError("DDP has not supported > 1D parallelism")
-        dp_mesh = world_mesh
         apply_ddp(
             model,
             dp_mesh,
@@ -255,8 +277,8 @@ def apply_non_moe_tp(
         layer_plan = {
             "attention_norm": SequenceParallel(),
             "attention": prepare_module_input(
-                input_layouts=(Shard(1), None),
-                desired_input_layouts=(Replicate(), None),
+                input_layouts=(Shard(1), None, None, None),
+                desired_input_layouts=(Replicate(), None, None, None),
             ),
             "attention.wq": colwise_parallel(),
             "attention.wk": colwise_parallel(),
@@ -293,11 +315,12 @@ def apply_non_moe_tp(
                     layer_plan["feed_forward.mid_norm"] = PrepareMidNormInputOutput()
 
         parallelize_module(
+            # pyrefly: ignore [bad-argument-type]
             module=transformer_block,
             device_mesh=tp_mesh,
+            # pyrefly: ignore [bad-argument-type]
             parallelize_plan=layer_plan,
         )
-
     logger.info(
         f"Applied {'Float8 tensorwise ' if enable_float8_tensorwise_tp else ''}"
         "Tensor Parallelism to the model"
@@ -308,19 +331,22 @@ def apply_moe_ep_tp(
     model: nn.Module,
     tp_mesh: DeviceMesh | None,
     ep_mesh: DeviceMesh | None,
-    ep_tp_mesh: DeviceMesh | None,
-    etp_enabled: bool,
+    etp_mesh: DeviceMesh | None,
+    ep_etp_mesh: DeviceMesh | None,
+    dual_pipe_v: bool = False,
+    use_deepep: bool = False,
     tp_only_attention: bool = False,
     enable_approx_mid_norm_for_tensor_parallel: bool = False,
 ):
     """
-    I will disble moe EP_TP for now.
+    I will disable moe EP_TP for now.
     To make it work, we need
     1) Takeing the mid-norm things same same dense model
     2) We need to name the MoE layer as "moe" and dense layer as "feed_forward", we cannot use the
        same name "feed_forward" for both.
 
     """
+    assert ep_mesh is not None or tp_mesh is not None
     for transformer_block in model.layers.values():
         if not transformer_block.moe_enabled:
             continue
@@ -358,13 +384,25 @@ def apply_moe_ep_tp(
         # if ep_mesh is not None:
         experts_mesh, experts_plan = None, None
         if ep_mesh is None:  # TP only
+            assert ep_etp_mesh is None
             experts_mesh = tp_mesh
             # input Replicate, output Partial
             experts_plan = TensorParallel()
-        elif tp_mesh is None or not etp_enabled:  # EP only
+        elif tp_mesh is None or etp_mesh is None:  # EP only
+            assert ep_etp_mesh is None
             experts_mesh = ep_mesh
             # input / output sharding on the batch / tokens dim
-            experts_plan = ExpertParallel()
+            if use_deepep:
+                # pyrefly: ignore [missing-attribute]
+                score_before_experts = transformer_block.moe.score_before_experts
+
+                experts_plan = DeepEPExpertParallel(
+                    score_before_experts=score_before_experts,
+                )
+                logger.info("Applying DeepEP to MoE layer")
+            else:
+                # input / output sharding on the batch / tokens dim
+                experts_plan = ExpertParallel()
 
             # below is for logging and debugging
             transformer_block.moe.experts.ep_enable = True
@@ -379,6 +417,9 @@ def apply_moe_ep_tp(
             raise NotImplementedError("Maybe we dont need TP for MoE")
             # experts_mesh = ep_tp_mesh
             # experts_plan = ExpertTensorParallel()
+
+        if dual_pipe_v and isinstance(experts_plan, BaseExpertParallel):
+            experts_plan = DualPipeExpertParallel(experts_plan)
 
         if experts_mesh:
             parallelize_module(
@@ -402,7 +443,7 @@ def apply_compile_wo_ep(model: nn.Module, compile_config: CompileConfig):
     logger.info("Compiling each TransformerBlock with torch.compile")
 
 
-def apply_compile(model: nn.Module, compile_config: CompileConfig):
+def apply_compile(model: nn.Module, compile_config: CompileConfig, ep_enabled: bool):
     """
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
@@ -411,7 +452,9 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
     # but it is experimental.
     torch._dynamo.config.capture_scalar_outputs = True
     # Workaround for https://github.com/pytorch/pytorch/issues/166926
+    # pyrefly: ignore [missing-attribute]
     torch._C._dynamo.eval_frame._set_lru_cache(False)
+    # pyrefly: ignore [missing-attribute]
     for layer_id, transformer_block in model.layers.named_children():
         if transformer_block.moe_enabled:
             # If it is a MoE layer, FSDP(GroupedExperts) will cause a graph break
@@ -465,13 +508,44 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
                 fullgraph=True,
             )
 
+        # pyrefly: ignore [missing-attribute]
         model.layers.register_module(layer_id, transformer_block)
 
-    grouped_experts_module._run_experts_grouped_mm = torch.compile(
-        grouped_experts_module._run_experts_grouped_mm,
-        backend=compile_config.backend,
-        fullgraph=True,
+    # Patch some globals only once (apply_compile is called multiple times for PP setup)
+    already_patched = (
+        "_run_experts_grouped_mm_dynamic"
+        in grouped_experts_module._run_experts_grouped_mm.__qualname__
     )
+    if not already_patched:
+        grouped_experts_module._run_experts_grouped_mm = torch.compile(
+            grouped_experts_module._run_experts_grouped_mm,
+            backend=compile_config.backend,
+            fullgraph=True,
+        )
+
+        if ep_enabled:
+            # pyrefly: ignore [missing-attribute]
+            compiled_fn = grouped_experts_module._run_experts_grouped_mm
+
+            # keep function logic in sync with `already_patched` above
+            def _run_experts_grouped_mm_dynamic(
+                w1: torch.Tensor,
+                w2: torch.Tensor,
+                w3: torch.Tensor,
+                x: torch.Tensor,
+                num_tokens_per_expert: torch.Tensor,
+                activation: Callable,
+                mid_norm: nn.Module,
+            ) -> torch.Tensor:
+                # dynamic number of tokens in expert parallel
+                torch._dynamo.mark_dynamic(x, 0)
+                return compiled_fn(
+                    w1, w2, w3, x, num_tokens_per_expert, activation, mid_norm
+                )
+
+            grouped_experts_module._run_experts_grouped_mm = (
+                _run_experts_grouped_mm_dynamic
+            )
 
     # NOTE: We don't compile for loop code path due to an issue with unbacked symints:
     # https://github.com/pytorch/pytorch/issues/166460

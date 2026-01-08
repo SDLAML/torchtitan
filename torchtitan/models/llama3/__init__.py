@@ -7,15 +7,19 @@
 from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.lr_scheduler import build_lr_schedulers
 from torchtitan.components.optimizer import build_optimizers
-from torchtitan.components.tokenizer import build_hf_byte_tokenizer, build_hf_tokenizer
+from torchtitan.components.tokenizer import build_hf_tokenizer
+
+# from torchtitan.components.tokenizer import build_hf_byte_tokenizer
 from torchtitan.components.validate import build_validator
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.hf_datasets.text_datasets import build_text_dataloader
-from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
+from torchtitan.protocols.train_spec import TrainSpec
 from .hf_assests import setup_hf
 
 from .infra.parallelize import parallelize_llama
-from .model.args import RoPEScalingArgs, TransformerModelArgs
+from .model.args import TransformerModelArgs
+
+# from .model.args import RoPEScalingArgs
 
 from .model.model import Transformer
 from .model.state_dict_adapter import Llama3StateDictAdapter
@@ -353,80 +357,8 @@ llama3_args = {
 }
 
 
-byte_llama3_configs = {
-    "debugmodel": TransformerModelArgs(
-        dim=256, n_layers=6, n_heads=16, vocab_size=-1, rope_theta=500000
-    ),
-    "debugmodel_flex_attn": TransformerModelArgs(
-        dim=256,
-        n_layers=6,
-        n_heads=16,
-        vocab_size=-1,
-        rope_theta=500000,
-        use_flex_attn=True,
-        attn_mask_type="block_causal",
-    ),
-    "1B": TransformerModelArgs(
-        dim=2048,
-        n_layers=24,
-        n_heads=16,
-        n_kv_heads=8,
-        vocab_size=-1,
-        ffn_dim_multiplier=1,  # need to check
-        multiple_of=256,
-        qk_norm=True,
-        norm_eps=1e-20,
-        rope_theta=10000,
-        norm_type="np_rmsnorm",
-        norm_everywhere=True,
-    ),
-    "8B": TransformerModelArgs(
-        dim=4096,
-        n_layers=32,
-        n_heads=32,
-        n_kv_heads=8,
-        vocab_size=-1,
-        ffn_dim_multiplier=1.3,
-        multiple_of=1024,
-        rope_theta=500000,
-    ),
-    "8B_qk": TransformerModelArgs(
-        dim=4096,
-        n_layers=32,
-        n_heads=32,
-        n_kv_heads=8,
-        vocab_size=-1,
-        ffn_dim_multiplier=1.3,
-        multiple_of=1024,
-        rope_theta=500000,
-        qk_norm=True,
-    ),
-    "70B": TransformerModelArgs(
-        dim=8192,
-        n_layers=80,
-        n_heads=64,
-        n_kv_heads=8,
-        vocab_size=-1,
-        ffn_dim_multiplier=1.3,
-        multiple_of=4096,
-        rope_theta=500000,
-    ),
-    "405B": TransformerModelArgs(
-        dim=16384,
-        n_layers=126,
-        n_heads=128,
-        n_kv_heads=8,
-        vocab_size=-1,
-        ffn_dim_multiplier=1.2,
-        multiple_of=4096,
-        rope_theta=500000,
-    ),
-}
-
-
-register_train_spec(
-    "llama3",
-    TrainSpec(
+def get_train_spec() -> TrainSpec:
+    return TrainSpec(
         model_cls=Transformer,
         model_args=llama3_args,
         parallelize_fn=parallelize_llama,
@@ -439,23 +371,4 @@ register_train_spec(
         build_validator_fn=build_validator,
         state_dict_adapter=Llama3StateDictAdapter,
         hf_assets_setup_fn=setup_hf.copy_and_overwrite_model_config,
-    ),
-)
-
-register_train_spec(
-    "byte_llama3",
-    TrainSpec(
-        model_cls=Transformer,
-        model_args=byte_llama3_configs,
-        parallelize_fn=parallelize_llama,
-        pipelining_fn=pipeline_llm,
-        build_optimizers_fn=build_optimizers,
-        build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_text_dataloader,
-        build_tokenizer_fn=build_hf_byte_tokenizer,
-        build_loss_fn=build_cross_entropy_loss,
-        build_validator_fn=build_validator,
-        state_dict_adapter=Llama3StateDictAdapter,
-        hf_assets_setup_fn=setup_hf.copy_and_overwrite_model_config,
-    ),
-)
+    )

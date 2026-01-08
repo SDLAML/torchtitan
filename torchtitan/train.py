@@ -7,7 +7,6 @@
 import dataclasses
 import datetime
 import functools
-import dataclasses
 import importlib
 import json
 import os
@@ -82,6 +81,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     # additional training states
     step: int
     ntokens_seen: int
+
+    # used for loggering, not need to put it in the stateful class
+    prev_data_sampled_tensor: torch.Tensor
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -162,7 +164,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info(
             f"Building {job_config.model.name} {job_config.model.flavor}"
             f""
-            f"with {json.dumps(dataclasses.asdict(json.dumps(dataclasses.asdict(model_args), indent=2, ensure_ascii=False)), indent=2, ensure_ascii=False)}"
+            f"with {json.dumps(dataclasses.asdict(model_args), indent=2, ensure_ascii=False)}"
         )
         with (
             torch.device("meta"),
@@ -220,13 +222,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             job_config, parallel_dims=parallel_dims, ft_manager=self.ft_manager
         )
 
-        # better with some flag to enable/disable this
-        pre_moe_loss_fn = self.loss_fn
-        self.loss_fn = functools.partial(
-            moe_loss,
-            loss_fn=pre_moe_loss_fn,
-        )
-
         # verify batch sizes
         global_batch_size = job_config.training.global_batch_size
         if global_batch_size < 0:
@@ -249,6 +244,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         assert self.gradient_accumulation_steps > 0
 
+        # better with some flag to enable/disable this
+        pre_moe_loss_fn = self.loss_fn
+        self.loss_fn = functools.partial(
+            moe_loss,
+            loss_fn=pre_moe_loss_fn,
+            grad_accumulation_steps=self.gradient_accumulation_steps,
+        )
         # Figure out whether model will be loaded, so that we can skip weight initialization.
         """
         Comment: *Important*:
@@ -343,6 +345,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
         self.ntokens_seen = 0
+
+        self.prev_data_sampled_tensor = None
 
         self.checkpointer = CheckpointManager(
             dataloader=self.dataloader,
@@ -453,6 +457,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             model_args_dict.pop("_enforced")
             with open(model_args_save_path, "w") as f:
                 json.dump(model_args_dict, f, indent=4)
+
+            data_mix_scheduler_save_path = os.path.join(
+                self.job_config.job.dump_folder,
+                "data_mix_scheduler_"
+                + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+                + ".json",
+            )
+            with open(data_mix_scheduler_save_path, "w") as f:
+                json.dump(self.data_mix_scheduler.mixing_configs, f, indent=4)
 
     def init_distributed(self) -> ParallelDims:
         job_config = self.job_config
@@ -755,17 +768,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.device
             )
 
-            torch.distributed.all_reduce(
+            sum_data_sampled = dist_utils.dist_sum(
                 sum_data_sampled,
-                group=parallel_dims.world_mesh["dp_cp"].get_group(),
-                op=torch.distributed.ReduceOp.SUM,
+                parallel_dims.get_optional_mesh("loss"),
+                ft_pg,
+                keep_tensor=True,
             )
-            total_data_sampled = sum_data_sampled.sum() / 100
+            if self.prev_data_sampled_tensor is None:
+                self.prev_data_sampled_tensor = torch.zeros_like(sum_data_sampled)
+            delta_data_sampled = sum_data_sampled - self.prev_data_sampled_tensor
+            self.prev_data_sampled_tensor = sum_data_sampled.clone()
+
+            total_data_sampled = delta_data_sampled.sum() / 100 + 1e-20
 
             data_sampled = {
                 k: int(sum_data_sampled[i].item()) for i, k in enumerate(keys)
             }
-            actual_sample_ratio = sum_data_sampled / total_data_sampled
+            actual_sample_ratio = delta_data_sampled / total_data_sampled
             actual_sample_ratio_dict = {
                 k: actual_sample_ratio[i].item()
                 for i, k in enumerate(keys_actual_sample_ratio)

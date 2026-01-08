@@ -26,7 +26,12 @@ from torchtitan.models.attention import (
     VarlenAttentionWrapper,
     VarlenMetadata,
 )
-from torchtitan.models.inits import build_init_fn
+from torchtitan.models.inits import (
+    build_init_fn,
+    setup_depth_init,
+    setup_residual_scale,
+)
+from torchtitan.models.inputs import MTPInputs, MTPInputsDict
 from torchtitan.models.norms import build_norm
 from torchtitan.protocols.model import AttentionMasksType
 from torchtitan.protocols.train_spec import ModelProtocol
@@ -258,19 +263,6 @@ class Attention(nn.Module):
             if not isinstance(norm, nn.Identity):
                 norm.reset_parameters()
 
-    def init_kv_cache(
-        self, max_batch_size: int, max_seq_length: int, dtype: torch.dtype
-    ):
-        device = self.wk.weight.device
-        self._kv_cache = KVCache(
-            batch_size=max_batch_size,
-            seq_length=max_seq_length,
-            n_kv_heads=self.n_kv_heads,
-            head_dim=self.head_dim,
-            dtype=dtype,
-            device=device,
-        )
-
     def forward(
         self,
         x: torch.Tensor,
@@ -484,36 +476,15 @@ class TransformerBlock(nn.Module):
             model_init_args.intermediate_init_std
             * model_args.dim**model_init_args.intermediate_exp
         )
-        match model_init_args.depth_init:
-            case "relative_depth":
-                self.residual_div_attn = (2 * (layer_id + 1)) ** 0.5
-                self.residual_div_ffn = (2 * (layer_id + 2)) ** 0.5
-            case "total_depth":
-                self.residual_div_attn = (2 * model_args.n_layers) ** 0.5
-                self.residual_div_ffn = (2 * model_args.n_layers) ** 0.5
-            case None:
-                self.residual_div_attn = 1.0
-                self.residual_div_ffn = 1.0
-            case _:
-                raise ValueError(f"Invalid depth_init: {model_init_args.depth_init}")
         self.init_gate_as_residual = model_init_args.init_gate_as_residual
 
-        match model_init_args.residual_scale:
-            case "depth_scale":
-                total_depth = 2 * model_args.n_layers
-                self.block_scale = 1 / total_depth
-                self.identity_scale = (total_depth - 1) / total_depth
-            case "complete_p":
-                total_depth = 2 * model_args.n_layers
-                self.block_scale = 1 / total_depth
-                self.identity_scale = 1.0
-            case "identity":
-                self.block_scale = 1.0
-                self.identity_scale = 1.0
-            case _:
-                raise ValueError(
-                    f"Invalid residual_scale: {model_init_args.residual_scale}"
-                )
+        self.residual_div_attn, self.residual_div_ffn = setup_depth_init(
+            model_init_args.depth_init, layer_id, model_args.n_layers
+        )
+
+        self.block_scale, self.identity_scale = setup_residual_scale(
+            model_init_args.residual_scale, model_args.n_layers
+        )
 
     def forward(
         self,

@@ -132,6 +132,9 @@ class TransformerModelArgs(BaseModelArgs):
                 f"Padded vocab size from {orig_vocab_size} to {self.vocab_size}."
             )
 
+        self.attn_type = job_config.model.attn_type
+        self.attn_mask_type = job_config.model.attn_mask_type
+
         seq_len = job_config.training.seq_len
         if seq_len > self.max_seq_len:
             logger.warning(
@@ -153,7 +156,6 @@ class TransformerModelArgs(BaseModelArgs):
     def get_nparams_and_flops(
         self, model: nn.Module, seq_len: int
     ) -> tuple[int, int, float]:
-
         return get_dense_model_nparams_and_flops(
             self,
             model,

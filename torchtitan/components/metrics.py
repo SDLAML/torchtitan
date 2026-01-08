@@ -289,21 +289,14 @@ def _build_metric_logger(
 
     if metrics_config.save_first_dp_and_tp and should_log:
         # The first data-parallel group
+
         is_dp_rank_0 = (
-            (
-                torch.distributed.get_rank(
-                    parallel_dims.world_mesh["dp_cp"].get_group()
-                )
-                == 0
-            )
+            parallel_dims.get_optional_mesh("loss").get_local_rank() == 0
             if parallel_dims.dp_cp_enabled
             else True
         )
         is_tp_rank_0 = (
-            (
-                torch.distributed.get_rank(parallel_dims.world_mesh["tp"].get_group())
-                == 0
-            )
+            (parallel_dims.get_optional_mesh("tp").get_local_rank() == 0)
             if parallel_dims.tp_enabled
             else True
         )

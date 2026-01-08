@@ -41,18 +41,20 @@ def moe_loss(
     pred: MoEInputsDict,
     labels: torch.Tensor,
     loss_fn: LossFunction,
+    grad_accumulation_steps: int = 1,
 ) -> torch.Tensor:
     """Sequence-wise auxiliary loss-enhanced loss function for MoE Transformer
     model training.
     """
     if isinstance(pred, dict) and "load_balance_loss" in pred:
         loss = loss_fn(pred["tokens_list"][0], labels)
-        aux_loss = pred["load_balance_loss"]
+        aux_loss = pred["load_balance_loss"] / grad_accumulation_steps
         # USE STE to make the magnitude of loss remain the same
         loss = loss + (aux_loss - aux_loss.detach())
     elif isinstance(pred, tuple):
         pred, aux_loss = pred
         loss = loss_fn(pred, labels)
+        aux_loss = aux_loss / grad_accumulation_steps
         loss = loss + (aux_loss - aux_loss.detach())
     else:
         loss = loss_fn(pred, labels)
