@@ -11,6 +11,7 @@ from enum import Enum
 
 import torch
 import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import _StridedShard, Replicate, Shard
 
@@ -93,15 +94,16 @@ def tp_axis(placements: tuple, tp_enabled: bool = False) -> int | None:
     return None  # could not infer
 
 
-def gather_tp_shard(tensor, tp_group, tp_world_size, original_placements):
+def gather_tp_shard(tensor, tp_mesh, tp_world_size, original_placements):
     # TP is used, we need to gather the TP-shard params first
     tp_mesh_dim = tp_axis(original_placements, True)
     assert tp_mesh_dim is not None, "TP mesh dimension not found"
     shard_dim = original_placements[tp_mesh_dim].dim
 
-    output_tensors = [torch.empty_like(tensor) for _ in range(tp_world_size)]
-    dist.all_gather(output_tensors, tensor, group=tp_group)
-    return torch.cat(output_tensors, dim=shard_dim)
+    # output_tensors = [torch.empty_like(tensor) for _ in range(tp_world_size)]
+    # dist.all_gather(output_tensors, tensor, group=tp_group)
+    # return torch.cat(output_tensors, dim=shard_dim)
+    return funcol.all_gather_tensor(tensor, gather_dim=shard_dim, group=tp_mesh)
 
 
 def calculate_shard_shape(shape, rank, world_size):
@@ -133,7 +135,6 @@ class DiSCO(AbstractDiSCO):
         extra_reduce_for_HSDP=False,
         experts_weights_layout="G-D_out-D_in",
     ):
-
         debug_mode = os.environ.get("DISCO_DEBUG_MODE", "0") == "1"
 
         # Initialize base optimizer and common state
@@ -155,7 +156,7 @@ class DiSCO(AbstractDiSCO):
 
         is_unconstrained = weight_decay == 0
 
-        self.world_mesh = parallel_dims.world_mesh
+        self.parallel_dims = parallel_dims
 
         self.fsdp_enabled = parallel_dims.fsdp_enabled
         self.expert_enabled = parallel_dims.ep_enabled
@@ -164,7 +165,9 @@ class DiSCO(AbstractDiSCO):
 
         # this is used to ensure only the DP or FSDP rank 0 will have norms
         if self.dp_replicate_enabled or self.fsdp_enabled:
-            self.is_dp_rank_0 = dist.get_rank(self.world_mesh["dp_cp"].get_group()) == 0
+            self.is_dp_rank_0 = (
+                parallel_dims.get_optional_mesh("loss").get_local_rank() == 0
+            )
         else:
             # only PP (and/or) TP enabled
             self.is_dp_rank_0 = dist.get_rank() == 0
@@ -179,7 +182,7 @@ class DiSCO(AbstractDiSCO):
         logger.info(
             f"Distributed Spectral Conditioned Optimizer "
             f"(is_light={self.is_light}, is_unconstrained={is_unconstrained}) "
-            f"is enabled with world_mesh={self.world_mesh} | fsdp_enabled={self.fsdp_enabled} | "
+            f"is enabled with world_mesh={self.parallel_dims.world_mesh} | fsdp_enabled={self.fsdp_enabled} | "
             f"EP={self.expert_enabled} | TP={self.tp_enabled} | DP={self.dp_replicate_enabled}"
         )
 
@@ -317,12 +320,12 @@ class DiSCO(AbstractDiSCO):
             pairs.sort(key=lambda x: x[0].numel(), reverse=True)
 
             # snake interleave across buckets to balance per-rank Phase-A compute
-            dp_group = (
-                self.world_mesh["dp_replicate"].get_group()
+            dp_replicate_mesh = (
+                self.parallel_dims.get_optional_mesh("dp_replicate")
                 if self.dp_replicate_enabled
                 else None
             )
-            w = dp_group.size() if dp_group is not None else 1
+            w = dp_replicate_mesh.size() if dp_replicate_mesh is not None else 1
             if w > 1:
                 blocks = [pairs[i : i + w] for i in range(0, len(pairs), w)]
                 for b, blk in enumerate(blocks):
@@ -338,17 +341,19 @@ class DiSCO(AbstractDiSCO):
             pairs = list(zip(self.fsdp_params, self.fsdp_param_names))
             pairs.sort(key=lambda x: x[0].numel(), reverse=True)
             self.fsdp_params, self.fsdp_param_names = list(zip(*pairs))
-            self.fsdp_params, self.fsdp_param_names = list(self.fsdp_params), list(
-                self.fsdp_param_names
+            self.fsdp_params, self.fsdp_param_names = (
+                list(self.fsdp_params),
+                list(self.fsdp_param_names),
             )
 
         if self.expert_params:
             pairs = list(zip(self.expert_params, self.expert_param_names))
             pairs.sort(key=lambda x: (x[0].numel(), x[0].shape[1]), reverse=True)
             self.expert_params, self.expert_param_names = list(zip(*pairs))
-            self.expert_params, self.expert_param_names = list(
-                self.expert_params
-            ), list(self.expert_param_names)
+            self.expert_params, self.expert_param_names = (
+                list(self.expert_params),
+                list(self.expert_param_names),
+            )
 
         if self.log_parameters_types:
             logger.info(
@@ -458,7 +463,9 @@ class DiSCO(AbstractDiSCO):
         if len(embed_params) == 0:
             return
 
-        tp_group = self.world_mesh["tp"].get_group() if self.tp_enabled else None
+        tp_mesh = (
+            self.parallel_dims.get_optional_mesh("tp") if self.tp_enabled else None
+        )
 
         # --- Phase 1: Parameter Update (Efficient, on shards) ---
         # This part of your refactor is efficient and correct for the update.
@@ -478,7 +485,7 @@ class DiSCO(AbstractDiSCO):
                 tp_mesh_dim = tp_axis(original_placements, True)
                 tp_sharded_dim = original_placements[tp_mesh_dim].dim
                 chunk_size = p.to_local().shape[tp_sharded_dim]
-                start_offset = tp_group.rank() * chunk_size
+                start_offset = tp_mesh.get_local_rank() * chunk_size
                 slicer = [slice(None)] * g.dim()
                 slicer[tp_sharded_dim] = slice(start_offset, start_offset + chunk_size)
                 g = g[tuple(slicer)]
@@ -503,7 +510,7 @@ class DiSCO(AbstractDiSCO):
 
         if not skip_update:
             self.update_bucket_params(
-                embed_params, updates, 0, len(embed_params), tp_group=None
+                embed_params, updates, 0, len(embed_params), tp_mesh=None
             )
 
         # --- Phase 2: Norm Calculation (On Full Tensors for Correctness) ---
@@ -562,9 +569,8 @@ class DiSCO(AbstractDiSCO):
         apply_on_weight = apply_on_weight and need_to_calculate_norm
 
         device = expert_params[0].device
-        fsdp_group = self.world_mesh["dp_shard_cp"].get_group()
-        world_size = dist.get_world_size(fsdp_group)
-        local_rank = dist.get_rank(fsdp_group)
+        fsdp_mesh = self.parallel_dims.get_optional_mesh("loss")
+        world_size, local_rank = fsdp_mesh.size(), fsdp_mesh.get_local_rank()
         ep_per_rank = math.ceil(expert_params[0].shape[0] / world_size)
 
         kinds_of_norms = len(self.norms_to_log)
@@ -615,25 +621,31 @@ class DiSCO(AbstractDiSCO):
                     norms_of_weight.extend([padding_norms] * pad_needed)
 
             norms_tensor = torch.stack(norms_of_update).float().to(device)
-            gathered_update_norms = torch.empty(
-                world_size * norms_tensor.shape[0],
-                dtype=norms_tensor.dtype,
-                device=norms_tensor.device,
-            )
-            dist.all_gather_into_tensor(
-                gathered_update_norms, norms_tensor, group=fsdp_group
+            # gathered_update_norms = torch.empty(
+            #     world_size * norms_tensor.shape[0],
+            #     dtype=norms_tensor.dtype,
+            #     device=norms_tensor.device,
+            # )
+            # dist.all_gather_into_tensor(
+            #     gathered_update_norms, norms_tensor, group=fsdp_group
+            # )
+            gathered_update_norms = funcol.all_gather_tensor(
+                norms_tensor, gather_dim=0, group=fsdp_mesh
             )
 
             if apply_on_weight:
                 norms_tensor = torch.stack(norms_of_weight).float().to(device)
-                gathered_weight_norms = torch.empty(
-                    world_size * norms_tensor.shape[0],
-                    dtype=norms_tensor.dtype,
-                    device=norms_tensor.device,
-                )
                 dist.barrier()
-                dist.all_gather_into_tensor(
-                    gathered_weight_norms, norms_tensor, group=fsdp_group
+                # gathered_weight_norms = torch.empty(
+                #     world_size * norms_tensor.shape[0],
+                #     dtype=norms_tensor.dtype,
+                #     device=norms_tensor.device,
+                # )
+                # dist.all_gather_into_tensor(
+                #     gathered_weight_norms, norms_tensor, group=fsdp_group
+                # )
+                gathered_weight_norms = funcol.all_gather_tensor(
+                    norms_tensor, gather_dim=0, group=fsdp_mesh
                 )
 
             if local_rank == 0:
@@ -687,18 +699,22 @@ class DiSCO(AbstractDiSCO):
         apply_on_weight = apply_on_weight and need_to_calculate_norm
 
         # --- distributed groups ---
-        dp_group = (
-            self.world_mesh["dp_replicate"].get_group()
+        dp_replicate_mesh = (
+            self.parallel_dims.get_optional_mesh("dp_replicate")
             if self.dp_replicate_enabled
             else None
-        )  # DDP group accessor
-        world_size = dp_group.size() if dp_group is not None else 1
-        rank = dp_group.rank() if dp_group is not None else 0
-
-        tp_group = self.world_mesh["tp"].get_group() if self.tp_enabled else None
-        tp_world_size = (
-            dist.get_world_size(group=tp_group) if tp_group is not None else 1
         )
+
+        world_size, rank = (
+            (dp_replicate_mesh.size(), dp_replicate_mesh.get_local_rank())
+            if dp_replicate_mesh
+            else (1, 0)
+        )
+
+        tp_mesh = (
+            self.parallel_dims.get_optional_mesh("tp") if self.tp_enabled else None
+        )
+        tp_world_size = tp_mesh.size() if tp_mesh else 1
 
         device = ddp_params[0].device
         cast_dtype = self.communication_dtype  # comm/exchange dtype
@@ -723,9 +739,9 @@ class DiSCO(AbstractDiSCO):
                 self.parameters_to_groups[id(p)]
             ]
             g = self.get_momentum_or_grad(p, momentum, nesterov)  # relies on pre-pass
-            if isinstance(g, DTensor) and tp_group is not None:
+            if isinstance(g, DTensor) and tp_mesh is not None:
                 g = gather_tp_shard(
-                    g.to_local(), tp_group, tp_world_size, g.placements
+                    g.to_local(), tp_mesh, tp_world_size, g.placements
                 )  # TP tolerant
             else:
                 g = g.to_local() if isinstance(g, DTensor) else g
@@ -746,7 +762,7 @@ class DiSCO(AbstractDiSCO):
                 ref = ddp_params[end_idx - 1]
                 send_u = torch.zeros(ref.shape, dtype=cast_dtype, device=device)
 
-            if dp_group is not None and world_size > 1 and not skip_update:
+            if dp_replicate_mesh is not None and world_size > 1 and not skip_update:
                 gathered = []
                 pad_buffer = None
                 for i in range(world_size):
@@ -766,7 +782,7 @@ class DiSCO(AbstractDiSCO):
                             )
                         recv = pad_buffer
                     gathered.append(recv)
-                dist.all_gather(gathered, send_u, group=dp_group)
+                dist.all_gather(gathered, send_u, group=dp_replicate_mesh.get_group())
             else:
                 gathered = [send_u] if not skip_update else []
             if not skip_update:
@@ -791,7 +807,7 @@ class DiSCO(AbstractDiSCO):
         # -------- Phase C: apply once (vectorised foreach inside update_bucket_params) --------
         if not skip_update:
             self.update_bucket_params(
-                ddp_params, global_updates, 0, len(ddp_params), tp_group=tp_group
+                ddp_params, global_updates, 0, len(ddp_params), tp_mesh=tp_mesh
             )
 
         # -------- Phase C.5: Calculate Weight Norms (POST-UPDATE) --------
@@ -800,9 +816,9 @@ class DiSCO(AbstractDiSCO):
                 my_idx = bucket_idx * world_size + rank
                 if my_idx < len(ddp_params):
                     w = ddp_params[my_idx]
-                    if isinstance(w, DTensor) and tp_group is not None:
+                    if isinstance(w, DTensor) and tp_mesh is not None:
                         w = gather_tp_shard(
-                            w.to_local(), tp_group, tp_world_size, w.placements
+                            w.to_local(), tp_mesh, tp_world_size, w.placements
                         )
                     w_norms = calculate_norm(w, self.norms_to_log)
                 else:
@@ -817,21 +833,29 @@ class DiSCO(AbstractDiSCO):
             return
 
         upd = torch.stack(norms_of_update).float().to(device)
-        if dp_group is not None and world_size > 1:
-            gathered_upd = torch.empty(
-                world_size * upd.shape[0], dtype=upd.dtype, device=device
+        if dp_replicate_mesh is not None and world_size > 1:
+            # gathered_upd = torch.empty(
+            #     world_size * upd.shape[0], dtype=upd.dtype, device=device
+            # )
+            # dist.all_gather_into_tensor(gathered_upd, upd, group=dp_replicate_group)
+
+            gathered_upd = funcol.all_gather_tensor(
+                upd, gather_dim=0, group=dp_replicate_mesh
             )
-            dist.all_gather_into_tensor(gathered_upd, upd, group=dp_group)
         else:
             gathered_upd = upd
 
         if apply_on_weight:
             w = torch.stack(norms_of_weight).float().to(device)
-            if dp_group is not None and world_size > 1:
-                gathered_w = torch.empty(
-                    world_size * w.shape[0], dtype=w.dtype, device=device
+            if dp_replicate_mesh is not None and world_size > 1:
+                # gathered_w = torch.empty(
+                #     world_size * w.shape[0], dtype=w.dtype, device=device
+                # )
+                # dist.all_gather_into_tensor(gathered_w, w, group=dp_replicate_group)
+
+                gathered_w = funcol.all_gather_tensor(
+                    w, gather_dim=0, group=dp_replicate_mesh
                 )
-                dist.all_gather_into_tensor(gathered_w, w, group=dp_group)
             else:
                 gathered_w = w
         else:
@@ -861,7 +885,7 @@ class DiSCO(AbstractDiSCO):
         self,
         norms_of_update,
         norms_of_weight,
-        fsdp_group,
+        fsdp_mesh,
         rank,
         device,
         fsdp_param_names,
@@ -875,18 +899,24 @@ class DiSCO(AbstractDiSCO):
         """
         # --- 1. Collective Communication: All ranks must participate ---
         upd = torch.stack(norms_of_update).float().to(device)
-        gathered_update_norms = torch.empty(
-            world_size * upd.numel(), dtype=upd.dtype, device=device
+        # gathered_update_norms = torch.empty(
+        #     world_size * upd.numel(), dtype=upd.dtype, device=device
+        # )
+        # dist.all_gather_into_tensor(gathered_update_norms, upd, group=fsdp_group)
+        gathered_update_norms = funcol.all_gather_tensor(
+            upd, gather_dim=0, group=fsdp_mesh
         )
-        dist.all_gather_into_tensor(gathered_update_norms, upd, group=fsdp_group)
 
         gathered_weight_norms = None
         if apply_on_weight and norms_of_weight:
             w = torch.stack(norms_of_weight).float().to(device)
-            gathered_weight_norms = torch.empty(
-                world_size * w.numel(), dtype=w.dtype, device=device
+            # gathered_weight_norms = torch.empty(
+            #     world_size * w.numel(), dtype=w.dtype, device=device
+            # )
+            # dist.all_gather_into_tensor(gathered_weight_norms, w, group=fsdp_group)
+            gathered_weight_norms = funcol.all_gather_tensor(
+                w, gather_dim=0, group=fsdp_mesh
             )
-            dist.all_gather_into_tensor(gathered_weight_norms, w, group=fsdp_group)
 
         # --- 2. Local Processing: Only rank 0 processes and logs the results ---
         final_norms = {}
@@ -928,16 +958,18 @@ class DiSCO(AbstractDiSCO):
         need_to_calculate_norm = self.need_to_calculate_norm
         apply_on_weight = apply_on_weight and need_to_calculate_norm
 
-        fsdp_group = self.world_mesh["dp_shard_cp"].get_group()
-        world_size = dist.get_world_size(fsdp_group)
-        rank = dist.get_rank(fsdp_group)
+        fsdp_mesh = self.parallel_dims.get_optional_mesh("loss")
+        world_size, rank = fsdp_mesh.size(), fsdp_mesh.get_local_rank()
         device = fsdp_params[0].device
         cast_dtype = self.communication_dtype
 
-        tp_group = self.world_mesh["tp"].get_group() if self.tp_enabled else None
-        tp_world_size = dist.get_world_size(group=tp_group) if tp_group else 1
-        dp_replicate_group = (
-            self.world_mesh["dp_replicate"].get_group()
+        tp_mesh = (
+            self.parallel_dims.get_optional_mesh("tp") if self.tp_enabled else None
+        )
+        tp_world_size = tp_mesh.size() if tp_mesh else 1
+
+        dp_replicate_mesh = (
+            self.parallel_dims.get_optional_mesh("dp_replicate")
             if self.dp_replicate_enabled
             else None
         )
@@ -971,10 +1003,10 @@ class DiSCO(AbstractDiSCO):
                     if isinstance(g, DTensor):
                         original_placements = g.placements
                         tp_mesh_dim = tp_axis(original_placements)
-                        if tp_group and tp_mesh_dim is not None:
+                        if tp_mesh and tp_mesh_dim is not None:
                             g_local = gather_tp_shard(
                                 g.to_local(),
-                                tp_group,
+                                tp_mesh,
                                 tp_world_size,
                                 original_placements,
                             )
@@ -1014,17 +1046,24 @@ class DiSCO(AbstractDiSCO):
             recv_list_grads = [
                 torch.empty(s, dtype=cast_dtype, device=device) for s in recv_shapes
             ]
-
             # A2A: shards -> owners
             dist.all_to_all(
-                recv_list_grads, grads_send_list, group=fsdp_group
-            )  # list API
-
+                recv_list_grads, grads_send_list, group=fsdp_mesh.get_group()
+            )
             full_g = torch.cat(recv_list_grads, dim=0)
+
+            # this one only work if grads_send_list have same dim(1)
+            # full_g = funcol.all_to_all_single(
+            #     torch.cat(grads_send_list, dim=0),
+            #     output_split_sizes=recv_shapes,
+            #     input_split_sizes=send_shapes,
+            #     group=fsdp_mesh,
+            # )
+
             u = self.lmo(full_g, **param_kwargs_me)
 
-            if dp_replicate_group and self.extra_reduce_for_HSDP:
-                dist.all_reduce(u, group=dp_replicate_group, op=dist.ReduceOp.AVG)
+            if dp_replicate_mesh and self.extra_reduce_for_HSDP:
+                dist.all_reduce(u, group=dp_replicate_mesh, op=dist.ReduceOp.AVG)
 
             if not skip_update:
                 # Split owner’s update by destination rows and scatter back
@@ -1035,7 +1074,9 @@ class DiSCO(AbstractDiSCO):
                 ]
 
                 # A2A: owners -> shards
-                dist.all_to_all(recv_list_updates, updates_send_list, group=fsdp_group)
+                dist.all_to_all(
+                    recv_list_updates, updates_send_list, group=fsdp_mesh.get_group()
+                )
 
                 # Materialise bucket’s updates into global list
                 for i in range(end_idx - start_idx):
@@ -1059,7 +1100,7 @@ class DiSCO(AbstractDiSCO):
                 global_updates,
                 0,
                 len(fsdp_params),
-                tp_group=self.world_mesh["tp"].get_group() if self.tp_enabled else None,
+                tp_mesh=tp_mesh,
             )
 
         # --- Calculate Weight Norms (POST-UPDATE) ---
@@ -1080,9 +1121,9 @@ class DiSCO(AbstractDiSCO):
 
                     original_placements = p.placements
                     tp_mesh_dim = tp_axis(original_placements)
-                    if tp_group and tp_mesh_dim is not None:
+                    if tp_mesh and tp_mesh_dim is not None:
                         p_local = gather_tp_shard(
-                            p.to_local(), tp_group, tp_world_size, original_placements
+                            p.to_local(), tp_mesh, tp_world_size, original_placements
                         )
                     else:
                         p_local = p.to_local()
@@ -1095,8 +1136,9 @@ class DiSCO(AbstractDiSCO):
                 recv_list_params = [
                     torch.empty(s, dtype=cast_dtype, device=device) for s in recv_shapes
                 ]
-                dist.all_to_all(recv_list_params, params_send_list, group=fsdp_group)
-
+                dist.all_to_all(
+                    recv_list_params, params_send_list, group=fsdp_mesh.get_group()
+                )
                 full_weight = torch.cat(recv_list_params, dim=0)
 
                 w_norms = (
@@ -1112,7 +1154,7 @@ class DiSCO(AbstractDiSCO):
             self._gather_and_log_fsdp_norms(
                 norms_of_update,
                 norms_of_weight,
-                fsdp_group,
+                fsdp_mesh,
                 rank,
                 device,
                 fsdp_param_names,
@@ -1185,14 +1227,14 @@ class DiSCO(AbstractDiSCO):
         return g
 
     @record_function("disco.update_bucket_params")
-    def update_bucket_params(self, params, updates, start_idx, end_idx, tp_group=None):
+    def update_bucket_params(self, params, updates, start_idx, end_idx, tp_mesh=None):
         slice_params = params[start_idx:end_idx]
         slice_updates = updates[: (end_idx - start_idx)]
         # already prepare a bucket of same length
 
         prepared = []
-        if tp_group is not None:
-            tp_rank = tp_group.rank()
+        if tp_mesh is not None:
+            tp_rank = tp_mesh.get_local_rank()
             for p, u in zip(slice_params, slice_updates):
                 if u is None:
                     prepared.append((p, None))
@@ -1282,16 +1324,20 @@ class DiSCO(AbstractDiSCO):
         # --- 1. SETUP ---
         device = fsdp_params[0].device
         torch.cuda.set_device(device)
-        fsdp_group = self.world_mesh["dp_shard_cp"].get_group()
-        world_size, rank = fsdp_group.size(), fsdp_group.rank()
+        fsdp_group = self.parallel_dims.get_optional_mesh("loss").get_group()
+        world_size, rank = fsdp_group.size(), fsdp_group.get_local_rank()
         cast_dtype = self.communication_dtype
         total_params = len(fsdp_params)
 
         # Optional groups for TP/HSDP
-        tp_group = self.world_mesh["tp"].get_group() if self.tp_enabled else None
-        tp_world = dist.get_world_size(group=tp_group) if tp_group else 1
+        tp_group = (
+            self.parallel_dims.get_optional_mesh("tp").get_group()
+            if self.tp_enabled
+            else None
+        )
+        tp_world = tp_group.size() if tp_group else 1
         dp_rep_group = (
-            self.world_mesh["dp_replicate"].get_group()
+            self.parallel_dims.get_optional_mesh("dp_replicate").get_group()
             if self.dp_replicate_enabled
             else None
         )
