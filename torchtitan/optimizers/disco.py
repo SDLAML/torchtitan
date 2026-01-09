@@ -25,7 +25,7 @@ except ImportError:
 
 from torch.profiler import record_function  # labels in PyTorch profiler
 
-from .norm_helper import calculate_norm
+from .norm_helper import calculate_norm, DONT_TRACK_RAW_GRADIENT
 from .utils import remove_orig_mod_and_weight_for_p_name
 
 __all__ = [
@@ -530,7 +530,9 @@ class DiSCO(AbstractDiSCO):
 
             # Calculate norms on the full tensors
             need_T = CONST_NAME_OF_EMBEDDING in p_name
-            upd_norms = calculate_norm(-lr * u, self.norms_to_log, transpose=need_T)
+            upd_norms = calculate_norm(
+                -lr * u, self.norms_to_log, transpose=need_T, raw_gradient=g
+            )
 
             # Gather the parameter itself to a full tensor if needed
             if apply_on_weight and isinstance(p, DTensor):
@@ -602,7 +604,10 @@ class DiSCO(AbstractDiSCO):
                 assert u.ndim == 3
                 for ep_idx in range(u.shape[0]):
                     update_norms = calculate_norm(
-                        u[ep_idx], self.norms_to_log, transpose=transpose
+                        -lr * u[ep_idx],
+                        self.norms_to_log,
+                        transpose=transpose,
+                        raw_gradient=g[ep_idx],
                     )
                     # Template for MoE norm keys
                     norms_of_update.extend(update_norms.values())
@@ -732,6 +737,8 @@ class DiSCO(AbstractDiSCO):
 
         # -------- Phase A: precompute local LMO updates (no comm) --------
         local_updates: dict[int, torch.Tensor] = {}
+        local_grads: dict[int, torch.Tensor | None] = {}
+
         local_indices = range(rank, len(ddp_params), world_size)
         for i in local_indices:
             p = ddp_params[i]
@@ -746,6 +753,8 @@ class DiSCO(AbstractDiSCO):
             else:
                 g = g.to_local() if isinstance(g, DTensor) else g
             u = self.lmo(g.to(dtype=cast_dtype), **param_kwargs)
+
+            local_grads[i] = None if DONT_TRACK_RAW_GRADIENT else g
             local_updates[i] = u
 
         # -------- Phase B: DDP communication (per bucket) and build a global update cache --------
@@ -795,7 +804,9 @@ class DiSCO(AbstractDiSCO):
                     p = ddp_params[my_idx]
                     lr, *_ = self.groups_info[self.parameters_to_groups[id(p)]]
                     upd_norms = calculate_norm(
-                        -lr * local_updates[my_idx], self.norms_to_log
+                        -lr * local_updates[my_idx],
+                        self.norms_to_log,
+                        raw_gradient=local_grads[my_idx],
                     )
                 else:
                     upd_norms = {
@@ -1088,7 +1099,9 @@ class DiSCO(AbstractDiSCO):
                 if my_param_in_bucket:
                     p = fsdp_params[start_idx + rank]
                     lr, *_ = self.groups_info[self.parameters_to_groups[id(p)]]
-                    upd_norms = calculate_norm(-lr * u, self.norms_to_log)
+                    upd_norms = calculate_norm(
+                        -lr * u, self.norms_to_log, raw_gradient=full_g
+                    )
                 else:
                     upd_norms = padding_norms
                 norms_of_update.extend(upd_norms.values())
