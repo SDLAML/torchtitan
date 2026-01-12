@@ -8,7 +8,7 @@
 # [1] https://github.com/volcengine/verl/blob/main/verl/utils/dataset/multiturn_sft_dataset.py
 # [2] https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/datasets/sft_dataset.py#L35
 # [3] https://github.com/volcengine/verl/blob/main/verl/utils/dataset/sft_dataset.py#L33
-from dataclasses import field
+from dataclasses import asdict, field
 from functools import partial
 from typing import Any, Callable, Optional
 
@@ -551,6 +551,14 @@ def build_sft_text_dataloader(
     batch_size = job_config.training.local_batch_size
     seq_len = job_config.training.seq_len
 
+    rng = torch.Generator()
+    if job_config.training.dataset_seed is not None:
+        rng.manual_seed(job_config.training.dataset_seed)
+
+    # lets not use multiple datasets for now
+    dataset_name = dataset_name[0] if isinstance(dataset_name, list) else dataset_name
+    dataset_path = dataset_path[0] if isinstance(dataset_path, list) else dataset_path
+
     sft_config = job_config.sft_config
     # TODO: Improving the dataset loading, its easy to fix
     dataset = load_dataset(
@@ -572,11 +580,32 @@ def build_sft_text_dataloader(
         sft_config=sft_config,
     )
 
+    if job_config.checkpoint.enable:
+        global_batch_size = job_config.training.global_batch_size
+        if global_batch_size < 0:
+            global_batch_size = job_config.training.local_batch_size * dp_world_size
+        gradient_accumulation_steps = global_batch_size // (
+            job_config.training.local_batch_size * dp_world_size
+        )
+        ckpt_freq = job_config.checkpoint.interval * gradient_accumulation_steps
+    elif len(dataset_name) == 1:
+        ckpt_freq = 1
+    else:
+        ckpt_freq = 999999999999
+    logger.info(f" [DataLoader] snapshot_every_n_steps is set to {ckpt_freq}")
+
+    dataloader_kwargs = {
+        **asdict(job_config.training.dataloader),
+        "batch_size": batch_size,
+        "generator": rng,
+        "snapshot_every_n_steps": ckpt_freq,
+    }
+
     return ParallelAwareDataloader(
-        dataset=hf_ds,
+        hf_ds,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
-        batch_size=batch_size,
+        **dataloader_kwargs,
     )
 
 
@@ -593,6 +622,10 @@ def build_sft_validation_dataloader(
     batch_size = job_config.validation.local_batch_size
     seq_len = job_config.validation.seq_len
 
+    rng = torch.Generator()
+    if job_config.validation.seed is not None:
+        rng.manual_seed(job_config.validation.seed)
+
     sft_config = job_config.sft_config
     # TODO: Improving the dataset loading, its easy to fix
     dataset = load_dataset(
@@ -614,9 +647,24 @@ def build_sft_validation_dataloader(
         sft_config=sft_config,
     )
 
+    if job_config.checkpoint.enable:
+        ckpt_freq = job_config.checkpoint.interval
+    elif len(dataset_name) == 1:
+        ckpt_freq = 1
+    else:
+        ckpt_freq = 999999999999
+    logger.info(f" [DataLoader] snapshot_every_n_steps is set to {ckpt_freq}")
+
+    dataloader_kwargs = {
+        **asdict(job_config.validation.dataloader),
+        "batch_size": batch_size,
+        "generator": rng,
+        "snapshot_every_n_steps": ckpt_freq,
+    }
+
     return ParallelAwareDataloader(
-        dataset=hf_ds,
+        hf_ds,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
-        batch_size=batch_size,
+        **dataloader_kwargs,
     )

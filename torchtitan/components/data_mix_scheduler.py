@@ -7,6 +7,7 @@
 import json
 import os
 
+import torch
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.config import JobConfig
 
@@ -45,8 +46,27 @@ class DataMixScheduler:
         self.dataloader.dataset.set_weights(current_weights)
 
 
-def build_data_mix_scheduler(dataloader: BaseDataLoader, job_config: JobConfig):
+class DummyDataMixScheduler:
+    def __init__(self):
+        self.mixing_configs = {0: [1]}
 
+    def get_weights_at_step(self, current_step: int):
+        return [1]
+
+    def get_log_dict_at_step(self, current_step: int):
+        data_mix_log = {"data_mixing/not_mixed_datasets": torch.tensor(1)}
+        data_sampled_log = {"data_sampled/not_mixed_datasets": torch.tensor(0)}
+        return data_mix_log, data_sampled_log
+
+    def step(self, current_step: int):
+        pass
+
+
+def build_data_mix_scheduler(dataloader: BaseDataLoader, job_config: JobConfig):
+    if not hasattr(dataloader.dataset, "weights") or not hasattr(
+        dataloader.dataset, "datasets"
+    ):
+        return DummyDataMixScheduler()
     mixing_scheduler_configs = job_config.training.data_mixing_scheduler_configs
     mixing_configs = None
     if mixing_scheduler_configs:
@@ -65,14 +85,15 @@ def build_data_mix_scheduler(dataloader: BaseDataLoader, job_config: JobConfig):
         step: [weights_for_dataset_0, weights_for_dataset_1, ...],
     }
     """
+
     if mixing_configs is None:
         mixing_configs = {
-            0: dataloader.dataset.weights,
+            0: dataloader.dataset.weights.tolist(),
         }
     else:
-        assert (
-            0 in mixing_configs
-        ), "mixing_configs must contain at least one entry for step 0"
+        assert 0 in mixing_configs, (
+            "mixing_configs must contain at least one entry for step 0"
+        )
 
         for step, weights in mixing_configs.items():
             assert len(weights) == len(dataloader.dataset.datasets), (

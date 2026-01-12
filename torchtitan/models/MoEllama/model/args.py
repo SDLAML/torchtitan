@@ -139,10 +139,11 @@ class MoEModelArgs(BaseModelArgs):
             # optional.
             if hasattr(tokenizer, "pad_id"):
                 self.pad_id = tokenizer.pad_id
-            # Add an additional vocab element if we are explicitly
-            # supporting a pad token.
-            if self.pad_id >= 0:
-                self.vocab_size += 1
+            # Cannot see the point why make vocab size +1 for pad token
+            # # # Add an additional vocab element if we are explicitly
+            # # # supporting a pad token.
+            # # if self.pad_id >= 0:
+            # #     self.vocab_size += 1
 
         if job_config.model.vocab_size_multiple_of:
             orig_vocab_size = self.vocab_size
