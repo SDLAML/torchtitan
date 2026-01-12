@@ -16,6 +16,10 @@ from torchtitan.tools.logging import logger
 
 LossFunction: TypeAlias = Callable[..., torch.Tensor]
 
+IGNORE_INDEX = -100
+# Pytorch's default for F.cross_entropy
+# Used in VLM and SFT training
+
 
 def cross_entropy_loss(
     pred: torch.Tensor | list[torch.Tensor] | TransformerInputsDict,
