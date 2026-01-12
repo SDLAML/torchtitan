@@ -963,6 +963,7 @@ def main(trainer_class: type[Trainer]) -> None:
 
     config_manager = ConfigManager()
     config = config_manager.parse_args()
+
     trainer: Trainer | None = None
 
     try:

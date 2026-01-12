@@ -389,7 +389,7 @@ class DataLoader:
     pin_memory: bool = False
     """Copy tensors to CUDA pinned memory before returning them."""
 
-    prefetch_factor: int | None = None
+    prefetch_factor: int | None = 2
     """
     Number of batches loaded in advance by each worker. Only valid when num_workers > 0.
     Default is 2 when num_workers > 0, otherwise None.
@@ -950,7 +950,9 @@ class Float8Linear:
     precompute_float8_dynamic_scale_for_fsdp: bool = False
     """Whether precompute float8 scales dynamically for FSDP, recommended for tensorwise scaling"""
 
-    recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] | None = None
+    recipe_name: Literal[
+        "tensorwise", "rowwise", "rowwise_with_gw_hp"
+    ] | None = "tensorwise"
     """If specified, creates float8 config from recipe name"""
 
     filter_fqns: list[str] = field(default_factory=list)
