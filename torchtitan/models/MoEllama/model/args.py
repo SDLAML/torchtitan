@@ -113,16 +113,13 @@ class MoEModelArgs(BaseModelArgs):
         self.num_mtp_modules = job_config.training.num_mtp_tokens
         assert self.num_mtp_modules >= 0
 
-        # Normalize `depth_init`.
-        depth_init = job_config.model.depth_init.lower()
-        if depth_init == ["true", "depth"]:
-            depth_init = True
-        elif depth_init == ["false", "total_depth"]:
-            depth_init = False
-        elif depth_init in ["none", "null", "identity"]:
-            depth_init = None
-        self.depth_init = depth_init
+        self.model_init_args.depth_init = parse_depth_init(
+            self.model_init_args.depth_init
+        )
 
+        if job_config.model.vocab_size is not None:
+            self.vocab_size = job_config.model.vocab_size
+        vocab_size_not_set = self.vocab_size == -1
         if self.vocab_size == -1:
             tokenizer = kwargs.get("tokenizer")
             assert isinstance(tokenizer, BaseTokenizer), (
@@ -139,11 +136,14 @@ class MoEModelArgs(BaseModelArgs):
             # optional.
             if hasattr(tokenizer, "pad_id"):
                 self.pad_id = tokenizer.pad_id
-            # Cannot see the point why make vocab size +1 for pad token
-            # # # Add an additional vocab element if we are explicitly
-            # # # supporting a pad token.
-            # # if self.pad_id >= 0:
-            # #     self.vocab_size += 1
+
+            # Add an additional vocab element if we are explicitly
+            # supporting a pad token.
+            if self.pad_id >= 0 and vocab_size_not_set:
+                # if the vocab size is not set, add 1 for the pad token
+                # in general, we usually pre-assigned a larger vocab size
+                # such that there is no need to add 1 for the pad token
+                self.vocab_size += 1
 
         if job_config.model.vocab_size_multiple_of:
             orig_vocab_size = self.vocab_size
