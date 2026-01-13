@@ -101,6 +101,7 @@ class TransformerModelArgs(BaseModelArgs):
 
         if job_config.model.vocab_size is not None:
             self.vocab_size = job_config.model.vocab_size
+        vocab_size_not_set = self.vocab_size == -1
         if self.vocab_size == -1:
             tokenizer = kwargs.get("tokenizer")
             assert isinstance(tokenizer, BaseTokenizer), (
@@ -117,9 +118,14 @@ class TransformerModelArgs(BaseModelArgs):
             # optional.
             if hasattr(tokenizer, "pad_id"):
                 self.pad_id = tokenizer.pad_id
+
+            # Cannot see the point why make vocab size +1 for pad token
             # Add an additional vocab element if we are explicitly
             # supporting a pad token.
-            if self.pad_id >= 0:
+            if self.pad_id >= 0 and vocab_size_not_set:
+                # if the vocab size is not set, add 1 for the pad token
+                # in general, we usually pre-assigned a larger vocab size
+                # such that there is no need to add 1 for the pad token
                 self.vocab_size += 1
 
         if job_config.model.vocab_size_multiple_of:
