@@ -8,6 +8,8 @@ import json
 import os
 
 import torch
+
+
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.config import JobConfig
 
@@ -43,6 +45,23 @@ class DataMixScheduler:
         first_step = self.step_milestones[0]
         return self.mixing_configs[first_step]
 
+    def convert_mixing_configs_to_json(self):
+        configs_dict = {}
+        for key, value in self.mixing_configs.items():
+            if key == "names":
+                configs_dict[key] = value
+                continue
+            if isinstance(value, torch.Tensor):
+                configs_dict[key] = value.cpu().tolist()
+            elif isinstance(value, list) or isinstance(value, tuple):
+                configs_dict[key] = value
+            elif isinstance(value, int) or isinstance(value, float):
+                configs_dict[key] = [value]
+            else:
+                raise ValueError(f"Unsupported type: {type(value)}")
+
+        return configs_dict
+
     def get_log_dict_at_step(self, current_step: int):
         all_weights = self.get_weights_at_step(current_step)
         data_mix_log, data_sampled_log = {}, {}
@@ -50,9 +69,9 @@ class DataMixScheduler:
             data_mix_log[f"data_mixing/{self.datasets_names[data_i]}"] = all_weights[
                 data_i
             ]
-            data_sampled_log[
-                f"data_sampled/{self.datasets_names[data_i]}"
-            ] = self.dataloader.dataset.num_sampled_per_dataset[data_i]
+            data_sampled_log[f"data_sampled/{self.datasets_names[data_i]}"] = (
+                self.dataloader.dataset.num_sampled_per_dataset[data_i]
+            )
         return data_mix_log, data_sampled_log
 
     def step(self, current_step: int):
@@ -116,9 +135,9 @@ def build_data_mix_scheduler(dataloader: BaseDataLoader, job_config: JobConfig):
             f"{len(dataloader.dataset.datasets)} and len(datasets_names) = "
             f"{len(datasets_names)} but got datasets_names = {datasets_names}"
         )
-    assert (
-        0 in mixing_configs
-    ), "mixing_configs must contain at least one entry for step 0"
+    assert 0 in mixing_configs, (
+        "mixing_configs must contain at least one entry for step 0"
+    )
 
     for step, weights in mixing_configs.items():
         assert len(weights) == len(dataloader.dataset.datasets), (

@@ -494,8 +494,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 + datetime.datetime.now().strftime("%Y%m%d-%H%M")
                 + ".json",
             )
+
             with open(data_mix_scheduler_save_path, "w") as f:
-                json.dump(self.data_mix_scheduler.mixing_configs, f, indent=4)
+                json.dump(
+                    self.data_mix_scheduler.convert_mixing_configs_to_json(),
+                    f,
+                    indent=4,
+                )
 
     def init_distributed(self) -> ParallelDims:
         job_config = self.job_config
