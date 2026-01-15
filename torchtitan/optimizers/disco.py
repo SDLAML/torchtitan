@@ -569,7 +569,7 @@ class DiSCO(AbstractDiSCO):
         apply_on_weight = apply_on_weight and need_to_calculate_norm
 
         device = expert_params[0].device
-        fsdp_mesh = self.parallel_dims.get_optional_mesh("loss")
+        fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
         world_size, local_rank = fsdp_mesh.size(), fsdp_mesh.get_local_rank()
         ep_per_rank = math.ceil(expert_params[0].shape[0] / world_size)
 
@@ -958,7 +958,7 @@ class DiSCO(AbstractDiSCO):
         need_to_calculate_norm = self.need_to_calculate_norm
         apply_on_weight = apply_on_weight and need_to_calculate_norm
 
-        fsdp_mesh = self.parallel_dims.get_optional_mesh("loss")
+        fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
         world_size, rank = fsdp_mesh.size(), fsdp_mesh.get_local_rank()
         device = fsdp_params[0].device
         cast_dtype = self.communication_dtype
@@ -1324,7 +1324,7 @@ class DiSCO(AbstractDiSCO):
         # --- 1. SETUP ---
         device = fsdp_params[0].device
         torch.cuda.set_device(device)
-        fsdp_group = self.parallel_dims.get_optional_mesh("loss").get_group()
+        fsdp_group = self.parallel_dims.get_optional_mesh("fsdp").get_group()
         world_size, rank = fsdp_group.size(), fsdp_group.get_local_rank()
         cast_dtype = self.communication_dtype
         total_params = len(fsdp_params)
