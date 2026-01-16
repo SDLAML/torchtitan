@@ -42,7 +42,7 @@ def precompute_freqs_cis(
     dim: int,
     end: int,
     theta: float = 10000.0,
-    scaling_args: RoPEScalingArgs = RoPEScalingArgs(),
+    scaling_args: RoPEScalingArgs | None = None,
 ) -> torch.Tensor:
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
@@ -64,36 +64,58 @@ def precompute_freqs_cis(
                 (short-wavelength) RoPE bands. Defaults to 4.0.
             original_max_position_embeddings (int): Maximum position embeddings
                 for original model. Defaults to 8192.
+            attention_factor (float): Attention factor for YaRN scaling. Defaults to 1.0.
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
     """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    half = dim // 2
+    # --- base inv_freq (extrapolation spectrum): [half] ---
+    inv_freq_extrap = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))[:half]
+    inv_freq = inv_freq_extrap
 
-    # apply rope scaling
+    attention_factor = 1.0
+
     if scaling_args is not None:
-        scaling_factor = scaling_args.scaling_factor
-        low_freq_factor = scaling_args.low_freq_factor
-        high_freq_factor = scaling_args.high_freq_factor
-        original_max_position_embeddings = scaling_args.original_max_position_embeddings
-        wavelen = 2 * math.pi / freqs
-        high_freq_wavelen = original_max_position_embeddings / high_freq_factor
-        low_freq_wavelen = original_max_position_embeddings / low_freq_factor
-        # wavelen < high_freq_wavelen: do nothing
-        # wavelen > low_freq_wavelen: divide by scaling factor
-        freqs = torch.where(wavelen > low_freq_wavelen, freqs / scaling_factor, freqs)
-        # wavelen in between: linear interpolation of the scaled freqs and the original freqs
-        smooth_factor = (
-            original_max_position_embeddings / wavelen - low_freq_factor
-        ) / (high_freq_factor - low_freq_factor)
-        smoothed_freqs = (
-            1 - smooth_factor
-        ) * freqs / scaling_factor + smooth_factor * freqs
-        is_medium_freqs = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
-        freqs = torch.where(is_medium_freqs, smoothed_freqs, freqs)
+        factor = float(scaling_args.scaling_factor)  # HF/YaRN "factor"
+        beta_slow = float(scaling_args.low_freq_factor)  # HF "beta_slow"
+        beta_fast = float(scaling_args.high_freq_factor)  # HF "beta_fast"
+        old_ctx = int(scaling_args.original_max_position_embeddings)
 
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+        # HF/YaRN attention scaling (sqrt(1/t)); if None, compute default
+        attention_factor = float(scaling_args.attention_factor)
+        # if attention_factor is None:
+        #     attention_factor = 1.0 if factor <= 1.0 else (0.1 * math.log(factor) + 1.0)
+
+        if factor != 1.0:
+            inv_freq_interp = inv_freq_extrap / factor
+
+            # Convert beta thresholds (rotations) -> index boundaries in [0, half-1]
+            def dim_from_rot(n_rot: float) -> float:
+                return (
+                    dim
+                    * math.log(old_ctx / (n_rot * 2.0 * math.pi))
+                    / (2.0 * math.log(theta))
+                )
+
+            low = max(int(math.floor(dim_from_rot(beta_fast))), 0)
+            high = min(int(math.ceil(dim_from_rot(beta_slow))), half - 1)
+
+            # Linear ramp over index i
+            idx = torch.arange(half, device=inv_freq_extrap.device, dtype=torch.float32)
+            if high <= low:
+                ramp = (idx >= low).to(dtype=torch.float32)
+            else:
+                ramp = ((idx - low) / (high - low)).clamp_(0.0, 1.0)
+
+            # Blend: ramp=0 -> extrapolation, ramp=1 -> interpolation
+            inv_freq = inv_freq_extrap * (1.0 - ramp) + inv_freq_interp * ramp
+
+    # angles: [end, half]
+    t = torch.arange(end, device=inv_freq.device)
+    angles = torch.outer(t, inv_freq).float()
+
+    # Complex cis with YaRN attention scaling as magnitude (matches HF cos/sin *= attention_scaling)
+    freqs_cis = torch.polar(attention_factor * torch.ones_like(angles), angles)
     return freqs_cis
 
 
