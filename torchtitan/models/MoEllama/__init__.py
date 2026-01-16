@@ -140,6 +140,35 @@ moe_llama_configs = {
         intermediate_size=5120,
         moe_intermediate_size=640,
     ),
+    "bsc-1B-7B-opt-g-32k": MoEModelArgs(
+        dim=2048,
+        n_layers=24,
+        n_dense_layers=1,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        moe_args=MoEArgs(
+            num_experts=64,
+            num_shared_experts=1,
+            top_k=8,
+            scaling_factor=2.8232,  # 8 of 64 experts
+        ),
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        rope_scaling_args=RoPEScalingArgs(
+            scaling_factor=8.0,
+            low_freq_factor=1.0,
+            high_freq_factor=32.0,
+            original_max_position_embeddings=4096,
+            attention_factor=1.2079441541679836,
+            # 0.1*ln(factor) + 1
+        ),
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+        intermediate_size=5120,
+        moe_intermediate_size=640,
+    ),
     "bsc-1B-7B-opt-g-64k": MoEModelArgs(
         dim=2048,
         n_layers=24,

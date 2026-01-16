@@ -5,8 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Sequence
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from random import Random
 from typing import Any, Callable
@@ -407,11 +406,13 @@ class GreedyPackedDataset(IterableDataset, Stateful):
         seq_len: int = 2048,
         infinite: bool = False,
         num_mtp_tokens: int = 0,
+        drop_long_samples: bool = False,
     ) -> None:
         self._data = dataset
         self.seq_len = seq_len
         self.infinite = infinite
         self.num_mtp_tokens = num_mtp_tokens
+        self.drop_long_samples = drop_long_samples
 
         # Variables for checkpointing
         self._sample_idx = 0
@@ -437,8 +438,12 @@ class GreedyPackedDataset(IterableDataset, Stateful):
             num_yielded = 0
             for sample_tokens in self._get_data_iter():
                 num_yielded += 1
-                self._token_buffer.extend(sample_tokens)
                 self._sample_idx += 1
+
+                if self.drop_long_samples and len(sample_tokens) > max_buffer_token_len:
+                    continue
+
+                self._token_buffer.extend(sample_tokens)
 
                 while len(self._token_buffer) >= max_buffer_token_len:
                     x = torch.LongTensor(self._token_buffer[:max_buffer_token_len])
@@ -617,6 +622,7 @@ def build_text_dataloader(
         # Convert to floats.
         else list(map(float, dataset_weights))
     )
+    drop_long_samples = job_config.training.drop_long_samples
 
     if len(dataset_name) > 1:
         assert (
@@ -659,6 +665,7 @@ def build_text_dataloader(
                 seq_len=seq_len,
                 infinite=infinite,
                 num_mtp_tokens=num_mtp_tokens,
+                drop_long_samples=drop_long_samples,
             )
         hf_datasets.append(hf_ds)
 
@@ -673,6 +680,7 @@ def build_text_dataloader(
             seq_len=seq_len,
             infinite=infinite,
             num_mtp_tokens=num_mtp_tokens,
+            drop_long_samples=drop_long_samples,
         )
 
     if job_config.training.dataset_shuffle_buffer_size:
@@ -686,7 +694,7 @@ def build_text_dataloader(
     rng = torch.Generator()
     if job_config.training.dataset_seed is not None:
         rng.manual_seed(job_config.training.dataset_seed)
-    
+
     if job_config.checkpoint.enable:
         global_batch_size = job_config.training.global_batch_size
         if global_batch_size < 0:
@@ -706,10 +714,7 @@ def build_text_dataloader(
         "batch_size": batch_size,
         "generator": rng,
         "snapshot_every_n_steps": ckpt_freq,
-
     }
-
-
 
     return ParallelAwareDataloader(
         hf_ds,
@@ -777,14 +782,12 @@ def build_text_validation_dataloader(
         ckpt_freq = 999999999999
     logger.info(f" [DataLoader] snapshot_every_n_steps is set to {ckpt_freq}")
 
-
     dataloader_kwargs = {
         **asdict(job_config.validation.dataloader),
         "batch_size": batch_size,
         "generator": rng,
         "snapshot_every_n_steps": ckpt_freq,
     }
-    
 
     return ParallelAwareDataloader(
         hf_ds,

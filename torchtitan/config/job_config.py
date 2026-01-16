@@ -464,6 +464,9 @@ class Training:
     and key "0" must exist.
     """
 
+    drop_long_samples: bool = False
+    """Whether to drop samples longer than the sequence length"""
+
     local_batch_size: int = 8
     """Local batch size (i.e., per-device batch size)"""
 
