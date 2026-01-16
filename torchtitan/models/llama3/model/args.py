@@ -26,6 +26,7 @@ class RoPEScalingArgs:
     low_freq_factor: float = 1.0
     high_freq_factor: float = 4.0
     original_max_position_embeddings: int = 8192
+    attention_factor: float = 1.0
 
 
 @dataclass

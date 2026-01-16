@@ -50,6 +50,18 @@ def overwrite_config(model, model_args):
     default_config["head_dim"] = attention.head_dim
     default_config["rope_theta"] = model_args.rope_theta
 
+    # yarn scaling
+    if model_args.rope_scaling_args is not None:
+        rope_scaling_args = model_args.rope_scaling_args
+        default_config["rope_scaling"] = {
+            "rope_type": "yarn",
+            "attention_factor": rope_scaling_args.attention_factor,
+            "beta_fast": rope_scaling_args.high_freq_factor,
+            "beta_slow": rope_scaling_args.low_freq_factor,
+            "factor": rope_scaling_args.scaling_factor,
+            "original_max_position_embeddings": rope_scaling_args.original_max_position_embeddings,
+        }
+
     default_config["intermediate_size"] = ffn.hidden_dim
     default_config["hidden_size"] = ffn.dim
 
