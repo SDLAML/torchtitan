@@ -91,6 +91,9 @@ class DummyDataMixScheduler:
         data_sampled_log = {"data_sampled/not_mixed_datasets": torch.tensor(0)}
         return data_mix_log, data_sampled_log
 
+    def convert_mixing_configs_to_json(self):
+        return {"0": [1]}
+
     def step(self, current_step: int):
         pass
 
