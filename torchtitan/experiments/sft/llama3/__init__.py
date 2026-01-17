@@ -21,6 +21,7 @@ from torchtitan.models.llama3 import llama3_args, Transformer
 from torchtitan.models.llama3.infra.parallelize import parallelize_llama
 from torchtitan.models.llama3.model.state_dict_adapter import Llama3StateDictAdapter
 from torchtitan.protocols.train_spec import TrainSpec
+from torchtitan.models.llama3.hf_assests import setup_hf
 
 
 def get_train_spec() -> TrainSpec:
@@ -37,4 +38,5 @@ def get_train_spec() -> TrainSpec:
         build_loss_fn=build_token_imbalance_ce_loss,
         build_validator_fn=build_sft_validation_dataloader,
         state_dict_adapter=Llama3StateDictAdapter,
+        hf_assets_setup_fn=setup_hf.copy_and_overwrite_model_config,
     )
