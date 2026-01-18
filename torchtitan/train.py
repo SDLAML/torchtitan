@@ -32,6 +32,7 @@ from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
 from torchtitan.components.loss import (
     build_cross_entropy_loss,
+    IGNORE_INDEX,
     moe_loss,
     multi_token_cross_entropy_loss,
     rescale_accumulated_loss,
@@ -605,7 +606,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 tokenizer=self.tokenizer,
                 extra_inputs=extra_inputs,
             )
-
+        if self.job_config.training.enable_token_mask_for_moe:
+            loss_mask = labels != IGNORE_INDEX
+            extra_kwargs["loss_mask"] = loss_mask
         return inputs, labels, extra_inputs, extra_kwargs
 
     def forward_backward_step(

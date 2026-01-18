@@ -812,6 +812,7 @@ class Transformer(nn.Module, ModelProtocol):
         inputs: MTPInputs,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
+        loss_mask: torch.Tensor | None = None,
     ) -> MTPInputsDict:
         """
         Perform a forward pass through the Transformer model.
@@ -838,7 +839,7 @@ class Transformer(nn.Module, ModelProtocol):
                 - prev_embed (torch.Tensor | None): Output token embeddings
                   of previous Transformer layer (after output norm, before
                   unembedding).
-
+            loss_mask (torch.Tensor | None): Loss mask for MoE. Defaults to None.
         """
         if not isinstance(inputs, dict):
             inputs = {"tokens_list": inputs}

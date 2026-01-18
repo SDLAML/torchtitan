@@ -166,6 +166,7 @@ class TransformerBlock(nn.Module):
         accumulated_load_balance_loss: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        loss_mask: torch.Tensor | None = None,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -184,7 +185,7 @@ class TransformerBlock(nn.Module):
         )
 
         if self.moe_enabled:
-            mlp_output, load_balance_loss = self.moe(self.ffn_norm(h))
+            mlp_output, load_balance_loss = self.moe(self.ffn_norm(h), loss_mask)
             accumulated_load_balance_loss = (
                 accumulated_load_balance_loss + load_balance_loss
             )
@@ -409,6 +410,7 @@ class Transformer(nn.Module, ModelProtocol):
         accumulated_load_balance_loss: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
+        loss_mask: torch.Tensor | None = None,
     ) -> MoEInputsDict:
         """
         Perform a forward pass through the Transformer model.
@@ -458,6 +460,7 @@ class Transformer(nn.Module, ModelProtocol):
                 accumulated_load_balance_loss,
                 attention_masks,
                 positions,
+                loss_mask,
             )
 
         h = self.norm(h) if self.norm else h

@@ -145,6 +145,7 @@ class TokenChoiceTopKRouter(nn.Module):
         x: torch.Tensor,
         expert_bias: torch.Tensor | None = None,
         need_aux_loss: bool = False,
+        loss_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -202,20 +203,37 @@ class TokenChoiceTopKRouter(nn.Module):
             -1
         )  # (T*K,)  (already per-token normalized over K)
 
-        mass = torch.zeros(self.num_experts, device=x.device, dtype=torch.bfloat16)
-        mass.scatter_add_(0, idx, detached_top_scores.to(torch.bfloat16))
-        p = mass / (mass.sum() + 1e-20)
-        experts_entropy = -(p * (p + 1e-20).log()).sum()
+        if loss_mask is None:
+            mass = torch.zeros(self.num_experts, device=x.device, dtype=torch.bfloat16)
+            mass.scatter_add_(0, idx, detached_top_scores.to(torch.bfloat16))
+            num_tokens_per_expert = torch.histc(
+                selected_experts_indices.view(-1),
+                bins=self.num_experts,
+                min=0,
+                max=self.num_experts,
+            )
+        else:
+            mask_t = loss_mask.view(-1)  # (T,)
+            mask_tk = mask_t[:, None].expand(-1, self.top_k)  # (T, K)
+
+            idx = selected_experts_indices.reshape(-1)  # (T*K,)
+            m = mask_tk.reshape(-1).bool()  # (T*K,)
+
+            # masked token counts
+            num_tokens_per_expert = torch.bincount(
+                idx[m], minlength=self.num_experts
+            ).to(device=idx.device)
+
+            # masked router "mass" (sum of top-k probs/scores per expert)
+            w = mask_tk.reshape(-1).to(detached_top_scores.dtype)  # (T*K,)
+            mass = torch.zeros(
+                self.num_experts, device=idx.device, dtype=detached_top_scores.dtype
+            )
+            mass.scatter_add_(0, idx, detached_top_scores.reshape(-1) * w)
 
         top_scores = top_scores * self.route_scale
-
-        # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
-        )
+        p = mass / (mass.sum() + 1e-20)
+        experts_entropy = -(p * (p + 1e-20).log()).sum()
 
         return (
             top_scores,
@@ -398,7 +416,9 @@ class MoE(nn.Module):
         self.acc_fwd_times.zero_()
         self.load_balance_loss.zero_()
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, loss_mask: torch.Tensor | None = None, **kwargs
+    ) -> torch.Tensor:
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
         # TODO@JSC: check if we want to use FP32 remix
@@ -410,7 +430,10 @@ class MoE(nn.Module):
             experts_entropy,
             indices_for_load_balance,
         ) = self.router(
-            x, self.expert_bias, need_aux_loss=self.load_balance_coeff > 0.0
+            x,
+            self.expert_bias,
+            need_aux_loss=self.load_balance_loss_weight > 0.0,
+            loss_mask=loss_mask,
         )
 
         with torch.no_grad():
@@ -428,7 +451,7 @@ class MoE(nn.Module):
             if self.load_balance_loss_type == "sequence_wise":
                 load_balance_loss = MoE.sequence_wise_aux_loss(
                     sigmoid_scores,
-                    indices_for_load_balance.long(),
+                    indices_for_load_balance,
                     bs,
                     slen,
                     self.top_k,
@@ -496,7 +519,7 @@ class MoE(nn.Module):
     @torch.compile(fullgraph=True)
     def sequence_wise_aux_loss(
         scores: torch.Tensor,  # Shape: (B*S, N) - Raw Sigmoid Affinities (s_{i,t})
-        indices: torch.Tensor,  # Shape: (B*S, K) - Selected Expert Indices
+        indices: torch.Tensor | None,  # Shape: (B*S, K) - Selected Expert Indices
         B: int,  # Batch size
         S: int,  # Sequence length (T in the paper)
         top_k: int,  # K_r
@@ -516,6 +539,7 @@ class MoE(nn.Module):
         # N_r: Total number of routed experts
         N = scores.size(-1)
 
+        indices = indices.long()
         # 1. Reshape inputs to handle each sequence separately: (B, S, N)
         #    This ensures we calculate P_i and f_i per sequence (Eq 20 & 18).
         scores_per_seq = scores.view(B, S, N)
