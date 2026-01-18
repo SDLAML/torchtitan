@@ -490,6 +490,9 @@ class Training:
     load_balance_coeff: float = 0.001
     """Speed of MoE router bias update."""
 
+    enable_token_mask_for_moe: bool = False
+    """Whether to enable token mask for MoE, mainly for SFT"""
+
     max_norm: float | int = 1.0
     """Max norm for gradient clipping"""
 

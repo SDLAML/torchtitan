@@ -63,7 +63,7 @@ class DeepEPMoE(MoE):
             experts_entropy,
             indices_for_load_balance,
         ) = self.router(
-            x, self.expert_bias, need_aux_loss=self.load_balance_coeff > 0.0
+            x, self.expert_bias, need_aux_loss=self.load_balance_loss_weight > 0.0
         )
 
         with torch.no_grad():
@@ -75,7 +75,7 @@ class DeepEPMoE(MoE):
             if self.load_balance_loss_type == "sequence_wise":
                 load_balance_loss = MoE.sequence_wise_aux_loss(
                     sigmoid_scores,
-                    indices_for_load_balance.long(),
+                    indices_for_load_balance,
                     bs,
                     slen,
                     self.top_k,

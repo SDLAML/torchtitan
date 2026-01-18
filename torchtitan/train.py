@@ -577,7 +577,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 tokenizer=self.tokenizer,
                 extra_inputs=extra_inputs,
             )
-
+        if self.job_config.training.enable_token_mask_for_moe:
+            loss_mask = labels != IGNORE_INDEX
+            extra_kwargs["loss_mask"] = loss_mask
         if self.parallel_dims.cp_enabled:
             inputs, labels, extra_kwargs = prepare_context_parallel_input(
                 inputs,

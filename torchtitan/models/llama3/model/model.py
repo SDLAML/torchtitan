@@ -732,7 +732,8 @@ class Transformer(ModelProtocol):
         tokens: torch.Tensor,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
-    ):
+        loss_mask: torch.Tensor | None = None,
+    ) -> MTPInputsDict:
         """
         Perform a forward pass through the Transformer model.
 
@@ -743,6 +744,8 @@ class Transformer(ModelProtocol):
                 previous pipeline stage if the current rank is not on the first stage.
             attention_masks (AttentionMasksType | None): Masks used when calculating attention scores.
             positions (torch.Tensor | None): Position indices used to access/shuffle RoPE cache. Defaults to None.
+            loss_mask (torch.Tensor | None): Loss mask for MoE. Defaults to None.
+
 
         Returns:
             torch.Tensor: Output logits after applying the Transformer model.
