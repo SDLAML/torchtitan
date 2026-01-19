@@ -31,7 +31,6 @@ from torchtitan.models.inits import (
     setup_depth_init,
     setup_residual_scale,
 )
-from torchtitan.models.inputs import MTPInputs, MTPInputsDict
 from torchtitan.models.norms import build_norm
 from torchtitan.protocols.model import AttentionMasksType
 from torchtitan.protocols.train_spec import ModelProtocol
@@ -733,7 +732,7 @@ class Transformer(ModelProtocol):
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
-    ) -> MTPInputsDict:
+    ):
         """
         Perform a forward pass through the Transformer model.
 

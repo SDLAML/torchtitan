@@ -1,24 +1,30 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
 # This new code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this new tree.
 
 import argparse
+
+import json
+import os
+import shutil
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 
 import torch
 import torch.distributed.checkpoint as dcp
+import torchtitan.models  # noqa: F401
 import torchtitan.protocols.train_spec as train_spec_module
 from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torchtitan.components.checkpoint import ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
-from dataclasses import is_dataclass, fields
-import torchtitan.models  # noqa: F401
-
-import json
-import shutil
-import os
 
 
 def update_dataclass_from_dict(target, data):
@@ -56,6 +62,8 @@ def try_to_copy_tokenizer(output_dir, hf_assets_path):
         "tokenizer.json",
         "tokenizer_config.json",
         "special_tokens_map.json",
+        "chat_template.jinja",
+        "generation_config.json",
     ]
     for asset in tokenizer_assests_lists:
         if os.path.exists(os.path.join(hf_assets_path, asset)):
@@ -87,9 +95,9 @@ def convert_to_hf(
 
     # pyrefly: ignore[bad-instantiation, not-callable]
     sd_adapter = train_spec.state_dict_adapter(model_args, hf_assets_path)
-    assert sd_adapter is not None, (
-        "trying to convert checkpoint from DCP to HF safetensors format, but sd_adapter is not provided."
-    )
+    assert (
+        sd_adapter is not None
+    ), "trying to convert checkpoint from DCP to HF safetensors format, but sd_adapter is not provided."
 
     # allocate state dict memory with empty weights to load checkpoint
     state_dict = model._get_state_dict()
