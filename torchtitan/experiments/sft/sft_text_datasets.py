@@ -220,6 +220,8 @@ class SFTDataset(IterableDataset, Stateful):
         self.max_length = seq_len
         self.apply_chat_template_kwargs = sft_config.chat_template_kwargs
 
+        self.openai_harmony_eos = sft_config.openai_harmony_eos
+
         self.apply_chat_template = sft_config.apply_chat_template
         if self.apply_chat_template:
             assert self.tokenizer.chat_template is not None, (
@@ -407,14 +409,23 @@ class SFTDataset(IterableDataset, Stateful):
         self.sanity_check(input_ids, messages, tools, enable_thinking)
 
         # when chat template is applied, append the EOS token to the input_ids and loss_mask
+        # but only append EOS if the last token is not EOS
         if self.apply_chat_template:
-            input_ids = torch.cat(
-                [input_ids, input_ids.new_tensor([self.eos_id])], dim=0
-            )
-            loss_mask = torch.cat([loss_mask, loss_mask.new_tensor([0])], dim=0)
+            if self.openai_harmony_eos:
+                # for openai harmony, we replace last <|end|> token to EOS token
+                input_ids[-1] = self.eos_id
+
+            elif input_ids[-1].item() != self.eos_id:
+                # otherwise, we append a [no-gradient] EOS token to make FlexAttn/VarlenAttn work
+                # if the last token is already EOS, we do nothing
+                # this path potentially needs add <im_end> to Stop Criteria for inference
+                # and needs <im_end> to be different from EOS token
+                input_ids = torch.cat(
+                    [input_ids, input_ids.new_tensor([self.eos_id])], dim=0
+                )
+                loss_mask = torch.cat([loss_mask, loss_mask.new_tensor([0])], dim=0)
 
         position_ids = torch.arange(input_ids.shape[0], dtype=torch.long)  # (seq_len,)
-
         # comment out these two lines to log the actual text for debugging purpose
         # actaul_text = self.tokenizer.decode(input_ids, skip_special_tokens=False)
         # logger.info(f"actual_text: {actaul_text} ||-> last mask : {loss_mask[-3:]}")

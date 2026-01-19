@@ -61,6 +61,13 @@ class SFTConfig:
     Whether to ignore the input_ids mismatch when apply chat template.
     """
 
+    openai_harmony_eos: bool = False
+    """
+    Whether to use OpenAI Harmony EOS or not.
+    If True, we will replace last <|end|> token to EOS token.
+    If False, we will append a [no-gradient] EOS token to make FlexAttn/VarlenAttn work
+    """
+
     eos_token: str | None = None
     """
     EOS token to use.
