@@ -45,7 +45,9 @@ class DeepEPMoE(MoE):
         # DeepEP doesn't use reorderer - routing handled by DeepEPExpertParallel
         self.reorderer = None  # pyrefly: ignore [bad-assignment]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, loss_mask: torch.Tensor | None = None, **kwargs
+    ) -> torch.Tensor:
         """
         Forward pass with DeepEP communication.
 
@@ -63,7 +65,10 @@ class DeepEPMoE(MoE):
             experts_entropy,
             indices_for_load_balance,
         ) = self.router(
-            x, self.expert_bias, need_aux_loss=self.load_balance_loss_weight > 0.0
+            x,
+            self.expert_bias,
+            need_aux_loss=self.load_balance_loss_weight > 0.0,
+            loss_mask=loss_mask,
         )
 
         with torch.no_grad():
