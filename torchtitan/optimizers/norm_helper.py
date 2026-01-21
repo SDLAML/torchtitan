@@ -6,8 +6,20 @@
 
 import math
 
+import os
+
 import torch
 from torch.distributed.tensor import DTensor
+
+DONT_TRACK_RAW_GRADIENT = os.getenv("DONT_TRACK_RAW_GRADIENT", "1") == "1"
+METRICS_ON_RAW_GRADIENT = [
+    "frobenius_norm",
+    "rms_to_rms",
+    "stable_rank",
+    "effective_rank",
+    "average_entry_size",
+    "rank",
+]
 
 
 @torch.no_grad()
@@ -65,7 +77,7 @@ def condition_number(W):
 
 @torch.no_grad()
 def frobenius_norm(W):
-    return torch.linalg.norm(W.float(), ord="fro")
+    return torch.linalg.norm(W.float(), ord="fro")  # codespell:ignore fro
 
 
 @torch.no_grad()
@@ -93,6 +105,16 @@ def effective_rank(W):
     return torch.exp(-(p * p.log()).sum())
 
 
+@torch.no_grad()
+def rank(W):
+    S = torch.linalg.svdvals(W.to(torch.float32), driver="gesvd")
+    eps = torch.finfo(S.dtype).eps
+    fan_out, fan_in = W.shape
+    tol = max(fan_out, fan_in) * eps * S[0]
+    rank = (S > tol).sum()
+    return rank
+
+
 NORM_FUNCTIONS = {
     "rms_to_rms": rms_to_rms_norm,
     "l1_to_rms": l1_to_rms_norm,
@@ -103,6 +125,7 @@ NORM_FUNCTIONS = {
     "average_entry_size": average_entry_size,
     "stable_rank": stable_rank,
     "effective_rank": effective_rank,
+    "rank": rank,
 }
 
 
@@ -142,10 +165,16 @@ def fused_metrics(W, eps=1e-20):
     srank = (frob_norm**2) / (spec_unscaled**2 + eps)
     srank = srank.clamp_min(eps)
 
-    p = (S / (S.sum() + eps)).clamp_min(eps)
+    eps_rank = torch.finfo(S.dtype).eps
+    tol = max(fan_out, fan_in) * eps_rank * S[0]
+
+    S_nz = S[S > tol]
+    p = S_nz / (S_nz.sum() + 1e-12)
     erank = torch.exp(-(p * p.log()).sum())
 
     avg_entry = frob_norm / math.sqrt(fan_out * fan_in)
+
+    rank = (S > tol).sum()
 
     return {
         "rms_to_rms": spec,
@@ -157,6 +186,7 @@ def fused_metrics(W, eps=1e-20):
         "average_entry_size": avg_entry,
         "stable_rank": srank,
         "effective_rank": erank,
+        "rank": rank,
     }
 
 
@@ -199,6 +229,7 @@ def calculate_norm(
     norms_to_log: list[str] | None = None,
     transpose: bool = False,
     use_fused_metrics: bool = True,
+    raw_gradient: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     It is important to note that the order of the norms is the same
@@ -224,4 +255,16 @@ def calculate_norm(
     else:
         norms = {norm_name: NORM_FUNCTIONS[norm_name](W) for norm_name in norms_to_log}
 
+    if not DONT_TRACK_RAW_GRADIENT and raw_gradient is not None:
+        raw_gradient = raw_gradient.transpose(0, 1) if transpose else raw_gradient
+        if use_fused_metrics:
+            raw_norms = fused_metrics(raw_gradient)
+        else:
+            raw_norms = {
+                norm_name: NORM_FUNCTIONS[norm_name](raw_gradient)
+                for norm_name in norms_to_log
+            }
+        for norm_name in METRICS_ON_RAW_GRADIENT:
+            if norm_name in norms_to_log:
+                norms[norm_name] = raw_norms[norm_name]
     return norms
