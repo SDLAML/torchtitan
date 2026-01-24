@@ -19,7 +19,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
-
+import torch.distributed as dist
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
@@ -481,6 +481,60 @@ def moe_metrics_worker(log_queue: queue.Queue):
         log_queue.task_done()
 
 
+def fused_hier_reduce_loss_stats(
+    parallel_dims,
+    all_tokens: torch.Tensor,
+    all_entropies: torch.Tensor,
+    all_load_balance_losses: torch.Tensor,
+):
+    loss_mesh = parallel_dims.get_optional_mesh("loss")
+    if loss_mesh is None:
+        return
+
+    # 1. Determine Topology
+    fsdp_mesh = parallel_dims.get_optional_mesh("fsdp")
+    dp_mesh = parallel_dims.get_optional_mesh("dp_replicate")
+
+    # Check if we can do hierarchical reduction
+    use_hierarchical = (fsdp_mesh is not None) and (dp_mesh is not None)
+
+    # 2. Fuse & Pack (Float64)
+    t0 = all_tokens.reshape(-1).to(torch.float64)
+    t1 = all_entropies.reshape(-1).to(torch.float64)
+    t2 = all_load_balance_losses.reshape(-1).to(torch.float64)
+
+    buf = torch.cat([t0, t1, t2])
+
+    # 3. Perform Reduction
+    if use_hierarchical:
+        # Hierarchical: FSDP (Intra-node) -> DP (Inter-node)
+        # Using SUM for all, we will normalize averaging later
+        dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=fsdp_mesh.get_group())
+        dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=dp_mesh.get_group())
+    else:
+        # Fallback: Flat all-reduce on the global loss mesh
+        dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=loss_mesh.get_group())
+
+    # 4. Unpack & Normalize
+    ws_loss = dist.get_world_size(group=loss_mesh.get_group())
+
+    n0, n1, n2 = t0.numel(), t1.numel(), t2.numel()
+
+    # Slicing views
+    out_tokens = buf[0:n0].view_as(all_tokens)
+    out_ent = buf[n0 : n0 + n1].view_as(all_entropies)
+    out_lb = buf[n0 + n1 : n0 + n1 + n2].view_as(all_load_balance_losses)
+
+    # 5. Copy back to inputs
+    # Tokens: SUM (no division)
+    all_tokens.copy_(out_tokens.to(all_tokens.dtype))
+
+    # Stats: AVG (Divide SUM by world_size)
+    # We do the division *after* unpacking to keep the buffer operations clean
+    all_entropies.copy_((out_ent / ws_loss).to(all_entropies.dtype))
+    all_load_balance_losses.copy_((out_lb / ws_loss).to(all_load_balance_losses.dtype))
+
+
 def build_optimizers_with_moe_load_balancing(
     model_parts: list[nn.Module],
     optimizer_config: OptimizerConfig,
@@ -584,15 +638,18 @@ def build_optimizers_with_moe_load_balancing(
             all_entropies = all_entropies / scale_factor  # entropies are floats
 
         if loss_mesh is not None:
-            pg = loss_mesh.get_group()
-            torch.distributed.all_reduce(
-                all_tokens, group=pg, op=torch.distributed.ReduceOp.SUM
-            )
-            torch.distributed.all_reduce(
-                all_entropies, group=pg, op=torch.distributed.ReduceOp.AVG
-            )
-            torch.distributed.all_reduce(
-                all_load_balance_losses, group=pg, op=torch.distributed.ReduceOp.AVG
+            # pg = loss_mesh.get_group()
+            # torch.distributed.all_reduce(
+            #     all_tokens, group=pg, op=torch.distributed.ReduceOp.SUM
+            # )
+            # torch.distributed.all_reduce(
+            #     all_entropies, group=pg, op=torch.distributed.ReduceOp.AVG
+            # )
+            # torch.distributed.all_reduce(
+            #     all_load_balance_losses, group=pg, op=torch.distributed.ReduceOp.AVG
+            # )
+            fused_hier_reduce_loss_stats(
+                parallel_dims, all_tokens, all_entropies, all_load_balance_losses
             )
         num_layers = len(moe_layers_info)
         lens = torch.full(
