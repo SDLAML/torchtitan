@@ -25,19 +25,34 @@ def convert_to_hf(
     export_dtype,
 ):
     # load model and model args so that we can get the state dict shape
-    model_module = importlib.import_module(f"torchtitan.models.{model_name}")
-    model_spec = model_module.model_registry(model_flavor)
-    model_config = model_spec.model
+    train_spec = train_spec_module.get_train_spec(model_name)
+    model_args = train_spec.model_args[model_flavor]
+
+    actual_model_args = json.load(open(actual_model_args, "r"))
+
+    # this is a monkey patch to avoid running SVD/QR decompositoin for model init
+    def recursively_set_init_fn_to_zeros(d):
+        """Recursively find and set all keys containing 'init_fn_type' to 'zeros'."""
+        if isinstance(d, dict):
+            for key, value in d.items():
+                if "init_fn_type" in key:
+                    d[key] = "zeros"
+                elif isinstance(value, dict):
+                    recursively_set_init_fn_to_zeros(value)
+
+    recursively_set_init_fn_to_zeros(actual_model_args)
+
+    update_dataclass_from_dict(model_args, actual_model_args)
 
     with torch.device("cpu"):
         model = model_config.build()
     model = ModelWrapper(model)
 
     # pyrefly: ignore[bad-instantiation, not-callable]
-    sd_adapter = model_spec.state_dict_adapter(model_config, hf_assets_path)
-    assert (
-        sd_adapter is not None
-    ), "trying to convert checkpoint from DCP to HF safetensors format, but sd_adapter is not provided."
+    sd_adapter = train_spec.state_dict_adapter(model_args, hf_assets_path)
+    assert sd_adapter is not None, (
+        "trying to convert checkpoint from DCP to HF safetensors format, but sd_adapter is not provided."
+    )
 
     # allocate state dict memory with empty weights to load checkpoint
     state_dict = model._get_state_dict()
