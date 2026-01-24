@@ -59,12 +59,12 @@ class FeedForward(nn.Module):
         self.hidden_dim = hidden_dim
 
         if norm_everywhere:
-            assert (
-                norm_type is not None
-            ), "`norm_type` needs to be passed when `norm_everywhere=True`"
-            assert (
-                norm_eps is not None
-            ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            assert norm_type is not None, (
+                "`norm_type` needs to be passed when `norm_everywhere=True`"
+            )
+            assert norm_eps is not None, (
+                "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            )
             self.out_norm = build_norm(
                 norm_type,
                 dim=hidden_dim,
@@ -193,19 +193,15 @@ class TokenChoiceTopKRouter(nn.Module):
         top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-20)
 
         # TODO(JSC):  entropy - Do we want the entropy on the top-K experts or all experts?
-        # detached_top_scores = top_scores.detach()
-        # experts_entropy = (
-        #     -(detached_top_scores * detached_top_scores.log()).sum(dim=-1).mean()
-        # )
 
-        idx = selected_experts_indices.reshape(-1)  # (T*K,)
-        detached_top_scores = top_scores.detach().reshape(
-            -1
-        )  # (T*K,)  (already per-token normalized over K)
+        # ========================================
+        # BELOW IS OLD IMPLEMENTATION OF ENTROPY CALCULATION
+        detached_top_scores = top_scores.detach()
+        experts_entropy = (
+            -(detached_top_scores * detached_top_scores.log()).sum(dim=-1).mean()
+        )
 
         if loss_mask is None:
-            mass = torch.zeros(self.num_experts, device=x.device, dtype=torch.bfloat16)
-            mass.scatter_add_(0, idx, detached_top_scores.to(torch.bfloat16))
             num_tokens_per_expert = torch.histc(
                 selected_experts_indices.view(-1),
                 bins=self.num_experts,
@@ -224,16 +220,45 @@ class TokenChoiceTopKRouter(nn.Module):
                 idx[m], minlength=self.num_experts
             ).to(device=idx.device)
 
-            # masked router "mass" (sum of top-k probs/scores per expert)
-            w = mask_tk.reshape(-1).to(detached_top_scores.dtype)  # (T*K,)
-            mass = torch.zeros(
-                self.num_experts, device=idx.device, dtype=detached_top_scores.dtype
-            )
-            mass.scatter_add_(0, idx, detached_top_scores.reshape(-1) * w)
+        # ====================================
+        # BELOW IS NEW IMPLEMENTATION OF ENTROPY CALCULATION
+        # idx = selected_experts_indices.reshape(-1)  # (T*K,)
+        # detached_top_scores = top_scores.detach().reshape(
+        #     -1
+        # )  # (T*K,)  (already per-token normalized over K)
 
+        # if loss_mask is None:
+        #     mass = torch.zeros(self.num_experts, device=x.device, dtype=torch.bfloat16)
+        #     mass.scatter_add_(0, idx, detached_top_scores.to(torch.bfloat16))
+        #     num_tokens_per_expert = torch.histc(
+        #         selected_experts_indices.view(-1),
+        #         bins=self.num_experts,
+        #         min=0,
+        #         max=self.num_experts,
+        #     )
+        # else:
+        #     mask_t = loss_mask.view(-1)  # (T,)
+        #     mask_tk = mask_t[:, None].expand(-1, self.top_k)  # (T, K)
+
+        #     idx = selected_experts_indices.reshape(-1)  # (T*K,)
+        #     m = mask_tk.reshape(-1).bool()  # (T*K,)
+
+        #     # masked token counts
+        #     num_tokens_per_expert = torch.bincount(
+        #         idx[m], minlength=self.num_experts
+        #     ).to(device=idx.device)
+
+        #     # masked router "mass" (sum of top-k probs/scores per expert)
+        #     w = mask_tk.reshape(-1).to(detached_top_scores.dtype)  # (T*K,)
+        #     mass = torch.zeros(
+        #         self.num_experts, device=idx.device, dtype=detached_top_scores.dtype
+        #     )
+        #     mass.scatter_add_(0, idx, detached_top_scores.reshape(-1) * w)
+        # p = mass / (mass.sum() + 1e-20)
+        # experts_entropy = -(p * (p + 1e-20).log()).sum()
+
+        # ===== END
         top_scores = top_scores * self.route_scale
-        p = mass / (mass.sum() + 1e-20)
-        experts_entropy = -(p * (p + 1e-20).log()).sum()
 
         return (
             top_scores,
