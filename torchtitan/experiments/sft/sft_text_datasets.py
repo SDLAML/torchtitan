@@ -59,6 +59,21 @@ def _build_prompt_response_messages_from_row_dict(
     return message, None, None
 
 
+def _build_dolci_instruct_sft_messages_from_row_dict(
+    row_dict: dict,
+    messages_key: str = "messages",
+    tools_key: str = "functions",
+    **kwargs,
+):
+    """Build Dolci-Instruct-SFT messages from row dictionary."""
+    messages = row_dict[messages_key]
+    for msg in messages:
+        if msg.get("content") is None:
+            msg["content"] = ""
+    tools = messages[0].get(tools_key, None)
+    return messages, tools, False
+
+
 DATASET_MESSAGE_BUILDERS = {
     "multi_turn": _build_multi_turn_messages_from_row_dict,
     "prompt_response": _build_prompt_response_messages_from_row_dict,
@@ -67,6 +82,7 @@ DATASET_MESSAGE_BUILDERS = {
         prompt_key="question",
         response_key="answer",
     ),
+    "Dolci-Instruct-SFT": _build_dolci_instruct_sft_messages_from_row_dict,
 }
 
 
@@ -397,6 +413,7 @@ class SFTDataset(IterableDataset, Stateful):
             _input_ids, _loss_mask = self._process_single_message(
                 index=i,
                 message=message,
+                # here we assume the defination of tools is given only in system message.
                 tools=tools if i == 0 else None,
                 enable_thinking=enable_thinking,
             )
