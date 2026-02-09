@@ -584,33 +584,96 @@ class DiSCO(AbstractDiSCO):
         # rank
 
         transpose = self.experts_need_transpose
-        for param_idx in range(len(expert_params)):
-            p = expert_params[param_idx]
-            lr, nesterov, momentum, wd, param_kwargs = self.groups_info[
-                self.parameters_to_groups[id(p)]
-            ]
-            g = self.get_momentum_or_grad(p, momentum, nesterov)
-            u = self.lmo(g, **param_kwargs, transpose_experts=transpose)
 
+        total_params = len(expert_params)
+        L = total_params // 3
+        assert total_params == 3 * L, f"Expected 3*L expert params, got {total_params}"
+
+        #   [0 : L) -> W2
+        #   [L : 3L) -> W1 + W3 (same shape within itself)
+        # blocks = [(0, L), (L, 2 * L), (2 * L, 3 * L)] # this is a fallback for memory efficiency
+        blocks = [(0, L), (L, 3 * L)]
+
+        def _same_kwargs(a: dict, b: dict) -> bool:
+            # assumes kwargs contain comparable scalars/strings; adjust if needed
+            if a.keys() != b.keys():
+                return False
+            return all(a[k] == b[k] for k in a.keys())
+
+        for start, end in blocks:
+            block_params = expert_params[start:end]
+            if not block_params:
+                continue
+
+            # ---- build grads for the block ----
+            grads = []
+            kwargs0 = None
+
+            for p in block_params:
+                lr, nesterov, momentum, wd, param_kwargs = self.groups_info[
+                    self.parameters_to_groups[id(p)]
+                ]
+                g = self.get_momentum_or_grad(p, momentum, nesterov)
+                assert g.ndim == 3, "Batching path assumes MoE expert weights are 3-D."
+
+                g = g.to_local() if isinstance(g, DTensor) else g
+
+                if not g.shape[0] > 0:
+                    continue
+
+                if kwargs0 is None:
+                    kwargs0 = param_kwargs
+                else:
+                    # # If this can differ in your setup, bucket by kwargs instead of asserting.
+                    # assert _same_kwargs(kwargs0, param_kwargs), (
+                    #     "param_kwargs differ inside a batched block."
+                    # )
+                    # kwargs0 have ns5's parameters, e.g. eps, norm_factor, zeropower_backend, backend_steps.
+                    # we suppose they are the same for all the params in the block.
+                    pass
+
+                grads.append(g)
+
+            if not grads:
+                continue
+
+            # ---- mega-batch without explicitly inferring E / tail_shape ----
+            # grads: list of [E, A, B]
+            stacked_g = torch.stack(grads, dim=0)  # [K, E, A, B]
+            big_g = stacked_g.flatten(0, 1)  # [K*E, A, B]
+
+            # One LMO call per block (so 2 total)
+            big_u = self.lmo(big_g, **kwargs0, transpose_experts=transpose)
+
+            # big_u: [K*E, A, B] -> [K, E, A, B] -> list of K tensors [E, A, B]
+            updates = list(big_u.view_as(stacked_g).unbind(0))
+
+            # 5) One update_bucket_params call for the whole block
             if not skip_update:
-                self.update_bucket_params([p], [u], 0, 1)
+                self.update_bucket_params(
+                    block_params,
+                    updates,
+                    0,
+                    len(block_params),
+                )
 
+            # 6) Norm logging (kept non-batched as requested)
             if need_to_calculate_norm:
-                # cleaned_p_name = remove_orig_mod_and_weight_for_p_name(
-                #     expert_param_names[param_idx]
-                # )
-                assert u.ndim == 3
-                for ep_idx in range(u.shape[0]):
-                    update_norms = calculate_norm(
-                        u[ep_idx], self.norms_to_log, transpose=transpose
-                    )
-                    # Template for MoE norm keys
-                    norms_of_update.extend(update_norms.values())
-                    if apply_on_weight:
-                        weight_norms = calculate_norm(
-                            p.to_local()[ep_idx], self.norms_to_log, transpose=transpose
+                for p, u in zip(block_params, updates):
+                    assert u.ndim == 3
+                    for ep_idx in range(u.shape[0]):
+                        update_norms = calculate_norm(
+                            u[ep_idx], self.norms_to_log, transpose=transpose
                         )
-                        norms_of_weight.extend(weight_norms.values())
+                        norms_of_update.extend(update_norms.values())
+
+                        if apply_on_weight:
+                            weight_norms = calculate_norm(
+                                p.to_local()[ep_idx],
+                                self.norms_to_log,
+                                transpose=transpose,
+                            )
+                            norms_of_weight.extend(weight_norms.values())
 
         if need_to_calculate_norm:
             expected_total = len(expert_params) * ep_per_rank * kinds_of_norms
