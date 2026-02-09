@@ -27,9 +27,9 @@ def _get_autotune_configs():
             num_stages=stages,
             num_warps=warps,
         )
-        for bm in [64, 128]
+        for bm in [64, 128, 256]
         for bn in [64, 128, 256]
-        for bk in [64, 128]
+        for bk in [64, 128, 256]
         for stages, warps in [(3, 4), (3, 8), (4, 4)]
         if bm // bn <= 2 and bn // bm <= 2
     ]
