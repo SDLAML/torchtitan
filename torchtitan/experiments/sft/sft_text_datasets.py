@@ -11,7 +11,7 @@
 from dataclasses import asdict, field
 from functools import partial
 from typing import Any, Callable, Optional
-
+import json
 import torch
 import torch.nn.functional as F
 
@@ -71,6 +71,14 @@ def _build_dolci_instruct_sft_messages_from_row_dict(
         if msg.get("content") is None:
             msg["content"] = ""
     tools = messages[0].get(tools_key, None)
+
+    if isinstance(tools, str):
+        try:
+            tools = json.loads(tools)
+        except json.JSONDecodeError:
+            # Handle cases where the string is malformed or empty
+            logger.warning(f"Failed to parse tools JSON: {tools[:50]}...")
+            tools = None
     return messages, tools, False
 
 
@@ -188,18 +196,25 @@ boundaries between sequences within each packed row.
 def extract_system_prompt_and_generation(tokenizer):
     """Derive system and generation prompt token chunks from the tokenizer's chat template."""
     token1 = tokenizer.apply_chat_template(
-        [{"role": "user", "content": ""}], add_generation_prompt=False, tokenize=True
+        [{"role": "user", "content": ""}],
+        add_generation_prompt=False,
+        tokenize=True,
+        return_dict=False,
     )
     token2 = tokenizer.apply_chat_template(
         [{"role": "user", "content": ""}] * 2,
         add_generation_prompt=False,
         tokenize=True,
+        return_dict=False,
     )
     # get system prompt tokens
     system_prompt = token1[: -(len(token2) - len(token1))]
     # get generate prompt tokens
     token3 = tokenizer.apply_chat_template(
-        [{"role": "user", "content": ""}], add_generation_prompt=True, tokenize=True
+        [{"role": "user", "content": ""}],
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=False,
     )
     generate_prompt = token3[len(token1) :]
 
