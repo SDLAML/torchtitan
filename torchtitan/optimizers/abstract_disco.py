@@ -173,6 +173,8 @@ class AbstractDiSCO(torch.optim.Optimizer):
         zeropower_backend,
         backend_steps,
         transpose_experts=False,
+        splits_into=None,
+        splits_dim=None,
     ):
         """Supported Weight Types:
         - 1-D tensors: Bias vectors (Linear/Convolution layers)
@@ -189,6 +191,13 @@ class AbstractDiSCO(torch.optim.Optimizer):
 
 
         * 0-D (scalar) weights is supported but should not appear in this function call
+
+
+
+        splits_into: an integer indicating how to split the tensor into groups.
+        splits_dim: an integer indicating the dimension to split the tensor into groups.
+        This only supports for 2D tensors for now.
+
         """
 
         g = g.to_local() if isinstance(g, DTensor) else g
@@ -196,12 +205,39 @@ class AbstractDiSCO(torch.optim.Optimizer):
         # NB: make sure this function does not modify the grad inplace
         #     since it is also called during the log of gradients
         def _orth_and_norm(x):
-            x = zeropower_backends[zeropower_backend](x, steps=backend_steps, eps=eps)
-            x = AbstractDiSCO.normalise_grad(x, norm_factor=norm_factor, eps=eps)
+            with torch._dynamo.config.patch(recompile_limit=128, cache_size_limit=128):
+                x = zeropower_backends[zeropower_backend](
+                    x, steps=backend_steps, eps=eps
+                )
+                x = AbstractDiSCO.normalise_grad(x, norm_factor=norm_factor, eps=eps)
             return x
 
         if g.ndim == 2:
-            return _orth_and_norm(g)
+            if splits_into is not None and splits_dim is not None:
+                # it only supports for 2D tensors for now.
+                assert splits_dim in [0, 1], "splits_dim must be 0 or 1 for 2D tensors"
+                assert splits_into > 1, "splits_into must be greater than 1"
+                assert (
+                    g.shape[splits_dim] % splits_into == 0
+                ), "splits_into must be a divisor of the dimension to split"
+                d_out, d_in = g.shape
+                if splits_dim == 0:
+                    # Split rows: [d_out, d_in] -> [Group, d_out/Group, d_in]
+                    g_batched = g.view(splits_into, d_out // splits_into, d_in)
+                    g_orth = _orth_and_norm(g_batched)
+                    # Recover: [Group, d_out/Group, d_in] -> [d_out, d_in]
+                    return g_orth.view(d_out, d_in)
+                else:
+                    # Split cols: [d_out, d_in] -> [d_out, Group, d_in/Group]
+                    # Permute to move Group to front: -> [Group, d_out, d_in/Group]
+                    g_batched = g.view(d_out, splits_into, d_in // splits_into).permute(
+                        1, 0, 2
+                    )
+                    g_orth = _orth_and_norm(g_batched)
+                    # Recover: Permute back -> [d_out, Group, d_in/Group] -> Reshape to [d_out, d_in]
+                    return g_orth.permute(1, 0, 2).reshape(d_out, d_in)
+            else:
+                return _orth_and_norm(g)
 
         # 3-D: batched experts [G, D_out, D_in] (or [G, D_in, D_out] if transposed)
         elif g.ndim == 3:
