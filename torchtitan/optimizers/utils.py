@@ -130,6 +130,9 @@ def create_disco_param_groups(
         "norm_factor": optimizer_kwargs.get("norm_factor"),
         "backend": optimizer_kwargs.get("backend"),
         "backend_steps": optimizer_kwargs.get("backend_steps"),
+        # should be explicitly set in the extra_param_group_split_rules
+        "splits_into": None,
+        "splits_dim": None,
     }
 
     # Process extra_param_group_split_rules if provided
