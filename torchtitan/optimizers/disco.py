@@ -151,6 +151,8 @@ class DiSCO(AbstractDiSCO):
             norm_factor=norm_factor if not debug_mode else "none",
             backend=backend if not debug_mode else "identity",
             backend_steps=backend_steps,
+            splits_into=None,  # should be explicitly set in the extra_param_group_split_rules
+            splits_dim=None,  # should be explicitly set in the extra_param_group_split_rules
         )
         assert is_light is False, "is_light must be False"
 
@@ -203,6 +205,8 @@ class DiSCO(AbstractDiSCO):
                 "norm_factor": group["norm_factor"] if not debug_mode else "none",
                 "zeropower_backend": group["backend"] if not debug_mode else "identity",
                 "backend_steps": group["backend_steps"],
+                "splits_into": group["splits_into"],
+                "splits_dim": group["splits_dim"],
             }
             self.groups_info[group_idx] = [lr, nesterov, momentum, wd, param_kwargs]
             for param in group["params"]:
@@ -249,8 +253,9 @@ class DiSCO(AbstractDiSCO):
         self._build_param_lists()
 
         # check if nvshmem is enabled and build the workspace if FSDP is enabled
-        disable_nvshmem = os.environ.get("DISCO_ENABLE_NVSHMEM", "0") == "0"
-        self.disable_nvshmem = disable_nvshmem or _sm_mod is None
+        # disable_nvshmem = os.environ.get("DISCO_ENABLE_NVSHMEM", "0") == "0"
+        # self.disable_nvshmem = disable_nvshmem or _sm_mod is None
+        self.disable_nvshmem = True
 
     def _build_param_lists(self):
         # clear
@@ -382,6 +387,8 @@ class DiSCO(AbstractDiSCO):
                 "norm_factor": group["norm_factor"],
                 "zeropower_backend": group["backend"],
                 "backend_steps": group["backend_steps"],
+                "splits_into": group["splits_into"],
+                "splits_dim": group["splits_dim"],
             }
             self.groups_info[group_idx] = [lr, nesterov, momentum, wd, param_kwargs]
 
@@ -395,10 +402,7 @@ class DiSCO(AbstractDiSCO):
         self.step_experts(self.expert_params, self.expert_param_names)
         self.step_ddp(self.ddp_params, self.ddp_param_names)
 
-        if not self.disable_nvshmem:
-            self.step_fsdp_nvshmem(self.fsdp_params, self.fsdp_param_names)
-        else:
-            self.step_fsdp(self.fsdp_params, self.fsdp_param_names)
+        self.step_fsdp(self.fsdp_params, self.fsdp_param_names)
 
         self.need_to_calculate_norm = False
         return loss
@@ -1372,201 +1376,3 @@ class DiSCO(AbstractDiSCO):
                         gmap[(g.device, g.dtype)].append(g)
                 for _, gs in gmap.items():
                     torch._foreach_mul_(gs, 1.0 - m)
-
-    @record_function("disco.step_fsdp_nvshmem_fixed")
-    def step_fsdp_nvshmem(
-        self,
-        fsdp_params,
-        fsdp_param_names,
-        skip_update: bool = False,
-        apply_on_weight: bool = True,
-    ):
-        if not fsdp_params:
-            return
-
-        # --- 1. SETUP ---
-        device = fsdp_params[0].device
-        torch.cuda.set_device(device)
-        fsdp_group = self.parallel_dims.get_optional_mesh("fsdp").get_group()
-        world_size, rank = fsdp_group.size(), fsdp_group.get_local_rank()
-        cast_dtype = self.communication_dtype
-        total_params = len(fsdp_params)
-
-        # Optional groups for TP/HSDP
-        tp_group = (
-            self.parallel_dims.get_optional_mesh("tp").get_group()
-            if self.tp_enabled
-            else None
-        )
-        tp_world = tp_group.size() if tp_group else 1
-        dp_rep_group = (
-            self.parallel_dims.get_optional_mesh("dp_replicate").get_group()
-            if self.dp_replicate_enabled
-            else None
-        )
-
-        # Calculate workspace size
-        max_full_elems = max((p.numel() for p in fsdp_params), default=0)
-        if max_full_elems == 0:
-            return
-        padded_shard_elems = math.ceil(max_full_elems / world_size)
-
-        # Buffer layout: A single large window for all parameters.
-        # Each parameter `p_i` gets a block of `world_size * padded_shard_elems`.
-        # Within that block, rank `j` writes its shard for `p_i` at offset `j * padded_shard_elems`.
-        workspace_elems = total_params * world_size * padded_shard_elems
-
-        # --- NVSHMEM Workspace & Streams ---
-        import torch.distributed._symmetric_memory as symm_mem
-
-        symm_mem.set_backend("NVSHMEM")
-        symm_mem.enable_symm_mem_for_group(fsdp_group.group_name)
-
-        symm_buf = symm_mem.empty((workspace_elems,), dtype=cast_dtype, device=device)
-        hdl = symm_mem.rendezvous(symm_buf, fsdp_group)
-
-        # Simplified stream structure: one for I/O, N for compute
-        io_stream = torch.cuda.Stream()
-        num_compute_streams = int(
-            os.environ.get("DISCO_NVSHMEM_FSDP_COMPUTE_STREAMS", "2")
-        )
-        compute_streams = [torch.cuda.Stream() for _ in range(num_compute_streams)]
-
-        # --- Buffers & Events for Owner ---
-        owned_indices = [i for i in range(total_params) if (i % world_size) == rank]
-        owner_full_grads = {
-            i: torch.empty(fsdp_params[i].shape, dtype=cast_dtype, device=device)
-            for i in owned_indices
-        }
-        owner_updates = {
-            i: torch.empty(fsdp_params[i].shape, dtype=cast_dtype, device=device)
-            for i in owned_indices
-        }
-        grad_ready_events = {i: torch.cuda.Event() for i in owned_indices}
-        compute_done_events = {i: torch.cuda.Event() for i in owned_indices}
-        local_updates = [None] * total_params
-
-        # =================================================================
-        #  SEQUENTIAL EXECUTION: PUSH -> GATHER -> COMPUTE -> SCATTER -> READ
-        # =================================================================
-
-        # --- PHASE A: PUSH LOCAL GRADIENTS ---
-        # Each rank writes its local gradient shard into the owner's symmetric memory window.
-        # --- PHASE B: GATHER FULL GRADIENTS (Owner) & COMPUTE LMO ---
-        # This is now a two-step sequential process instead of an overlapped one.
-
-        # STEP B-1: Schedule all GATHER operations on the I/O stream.
-        with torch.cuda.stream(io_stream):
-            for i, p_idx in enumerate(owned_indices):
-                full_grad_tensor = owner_full_grads[p_idx]
-                current_offset = 0
-                for src_rank in range(world_size):
-                    shard_shape = calculate_shard_shape(
-                        full_grad_tensor.shape, src_rank, world_size
-                    )
-                    num_elems = math.prod(shard_shape)
-                    if num_elems == 0:
-                        continue
-
-                    offset = (p_idx * world_size + src_rank) * padded_shard_elems
-                    src_buffer = hdl.get_buffer(
-                        rank, (padded_shard_elems,), cast_dtype, storage_offset=offset
-                    )
-
-                    dest_view = (
-                        full_grad_tensor.narrow(0, current_offset, shard_shape[0])
-                        .contiguous()
-                        .flatten()
-                    )
-                    dest_view.copy_(src_buffer[:num_elems], non_blocking=True)
-                    current_offset += shard_shape[0]
-
-        # Synchronization Point: Wait for ALL GATHER operations on the I/O stream to complete.
-        io_stream.synchronize()
-
-        # STEP B-2: Now that all gradients are gathered, schedule all LMO computations.
-        for i, p_idx in enumerate(owned_indices):
-            compute_stream = compute_streams[i % num_compute_streams]
-            with torch.cuda.stream(compute_stream):
-                # No wait_event is needed here anymore, as the sync above guarantees data is ready.
-                p = fsdp_params[p_idx]
-                *_, param_kwargs = self.groups_info[self.parameters_to_groups[id(p)]]
-
-                update = self.lmo(owner_full_grads[p_idx], **param_kwargs)
-
-                if dp_rep_group and self.extra_reduce_for_HSDP:
-                    dist.all_reduce(update, group=dp_rep_group, op=dist.ReduceOp.AVG)
-
-                owner_updates[p_idx].copy_(update, non_blocking=True)
-                compute_done_events[p_idx].record(compute_stream)
-
-        # The next sync point remains the same
-        for stream in compute_streams:
-            stream.synchronize()
-        hdl.barrier(channel=200)
-
-        # --- PHASE C: SCATTER UPDATES ---
-        # Each owner scatters its computed update back to the respective ranks.
-        with torch.cuda.stream(io_stream):
-            for p_idx in owned_indices:
-                io_stream.wait_event(compute_done_events[p_idx])
-                update = owner_updates[p_idx]
-
-                current_offset = 0
-                for dest_rank in range(world_size):
-                    shard_shape = calculate_shard_shape(
-                        update.shape, dest_rank, world_size
-                    )
-                    num_elems = math.prod(shard_shape)
-
-                    update_shard = (
-                        update.narrow(0, current_offset, shard_shape[0])
-                        .contiguous()
-                        .flatten()
-                    )
-
-                    # Write the update shard into the destination rank's buffer
-                    # The slot is determined by the parameter index and *this rank's* ID (the owner).
-                    offset = (p_idx * world_size + rank) * padded_shard_elems
-                    peer_buffer = hdl.get_buffer(
-                        dest_rank,
-                        (padded_shard_elems,),
-                        cast_dtype,
-                        storage_offset=offset,
-                    )
-                    peer_buffer[:num_elems].copy_(update_shard, non_blocking=True)
-                    current_offset += shard_shape[0]
-
-        # Synchronization Point 3: Ensure all SCATTER operations are globally complete.
-        io_stream.synchronize()
-        hdl.barrier(channel=300)
-
-        # --- PHASE D: READ LOCAL UPDATES & APPLY ---
-        # Each rank reads its final update shard from its own symmetric memory.
-        with torch.cuda.stream(io_stream):
-            for p_idx, p in enumerate(fsdp_params):
-                owner_rank = p_idx % world_size
-                p_local = p.to_local() if isinstance(p, DTensor) else p
-
-                offset = (p_idx * world_size + owner_rank) * padded_shard_elems
-                src_buffer = hdl.get_buffer(
-                    rank, (padded_shard_elems,), cast_dtype, storage_offset=offset
-                )
-
-                update_buf = torch.empty_like(p_local, dtype=cast_dtype)
-                update_buf.flatten().copy_(
-                    src_buffer[: p_local.numel()], non_blocking=True
-                )
-                local_updates[p_idx] = update_buf
-
-        # Final Synchronization: ensure all reads are done before applying the update.
-        io_stream.synchronize()
-
-        if not skip_update:
-            self.update_bucket_params(
-                fsdp_params, local_updates, 0, total_params, tp_group=tp_group
-            )
-
-        # --- Cleanup ---
-        del hdl, symm_buf
-        torch.cuda.synchronize()
