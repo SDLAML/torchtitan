@@ -478,12 +478,6 @@ class Training:
     seq_len: int = 2048
     """Sequence length"""
 
-    num_mtp_tokens: int = 0
-    """Number of tokens to predict at once using multi-token prediction."""
-
-    mtp_loss_weight: float = 0.3
-    """Weight of multi-token prediction loss term."""
-
     load_balance_loss_weight: float | None = None
     """Weight of MoE auxiliary loss term."""
 

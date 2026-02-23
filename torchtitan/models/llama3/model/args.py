@@ -84,17 +84,11 @@ class TransformerModelArgs(BaseModelArgs):
     eos_id: int = 0
     pad_id: int = -1
 
-    # Number of additional modules to insert for multi-token prediction.
-    num_mtp_modules: int = 0
-
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
         self.model_init_args = job_config.model.model_init_args
         self.activation_type = job_config.model.activation_type
         self.norm_type = job_config.model.norm_type
         self.qk_norm = self.qk_norm or self.norm_everywhere
-
-        self.num_mtp_modules = job_config.training.num_mtp_tokens
-        assert self.num_mtp_modules >= 0
 
         self.model_init_args.depth_init = parse_depth_init(
             self.model_init_args.depth_init

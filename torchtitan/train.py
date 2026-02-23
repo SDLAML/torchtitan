@@ -35,8 +35,8 @@ from torchtitan.components.metrics import (
 )
 from torchtitan.config import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
-from torchtitan.optimizers import norm_helper
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.optimizers import norm_helper
 from torchtitan.protocols import ModelProtocol
 from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools import utils
@@ -219,7 +219,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             buffer_device = None
 
         self.loss_fn = self.train_spec.build_loss_fn(
-            job_config, parallel_dims=parallel_dims, ft_manager=self.ft_manager
+            job_config, parallel_dims=parallel_dims
         )
 
         # verify batch sizes
@@ -568,9 +568,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         attn_type = getattr(self.model_args, "attn_type", "sdpa")
         if attn_type in ["flex", "varlen"]:
-            assert self.tokenizer is not None, (
-                "tokenizer is required for flex/varlen attention"
-            )
+            assert (
+                self.tokenizer is not None
+            ), "tokenizer is required for flex/varlen attention"
             model = cast(ModelProtocol, self.model_parts[0])
             extra_kwargs["attention_masks"] = model.get_attention_masks(
                 input_batch=inputs,
@@ -644,7 +644,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with self.train_context():
                 with self.maybe_enable_amp:
                     pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-                    loss = self.loss_fn(pred, labels)
+                    # Compute loss sum (reduction='sum')
+                    loss_sum = self.loss_fn(pred, labels)
+
+                    # Scale the loss by the inverse of the total weight denominator before backward
+                    # This ensures gradients are properly normalized across all microbatches
+                    loss = loss_sum / global_valid_tokens
+
                 # need to free pred before bwd to avoid peaking memory
                 del pred
                 loss.backward()
@@ -778,7 +784,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             sum_data_sampled = dist_utils.dist_sum(
                 sum_data_sampled,
                 parallel_dims.get_optional_mesh("loss"),
-                ft_pg,
                 keep_tensor=True,
             )
             if self.prev_data_sampled_tensor is None:
@@ -871,8 +876,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
 
                 # Run validation if validator is available
-                if self.job_config.validation.enable and self.validator.should_validate(
-                    self.step
+                if (
+                    self.job_config.validation.enable
+                    and self.validator.should_validate(self.step)
                 ):
                     self.validator.validate(self.model_parts, self.step)
 
@@ -949,12 +955,12 @@ def main(trainer_class: type[Trainer]) -> None:
             return
 
         if config.checkpoint.create_seed_checkpoint:
-            assert int(os.environ["WORLD_SIZE"]) == 1, (
-                "Must create seed checkpoint using a single device, to disable sharding."
-            )
-            assert config.checkpoint.enable, (
-                "Must enable checkpointing when creating a seed checkpoint."
-            )
+            assert (
+                int(os.environ["WORLD_SIZE"]) == 1
+            ), "Must create seed checkpoint using a single device, to disable sharding."
+            assert (
+                config.checkpoint.enable
+            ), "Must enable checkpointing when creating a seed checkpoint."
             trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
         else:

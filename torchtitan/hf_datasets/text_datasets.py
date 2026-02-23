@@ -601,7 +601,6 @@ def build_text_dataloader(
 
     rng.manual_seed(job_config.debug.seed)
 
-    num_mtp_tokens = job_config.training.num_mtp_tokens
     dataset_weights = job_config.training.dataset_weights
     dataset_mix_in_seq = job_config.training.dataset_mix_in_seq
     dataset_inner_name = _replace_none_with_literal(
@@ -664,7 +663,6 @@ def build_text_dataloader(
                 dataset=hf_ds,
                 seq_len=seq_len,
                 infinite=infinite,
-                num_mtp_tokens=num_mtp_tokens,
                 drop_long_samples=drop_long_samples,
             )
         hf_datasets.append(hf_ds)
@@ -679,7 +677,6 @@ def build_text_dataloader(
             dataset=hf_ds,
             seq_len=seq_len,
             infinite=infinite,
-            num_mtp_tokens=num_mtp_tokens,
             drop_long_samples=drop_long_samples,
         )
 

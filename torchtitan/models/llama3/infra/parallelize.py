@@ -66,7 +66,9 @@ def parallelize_llama(
     # TODO: TP currently cannot handle uneven seq_len because we set
     #       `use_local_output=True` to use plain Tensors for legacy reasons.
     #       Need to revisit this.
-    assert job_config.training.seq_len % parallel_dims.seq_len_divisor == 0, f"""
+    assert (
+        job_config.training.seq_len % parallel_dims.seq_len_divisor == 0
+    ), f"""
         Sequence length {job_config.training.seq_len} must be divisible by the product of TP degree
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
@@ -383,13 +385,6 @@ def apply_fsdp(
             **fsdp_config,
             reshard_after_forward=reshard_after_forward_policy == "always",
         )
-    if model.model_args.num_mtp_modules > 0:
-        for layer_id, transformer_block in model.mtp_layers.items():
-            fully_shard(
-                transformer_block,
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward_policy == "always",
-            )
 
     fully_shard(model, **fsdp_config)
 
