@@ -179,7 +179,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             buffer_device = None
 
         self.loss_fn = self.train_spec.build_loss_fn(
-            job_config, parallel_dims=parallel_dims, ft_manager=self.ft_manager
+            job_config, parallel_dims=parallel_dims
         )
 
         # better with some flag to enable/disable this
@@ -599,7 +599,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with self.train_context():
                 with self.maybe_enable_amp:
                     pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-                    loss = self.loss_fn(pred, labels)
+                    # Compute loss sum (reduction='sum')
+                    loss_sum = self.loss_fn(pred, labels)
+
+                    # Scale the loss by the inverse of the total weight denominator before backward
+                    # This ensures gradients are properly normalized across all microbatches
+                    loss = loss_sum / global_valid_tokens
+
                 # need to free pred before bwd to avoid peaking memory
                 del pred
                 loss.backward()
@@ -717,6 +723,36 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     loss_mesh,
                 ),
             )
+            ##############################################################
+            # to communicate the data sampled across ranks
+            keys = sorted(data_sampled.keys())
+            keys_actual_sample_ratio = [
+                k.replace("data_sampled/", "actual_sample_ratio/") for k in keys
+            ]
+            sum_data_sampled = torch.stack([data_sampled[k] for k in keys]).to(
+                self.device
+            )
+
+            sum_data_sampled = dist_utils.dist_sum(
+                sum_data_sampled,
+                parallel_dims.get_optional_mesh("loss"),
+                keep_tensor=True,
+            )
+            if self.prev_data_sampled_tensor is None:
+                self.prev_data_sampled_tensor = torch.zeros_like(sum_data_sampled)
+            delta_data_sampled = sum_data_sampled - self.prev_data_sampled_tensor
+            self.prev_data_sampled_tensor = sum_data_sampled.clone()
+
+            total_data_sampled = delta_data_sampled.sum() / 100 + 1e-20
+
+            data_sampled = {
+                k: int(sum_data_sampled[i].item()) for i, k in enumerate(keys)
+            }
+            actual_sample_ratio = delta_data_sampled / total_data_sampled
+            actual_sample_ratio_dict = {
+                k: actual_sample_ratio[i].item()
+                for i, k in enumerate(keys_actual_sample_ratio)
+            }
 
         else:
             global_avg_loss = global_max_loss = loss.detach().item()

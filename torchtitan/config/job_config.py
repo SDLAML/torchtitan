@@ -427,12 +427,6 @@ class Training:
     seq_len: int = 2048
     """Sequence length"""
 
-    num_mtp_tokens: int = 0
-    """Number of tokens to predict at once using multi-token prediction."""
-
-    mtp_loss_weight: float = 0.3
-    """Weight of multi-token prediction loss term."""
-
     moe_aux_loss_alpha: float | None = None
     """Weight of MoE auxiliary loss term."""
 
@@ -925,9 +919,9 @@ class Float8Linear:
     precompute_float8_dynamic_scale_for_fsdp: bool = False
     """Whether precompute float8 scales dynamically for FSDP, recommended for tensorwise scaling"""
 
-    recipe_name: Literal[
-        "tensorwise", "rowwise", "rowwise_with_gw_hp"
-    ] | None = "tensorwise"
+    recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] | None = (
+        "tensorwise"
+    )
     """If specified, creates float8 config from recipe name"""
 
     filter_fqns: list[str] = field(default_factory=list)

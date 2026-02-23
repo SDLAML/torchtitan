@@ -684,49 +684,50 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         )
         drop_long_samples = config.drop_long_samples
 
-        if len(dataset_name) > 1:
-            assert dataset_files is None, (
-                "cannot supply dataset files when using multiple datasets"
-            )
-        for d in [
-            dataset_path,
-            dataset_inner_name,
-            dataset_split,
-            dataset_key,
-            dataset_weights,
-        ]:
-            assert len(d) == normed_list_length, (
-                f"list {d} does not match length of list of datasets (length = {normed_list_length})"
-            )
-        hf_datasets = []
-        for d_name, d_path, d_inner_name, d_split, d_key in zip(
-            dataset_name,
-            dataset_path,
-            dataset_inner_name,
-            dataset_split,
-            dataset_key,
-        ):
-            hf_ds = HuggingFaceDataset(
-                dataset_name=d_name,
-                dataset_path=d_path,
-                tokenizer=tokenizer,
-                dp_rank=dp_rank,
-                dp_world_size=dp_world_size,
+    if len(dataset_name) > 1:
+        assert dataset_files is None, (
+            "cannot supply dataset files when using multiple datasets"
+        )
+    for d in [
+        dataset_path,
+        dataset_inner_name,
+        dataset_split,
+        dataset_key,
+        dataset_weights,
+    ]:
+        assert len(d) == normed_list_length, (
+            f"list {d} does not match length of list of datasets (length = {normed_list_length})"
+        )
+    hf_datasets = []
+    for d_name, d_path, d_inner_name, d_split, d_key in zip(
+        dataset_name,
+        dataset_path,
+        dataset_inner_name,
+        dataset_split,
+        dataset_key,
+    ):
+        hf_ds = HuggingFaceDataset(
+            dataset_name=d_name,
+            dataset_path=d_path,
+            tokenizer=tokenizer,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            infinite=infinite,
+            dataset_inner_name=d_inner_name,
+            dataset_files=dataset_files,
+            dataset_split=d_split,
+            dataset_streaming=dataset_streaming,
+            dataset_key=d_key,
+        )
+        if not dataset_mix_in_seq:
+            hf_ds = GreedyPackedDataset(
+                dataset=hf_ds,
+                seq_len=seq_len,
                 infinite=infinite,
-                dataset_inner_name=d_inner_name,
-                dataset_files=dataset_files,
-                dataset_split=d_split,
-                dataset_streaming=dataset_streaming,
-                dataset_key=d_key,
+                num_mtp_tokens=num_mtp_tokens,
+                drop_long_samples=drop_long_samples,
             )
-            if not dataset_mix_in_seq:
-                hf_ds = GreedyPackedDataset(
-                    dataset=hf_ds,
-                    seq_len=seq_len,
-                    infinite=infinite,
-                    drop_long_samples=drop_long_samples,
-                )
-            hf_datasets.append(hf_ds)
+        hf_datasets.append(hf_ds)
 
         # First pack, then mix → data is only mixed in batch dimension.
         # First mix, then pack → data is also mixed inside packed sample.

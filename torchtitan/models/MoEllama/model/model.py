@@ -223,8 +223,6 @@ class Transformer(nn.Module, ModelProtocol):
     transformer_block_cls = TransformerBlock
 
     def __init__(self, model_args: MoEModelArgs):
-        if model_args.num_mtp_modules > 0:
-            raise ValueError("currently, MTP is not supported with MoE")
         super().__init__()
         self.model_args = model_args
         self.vocab_size = model_args.vocab_size
@@ -325,10 +323,6 @@ class Transformer(nn.Module, ModelProtocol):
                 std=final_out_std,
                 **extra_kwargs,
             )
-        if self.model_args.num_mtp_modules > 0:
-            for layer in self.mtp_layers.values():
-                if layer is not None:
-                    layer.init_weights()
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
         return precompute_freqs_cis(
