@@ -38,6 +38,7 @@ class MoEArgs:
 
     _debug_force_load_balance: bool = False
     # if True, we force each experts get same amount of token via round-robin
+    force_gate_on_fp32: bool = False
 
 
 class FeedForward(nn.Module):
@@ -59,12 +60,12 @@ class FeedForward(nn.Module):
         self.hidden_dim = hidden_dim
 
         if norm_everywhere:
-            assert norm_type is not None, (
-                "`norm_type` needs to be passed when `norm_everywhere=True`"
-            )
-            assert norm_eps is not None, (
-                "`norm_eps` needs to be passed when `norm_everywhere=True`"
-            )
+            assert (
+                norm_type is not None
+            ), "`norm_type` needs to be passed when `norm_everywhere=True`"
+            assert (
+                norm_eps is not None
+            ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
             self.out_norm = build_norm(
                 norm_type,
                 dim=hidden_dim,
@@ -94,8 +95,6 @@ class FeedForward(nn.Module):
 
 
 class TokenChoiceTopKRouter(nn.Module):
-    force_gate_on_fp32: bool = False
-
     def __init__(
         self,
         dim: int,
@@ -103,6 +102,7 @@ class TokenChoiceTopKRouter(nn.Module):
         top_k: int,
         route_scale: float,
         _debug_force_load_balance: bool = False,
+        force_router_fp32_matmul: bool = False,
     ):
         super().__init__()
 
@@ -111,6 +111,7 @@ class TokenChoiceTopKRouter(nn.Module):
         self.top_k = top_k
         self.route_scale = route_scale
         self._debug_force_load_balance = _debug_force_load_balance
+        self.force_router_fp32_matmul = force_router_fp32_matmul
 
     def __repr__(self):
         return (
@@ -160,9 +161,8 @@ class TokenChoiceTopKRouter(nn.Module):
                 Number of tokens assigned to each expert with shape ``(num_experts,)``.
         """
         # scores shape (bs*slen, num_experts)
-        if self.force_gate_on_fp32:
-            with torch.autocast(x.device, dtype=torch.float32):
-                scores = self.gate(x)
+        if self.force_router_fp32_matmul:
+            scores = x.float() @ self.gate.weight.t().float()
         else:
             scores = self.gate(x)
 
@@ -331,8 +331,6 @@ class TokenReorderer(nn.Module):
 
 
 class MoE(nn.Module):
-    experts_parallel_enabled = False
-
     def __init__(
         self,
         layer_id: int,
@@ -373,6 +371,7 @@ class MoE(nn.Module):
             top_k=self.top_k,
             route_scale=moe_args.scaling_factor,
             _debug_force_load_balance=moe_args._debug_force_load_balance,
+            force_router_fp32_matmul=moe_args.force_router_fp32_matmul,
         )
         self.reorderer = TokenReorderer(num_experts=self.num_experts, top_k=self.top_k)
         self.shared_experts = (
@@ -446,7 +445,6 @@ class MoE(nn.Module):
     ) -> torch.Tensor:
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
-        # TODO@JSC: check if we want to use FP32 remix
         (
             top_scores,
             sigmoid_scores,

@@ -159,6 +159,14 @@ class MoEModelArgs(BaseModelArgs):
         self.attn_type = job_config.model.attn_type
         self.attn_mask_type = job_config.model.attn_mask_type
 
+        self.moe_args.force_router_fp32_matmul = (
+            job_config.model.force_router_fp32_matmul
+        )
+        if self.moe_args.force_router_fp32_matmul:
+            logger.info(
+                "[MoE Router] Force router matrix multiplication on FP32 is enabled."
+            )
+
         if job_config.parallelism.expert_parallel_degree == 1:
             self.moe_impl = "standard"
             # if we are not using expert parallelism, we use standard communication backend

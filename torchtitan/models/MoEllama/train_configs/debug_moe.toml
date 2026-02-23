@@ -39,6 +39,7 @@ intermediate_exp = 0
 final_out_init_fn_type = "scion_normal_output"
 final_out_init_std = 1
 final_out_exp = 0
+force_router_fp32_matmul = false
 # tokenizer_path = ???
 # converters = ???
 

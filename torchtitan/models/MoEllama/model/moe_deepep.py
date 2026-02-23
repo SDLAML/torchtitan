@@ -9,6 +9,7 @@
 from typing import Optional
 
 import torch
+from torchtitan.distributed.deepep import sync_combine
 
 from .moe import MoE, MoEArgs
 
@@ -114,6 +115,7 @@ class DeepEPMoE(MoE):
 
         out = self.shared_experts(x) if self.shared_experts is not None else None
 
+        sync_combine()
         if out is None:
             return routed_output.reshape(bs, slen, dim), load_balance_loss
         return (out + routed_output).reshape(bs, slen, dim), load_balance_loss

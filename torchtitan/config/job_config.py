@@ -267,6 +267,9 @@ class Model:
     moe_router_scaling_factor: float | None = None
     """MoE router scaling factor to use"""
 
+    force_router_fp32_matmul: bool = False
+    """Whether to force the router matrix multiplication on FP32"""
+
 
 @dataclass
 class Optimizer:

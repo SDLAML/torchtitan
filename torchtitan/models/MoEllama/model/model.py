@@ -20,7 +20,6 @@ from torchtitan.models.inits import (
     setup_depth_init,
     setup_residual_scale,
 )
-from torchtitan.models.inputs import MoEInputs, MoEInputsDict
 from torchtitan.models.llama3.model.model import (
     # apply_rotary_emb,
     Attention,
@@ -222,7 +221,7 @@ class TransformerBlock(nn.Module):
             )
 
 
-class Transformer(nn.Module, ModelProtocol):
+class Transformer(ModelProtocol):
     """
     Transformer Module
 
@@ -244,7 +243,7 @@ class Transformer(nn.Module, ModelProtocol):
     transformer_block_cls = TransformerBlock
 
     def __init__(self, model_args: MoEModelArgs):
-        super().__init__()
+        super().__init__(model_args)
         self.model_args = model_args
         self.vocab_size = model_args.vocab_size
         self.n_layers = model_args.n_layers
@@ -363,6 +362,7 @@ class Transformer(nn.Module, ModelProtocol):
                 B = 1
             case "block_causal":
                 B = input_batch.shape[0]
+                assert tokenizer.eos_id is not None
                 mask_mods.append(get_document_mask_mod(input_batch, tokenizer.eos_id))
             case _:
                 raise ValueError(
@@ -390,54 +390,35 @@ class Transformer(nn.Module, ModelProtocol):
                         f"varlen attention is only supported with block_causal \
                         attention mask type, got {self.model_args.attn_mask_type}"
                     )
+                assert tokenizer.eos_id is not None
                 return create_varlen_metadata_for_document(
                     input_batch, tokenizer.eos_id
                 )
             case _:
-                raise NotImplementedError(
-                    "Only varlen and flex attn masks are supported"
-                )
+                raise TypeError("Only varlen and flex attn masks are supported")
 
     def forward(
         self,
-        inputs: MoEInputs,
+        tokens: torch.Tensor,
         accumulated_load_balance_loss: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
-    ) -> MoEInputsDict:
+    ):
         """
         Perform a forward pass through the Transformer model.
 
         Args:
-            inputs (MoEInputs): Single tensor or dictionary containing the
-                following keys and values:
-                - tokens_list (Union[list[torch.Tensor | None],
-                  torch.Tensor]): Input token indices if pipeline parallelism is not enabled.
-                  If pipeline parallelism is enabled, this will be the input token indices
-                  for the ranks on the first pipeline stage. This will be the activation of the
-                  previous pipeline stage if the current rank is not on the first stage.
-                - aux_loss (torch.Tensor): Sequence-wise auxiliary balance loss.
-            input_batch (torch.Tensor): The input batch read from the dataloader.
-                This will always be the input batch regardless of the pipeline stage.
-                This field is required for non-first PP stages to perform document
-                masking attention (to analyze the boundary of the document).
+            tokens (torch.Tensor): Input token indices if pipeline parallelism is not enabled.
+            accumulated_load_balance_loss (torch.Tensor | None): Accumulated load balance loss.
+            attention_masks (AttentionMasksType | None): Attention masks.
+            positions (torch.Tensor | None): Positions.
+            loss_mask (torch.Tensor | None): Loss mask.
 
         Returns:
-            MoEInputsDict: Dictionary containing the following keys and values:
-                - tokens_list (list[torch.Tensor]): Output logits after applying
-                  the Transformer model.
-                - aux_loss (torch.Tensor): Sequence-wise auxiliary balance loss.
-
+            torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        if not isinstance(inputs, dict):
-            inputs = {"tokens_list": inputs}
-        tokens = inputs["tokens_list"]
-        # prev_embed = inputs.get("prev_embed", None)
-        if isinstance(tokens, list):
-            tokens = tokens[0]
-
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 

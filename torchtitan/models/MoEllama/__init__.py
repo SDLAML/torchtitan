@@ -140,6 +140,27 @@ moe_llama_configs = {
         intermediate_size=5120,
         moe_intermediate_size=640,
     ),
+    "qwen-30bA3b-norm-everywhere": MoEModelArgs(
+        dim=2048,
+        n_layers=48,
+        n_dense_layers=0,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        moe_args=MoEArgs(
+            num_experts=128,
+            num_shared_experts=1,
+            top_k=8,
+            scaling_factor=2.8232,  # 8 of 64 experts
+        ),
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+        intermediate_size=6144,
+        moe_intermediate_size=768,
+    ),
     "bsc-1B-7B-opt-g-32k": MoEModelArgs(
         dim=2048,
         n_layers=24,
