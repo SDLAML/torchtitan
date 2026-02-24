@@ -11,6 +11,7 @@ from typing import Any, Generic, Literal, TypeVar
 import queue
 import threading
 import torch
+import torch.distributed as dist
 import torch.distributed.tensor
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
@@ -23,7 +24,8 @@ import torch.distributed as dist
 
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
-from torchtitan.config import Configurable
+from torchtitan.components.ft import FTManager, has_torchft
+from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.optimizers import Scion
 from torchtitan.optimizers import (

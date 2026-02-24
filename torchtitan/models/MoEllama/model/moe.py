@@ -347,6 +347,9 @@ class MoE(nn.Module):
         )
         self.register_buffer("router_entropy", torch.zeros(1, dtype=torch.float32))
         self.register_buffer("acc_fwd_times", torch.zeros(1, dtype=torch.int64))
+        self.register_buffer(
+            "tokens_per_expert_cumul", torch.zeros(self.num_experts, dtype=torch.int64)
+        )
 
     def init_weights(
         self,
