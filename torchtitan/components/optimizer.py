@@ -10,6 +10,7 @@ import threading
 from typing import Any, Callable, Generic, Iterator, TypeVar
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.checkpoint.state_dict import (
@@ -19,7 +20,6 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
-import torch.distributed as dist
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
@@ -456,6 +456,8 @@ def moe_metrics_worker(log_queue: queue.Queue):
             all_biases_cpu,
             all_entropies_cpu,
             all_load_balance_losses_cpu,
+            all_maxvio_batch_cpu,
+            all_maxvio_global_cpu,
             num_experts,
         ) = data
 
@@ -464,7 +466,11 @@ def moe_metrics_worker(log_queue: queue.Queue):
             moe = info["module"]
             layer_id = info["layer_id"]
 
-            metrics = {f"moe_entropy/L-{layer_id}": all_entropies_cpu[i]}
+            metrics = {
+                f"moe_entropy/L-{layer_id}": all_entropies_cpu[i],
+                f"moe_maxvio_batch/L-{layer_id}": all_maxvio_batch_cpu[i],
+                f"moe_maxvio_global/L-{layer_id}": all_maxvio_global_cpu[i],
+            }
             layer_usages = all_usages_cpu[usage_offset : usage_offset + num_experts]
             layer_biases = all_biases_cpu[bias_offset : bias_offset + num_experts]
 
@@ -481,6 +487,17 @@ def moe_metrics_worker(log_queue: queue.Queue):
             moe._log_expert_metrics = metrics
             usage_offset += num_experts
             bias_offset += num_experts
+
+        # Aggregated scalars across all MoE layers — attached to first layer
+        num_moe_layers = len(moe_layers_info)
+        metrics.update(
+            {
+                "moe_maxvio_batch/aggregate": sum(all_maxvio_batch_cpu)
+                / num_moe_layers,
+                "moe_maxvio_global/aggregate": sum(all_maxvio_global_cpu)
+                / num_moe_layers,
+            }
+        )
 
         log_queue.task_done()
 
@@ -604,6 +621,7 @@ def build_optimizers_with_moe_load_balancing(
 
         moe_layers_info = []
         tok_buffers, ent_buffers, load_balance_loss_buffers = [], [], []
+        cumul_buffers = []
         acc_fwd_times_buffers = []
         scale_factor = 1
         num_experts = 0
@@ -622,6 +640,7 @@ def build_optimizers_with_moe_load_balancing(
                     }
                 )
                 tok_buffers.append(moe.tokens_per_expert)
+                cumul_buffers.append(moe.tokens_per_expert_cumul)
                 ent_buffers.append(moe.router_entropy)
                 # if need_rescale_stats(moe) or need_rescale_stats(block):
                 #     scale_factor = 0.5
@@ -668,6 +687,25 @@ def build_optimizers_with_moe_load_balancing(
         )
         layer_sums.index_add_(0, grp, all_tokens)
         layer_means = layer_sums / num_experts
+
+        # Accumulate globally-reduced counts into per-layer cumulative buffers.
+        # No extra all-reduce: all ranks have identical all_tokens after fused reduce.
+        all_tokens_split = list(all_tokens.view(num_layers, num_experts).unbind(0))
+        torch._foreach_add_(cumul_buffers, all_tokens_split)
+
+        # MaxVio_batch: worst-case overload in current step window
+        layer_means_f = layer_means.float()
+        max_per_layer = (
+            all_tokens.view(num_layers, num_experts).max(dim=1).values.float()
+        )
+        maxvio_batch = (max_per_layer - layer_means_f) / layer_means_f.clamp(min=1.0)
+
+        # MaxVio_global: worst-case overload over the full training run (cumulative)
+        all_cumul = torch.cat(cumul_buffers).view(num_layers, num_experts).float()
+        cumul_means = all_cumul.sum(dim=1) / num_experts
+        maxvio_global = (all_cumul.max(dim=1).values - cumul_means) / cumul_means.clamp(
+            min=1.0
+        )
 
         # Vectorised deltas and usage
         delta_flat = layer_means[grp] - all_tokens
@@ -719,12 +757,16 @@ def build_optimizers_with_moe_load_balancing(
                 all_load_balance_losses_cpu = (
                     all_load_balance_losses.cpu().float().tolist()
                 )
+                all_maxvio_batch_cpu = maxvio_batch.cpu().tolist()
+                all_maxvio_global_cpu = maxvio_global.cpu().tolist()
                 payload = (
                     moe_layers_info,
                     all_usages_cpu,
                     all_biases_cpu,
                     all_entropies_cpu,
                     all_load_balance_losses_cpu,
+                    all_maxvio_batch_cpu,
+                    all_maxvio_global_cpu,
                     num_experts,
                 )
                 log_queue.put(payload)
