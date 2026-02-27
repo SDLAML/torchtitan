@@ -154,6 +154,18 @@ def create_disco_param_groups(
         # Rename str_match to param_str_match for compatibility
         group_config["param_str_match"] = group_config.pop("str_match")
 
+        # if one config's norm_factor is with unembed*,
+        # we could by default set backend to be identity
+        if (
+            group_config["norm_factor"].startswith("unembed")
+            and group_config["backend"] != "identity"
+        ):
+            group_config["backend"] = "identity"
+            logger.info(
+                f"[DISCO][init], For {group_config['param_str_match']},"
+                f"Setting backend from {group_config['backend']} to identity"
+            )
+
         param_groups_config.append(group_config)
 
     # Step 2: Extract actual parameters from the model
