@@ -8,10 +8,10 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 
 
-class StagingMoEllamaConfig(PretrainedConfig):
-    model_type = "StagingMoEllama"
+class OptMoEConfig(PretrainedConfig):
+    model_type = "OptMoE"
     keys_to_ignore_at_inference = ["past_key_values"]
-    # Default tensor parallel plan for base model `LlamaModel`
+    # Default tensor parallel plan for base model
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
         "layers.*.self_attn.k_proj": "colwise",
@@ -59,6 +59,12 @@ class StagingMoEllamaConfig(PretrainedConfig):
         head_dim=None,
         qk_norm=False,
         norm_everywhere=False,
+        gated_attention_type=None,
+        sliding_window_size=-1,
+        rope_pattern=None,
+        swa_pattern=None,
+        rope_theta_swa=None,
+        rope_scaling_swa=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -94,8 +100,14 @@ class StagingMoEllamaConfig(PretrainedConfig):
         )
         self.norm_everywhere = norm_everywhere
         self.qk_norm = qk_norm
+        self.gated_attention_type = gated_attention_type
+        self.sliding_window_size = sliding_window_size
+        self.rope_pattern = rope_pattern
+        self.swa_pattern = swa_pattern
         self.rope_theta = rope_theta
+        self.rope_theta_swa = rope_theta_swa
         self.rope_scaling = rope_scaling
+        self.rope_scaling_swa = rope_scaling_swa
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, copy it it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
@@ -111,4 +123,4 @@ class StagingMoEllamaConfig(PretrainedConfig):
         )
 
 
-__all__ = ["StagingMoEllamaConfig"]
+__all__ = ["OptMoEConfig"]

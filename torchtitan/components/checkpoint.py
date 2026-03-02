@@ -261,7 +261,7 @@ class CheckpointManager(Configurable):
         this parameter, the model need to define proper HuggingFaceStorageReader to perform dequantize.
         """
 
-        last_save_model_only: bool = True
+        last_save_model_only: bool = False
         """
         When last_save_model_only=True, only the model will be saved at the end of training,
         the last save.  With this, checkpoints can be loaded using `torch.load(..., weights_only=True)`
@@ -319,6 +319,12 @@ class CheckpointManager(Configurable):
         Exclude specific keys from being loaded from the checkpoint.
         Provide a comma-separated list of keys to exclude, e.g. 'optimizer,lr_scheduler,dataloader'.
         This will load the model only, excluding the specified keys.
+        """
+
+        reconfigure_lrs: bool = False
+        """
+        Whether _not_ to load LRs from the checkpoint, but instead use those specified in
+        the current job's config.
         """
 
         enable_first_step_checkpoint: bool = False
@@ -413,11 +419,11 @@ class CheckpointManager(Configurable):
             assert ft_manager is not None
             self.ft_replica_id = ft_manager.replica_id
 
-        if checkpoint_config.reconfigure_lrs:
+        if config.reconfigure_lrs:
             optimizers.preserve_lrs_when_loading = True
             lr_schedulers.preserve_lrs_when_loading = True
 
-        async_mode = checkpoint_config.async_mode.lower()
+        async_mode = config.async_mode.lower()
         self.enable_staging = (
             self.enable and async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM
         ) or self.enable_ft_dataloader_checkpoints
@@ -443,9 +449,9 @@ class CheckpointManager(Configurable):
         self.last_save_model_only = config.last_save_model_only
         self.last_save_in_hf = config.last_save_in_hf
         if self.last_save_in_hf:
-            assert sd_adapter is not None, (
-                "checkpoint.last_save_in_hf is True, but sd_adapter is not provided."
-            )
+            assert (
+                sd_adapter is not None
+            ), "checkpoint.last_save_in_hf is True, but sd_adapter is not provided."
         self.sd_adapter = sd_adapter
         self.export_dtype = TORCH_DTYPE_MAP[config.export_dtype]
         self.exclude_from_loading = config.exclude_from_loading
@@ -538,9 +544,9 @@ class CheckpointManager(Configurable):
         checkpoint_save_id: str | None = None
         fqn_to_index_mapping: dict[Any, int] | None = None
         if to_hf:
-            assert self.sd_adapter is not None, (
-                "trying to save checkpoint in HF safetensors format, but sd_adapter is not provided."
-            )
+            assert (
+                self.sd_adapter is not None
+            ), "trying to save checkpoint in HF safetensors format, but sd_adapter is not provided."
             state_dict = self.sd_adapter.to_hf(state_dict)
 
             fqn_to_index_mapping = self.sd_adapter.fqn_to_index_mapping
@@ -617,9 +623,9 @@ class CheckpointManager(Configurable):
         """
 
         if from_hf:
-            assert self.sd_adapter is not None, (
-                "trying to load checkpoint in HF safetensors format, but sd_adapter is not provided."
-            )
+            assert (
+                self.sd_adapter is not None
+            ), "trying to load checkpoint in HF safetensors format, but sd_adapter is not provided."
             hf_state_dict = self.sd_adapter.to_hf(state_dict)
             hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
                 checkpoint_id, from_quantized
@@ -720,6 +726,39 @@ class CheckpointManager(Configurable):
                 self.ft_manager.participating_rank(),
             )
 
+    @staticmethod
+    def can_skip_weight_init(config: Config) -> bool:
+        """Return whether the model will be loaded, so that we can skip
+        weight initialization.
+
+        In case errors would occur during loading, this also returns
+        True (i.e., weight initialization can be skipped, as if the
+        model would be loaded).
+        """
+        skip_weight_init = False
+        checkpoint_base_folder = os.path.join(
+            config.dump_folder, config.checkpoint.folder
+        )
+        initial_load_path = config.checkpoint.initial_load_path
+        load_step = config.checkpoint.load_step
+        if not os.path.exists(checkpoint_base_folder):
+            if initial_load_path:
+                checkpoint_id = initial_load_path
+                if not os.path.isdir(checkpoint_id):
+                    # We error out later in this case.
+                    skip_weight_init = True
+        else:
+            load_step = (
+                CheckpointManager._find_load_step(None, checkpoint_base_folder)
+                if load_step == -1
+                else load_step
+            )
+            if load_step != -1:
+                # We either error out later or load the checkpoint in
+                # this case.
+                skip_weight_init = True
+        return skip_weight_init
+
     @torch.no_grad()
     def load(self, step: int = -1) -> bool:
         """Load the checkpoint for the given step.
@@ -749,14 +788,14 @@ class CheckpointManager(Configurable):
             from_hf = self.initial_load_in_hf
             from_quantized = self.initial_load_in_hf_quantized
             if from_hf:
-                assert model_only, (
-                    "Only model can be loaded when loading from HF's safetensors checkpoint."
-                )
+                assert (
+                    model_only
+                ), "Only model can be loaded when loading from HF's safetensors checkpoint."
 
             if from_quantized:
-                assert from_hf, (
-                    "Quantized checkpoint can only be loaded from HuggingFace format."
-                )
+                assert (
+                    from_hf
+                ), "Quantized checkpoint can only be loaded from HuggingFace format."
 
             if self.initial_load_path:
                 checkpoint_id = self.initial_load_path
@@ -964,9 +1003,9 @@ class CheckpointManager(Configurable):
             states = self._flattened_model_states_sd()
 
         if self.last_save_in_hf:
-            assert self.last_save_model_only, (
-                "Only model can be saved when saving in HF safetensors format."
-            )
+            assert (
+                self.last_save_model_only
+            ), "Only model can be saved when saving in HF safetensors format."
 
         self.dcp_save(
             states,

@@ -44,8 +44,9 @@ class ModelSpec:
     pipelining_fn: Callable | None
     post_optimizer_build_fn: Callable | None
     state_dict_adapter: type[BaseStateDictAdapter] | None
+    hf_assets_setup_fn: Callable | None = None
 
 
 @dataclass
 class FaultTolerantModelSpec(ModelSpec):
-    fragment_fn: Callable | None
+    fragment_fn: Callable | None = None

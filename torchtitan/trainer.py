@@ -5,22 +5,29 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
+import datetime
+
+import functools
 import json
 import os
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field
-from datetime import timedelta
+
 from typing import Annotated, Any, cast
 
 import torch
 import torch.distributed.checkpoint.stateful
 import tyro
 from torch.distributed.elastic.multiprocessing.errors import record
-from torchtitan.hf_datasets.text_datasets import inter_snapshot_every_n_steps
+
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.data_mix_scheduler import (
+    build_data_mix_scheduler,
+    DataMixScheduler,
+)
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
-from torchtitan.components.loss import IGNORE_INDEX, LossFunction
+from torchtitan.components.loss import IGNORE_INDEX, LossFunction, moe_loss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.components.optimizer import (
@@ -40,7 +47,9 @@ from torchtitan.config.configs import (
 )
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.hf_datasets.text_datasets import infer_dataloader_snapshot_every_n_steps
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.optimizers import norm_helper
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.protocols.model_spec import ModelSpec
@@ -122,10 +131,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 if f.name == "model_spec":
                     assert self.model_spec is not None
                     # ModelSpec contains callables that can't be serialized
-                    d["model_spec"] = {
+                    model_spec_dict = {
                         "name": self.model_spec.name,
                         "flavor": self.model_spec.flavor,
                     }
+                    # Keep a JSON-serializable snapshot of model arguments so
+                    # overrides under model_spec.model are tracked in saved configs.
+                    if dataclasses.is_dataclass(self.model_spec.model):
+                        model_spec_dict["model"] = asdict(self.model_spec.model)
+                    d["model_spec"] = model_spec_dict
                 else:
                     d[f.name] = (
                         asdict(getattr(self, f.name))
@@ -140,9 +154,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     f"Running with configs: {json.dumps(self.to_dict(), indent=2, ensure_ascii=False)}"
                 )
 
-            if self.debug.save_config_file is not None:
+            if self.debug.save_config_file:
                 config_file = os.path.join(
-                    self.dump_folder, self.debug.save_config_file
+                    self.dump_folder,
+                    "job_config_"
+                    + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+                    + ".json",
                 )
                 if torch.distributed.is_initialized():
                     if torch.distributed.get_rank() == 0:
@@ -165,6 +182,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     model_config: BaseModel.Config
     # TODO: we should make this list[BaseModel / Decoder] but this will affect many components.
     # will do this in a separate PR
+    data_mix_scheduler: DataMixScheduler
     model_parts: list[torch.nn.Module]
     loss_fn: LossFunction
     optimizers: OptimizersContainer
@@ -185,15 +203,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     step: int
     ntokens_seen: int
 
+    # used for loggering, not need to put it in the stateful class
+    prev_data_sampled_tensor: torch.Tensor
+
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
     def __init__(self, config: Config):
         torch._C._log_api_usage_once("torchtitan.train")
 
         self.config = config
-        assert config.model_spec is not None, (
-            "model_spec must be set before creating Trainer"
-        )
+        assert (
+            config.model_spec is not None
+        ), "model_spec must be set before creating Trainer"
         model_spec = config.model_spec
 
         device_module, device_type = utils.device_module, utils.device_type
@@ -255,7 +276,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             else None
         )
 
-        snapshot_every_n_steps = inter_snapshot_every_n_steps(
+        snapshot_every_n_steps = infer_dataloader_snapshot_every_n_steps(
             checkpoint_enabled=config.checkpoint.enable,
             checkpoint_interval=config.checkpoint.interval,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -270,6 +291,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             local_batch_size=config.training.local_batch_size,
             snapshot_every_n_steps=snapshot_every_n_steps,
             seed=config.debug.seed,
+        )
+
+        mixing_scheduler_configs = config.training.data_mixing_scheduler_configs
+
+        self.data_mix_scheduler = build_data_mix_scheduler(
+            self.dataloader, mixing_scheduler_configs
+        )
+        self.data_mix_scheduler.step(0)
+        logger.info(
+            f"mixing weights at step 0: {self.data_mix_scheduler.get_log_dict_at_step(0)}"
         )
 
         # build model (using meta init)
@@ -289,6 +320,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             utils.set_default_dtype(TORCH_DTYPE_MAP[config.training.dtype]),
         ):
             model = model_config.build()
+
+        logger.info(f"model: {model}")
 
         # Build the collection of model converters. No-op if converters empty
         model_compile_enabled = (
@@ -311,15 +344,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # calculate model size and flops per token
         (
+            active_param,
+            embedding_param,
             model_param_count,
             self.metrics_processor.num_flops_per_token,
         ) = model_config.get_nparams_and_flops(model, config.training.seq_len)
 
         logger.info(
-            f"{color.blue}Model {model_spec.name} {model_spec.flavor} "
-            f"{color.red}size: {model_param_count:,} total parameters{color.reset}"
+            f"{color.blue}Model {model_spec.name} {model_spec.flavor} - "
+            f"Flops: {self.metrics_processor.num_flops_per_token:,}"
         )
-
+        logger.info(
+            f"{color.red}total parameters: {model_param_count:,} | "
+            f"active: {active_param:,} | embedding: {embedding_param:,} {color.reset}"
+        )
         # move sharded model to CPU/GPU and initialize weights via DTensor
         buffer_device: torch.device | None
         if config.checkpoint.create_seed_checkpoint:
@@ -335,6 +373,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.loss_fn = model_spec.build_loss_fn(
             config.compile, parallel_dims=parallel_dims
         )
+
+        pre_moe_loss_fn = self.loss_fn
+        self.loss_fn = functools.partial(
+            moe_loss,
+            loss_fn=pre_moe_loss_fn,
+            grad_accumulation_steps=self.gradient_accumulation_steps,
+        )
+
+        skip_weight_init = CheckpointManager.can_skip_weight_init(config)
 
         # apply parallelisms and initialization
         if parallel_dims.pp_enabled:
@@ -371,7 +418,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             for m in self.model_parts:
                 m.to_empty(device=init_device)
                 with torch.no_grad():
-                    cast(Decoder, m).init_weights(buffer_device=buffer_device)
+                    cast(Decoder, m).init_weights(
+                        buffer_device=buffer_device, skip_weight_init=skip_weight_init
+                    )
                 m.train()
 
             # confirm that user will be able to view loss metrics on the console
@@ -395,7 +444,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
             model.to_empty(device=init_device)
             with torch.no_grad():
-                cast(BaseModel, model).init_weights(buffer_device=buffer_device)
+                cast(BaseModel, model).init_weights(
+                    buffer_device=buffer_device, skip_weight_init=skip_weight_init
+                )
             model.train()
 
             self.model_parts = [model]
@@ -433,11 +484,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
         self.metrics_processor.optimizers = self.optimizers
         self.metrics_processor.model_parts = self.model_parts
-
+        self.optimizers.norms_to_log = norm_helper.get_norms_to_log(
+            config.metrics.norms_to_log
+        )
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
         self.ntokens_seen = 0
+        self.prev_data_sampled_tensor = None
 
         self.checkpointer = config.checkpoint.build(
             dataloader=self.dataloader,
@@ -501,6 +555,36 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             f"total steps {config.training.steps} "
             f"(warmup {config.lr_scheduler.warmup_steps})"
         )
+
+    def save_model_args(self):
+        if torch.distributed.get_rank() == 0:
+            # Save model args to dump folder.
+            os.makedirs(self.config.dump_folder, exist_ok=True)
+            # model_args_save_path = os.path.join(
+            #     self.job_config.job.dump_folder,
+            #     "model_args_"
+            #     + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+            #     + ".json",
+            # )
+
+            # model_args_dict = dataclasses.asdict(model_args)
+            # model_args_dict.pop("_enforced")
+            # with open(model_args_save_path, "w") as f:
+            #     json.dump(model_args_dict, f, indent=4)
+
+            data_mix_scheduler_save_path = os.path.join(
+                self.config.dump_folder,
+                "data_mix_scheduler_"
+                + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+                + ".json",
+            )
+
+            with open(data_mix_scheduler_save_path, "w") as f:
+                json.dump(
+                    self.data_mix_scheduler.convert_mixing_configs_to_json(),
+                    f,
+                    indent=4,
+                )
 
     def init_distributed(self) -> ParallelDims:
         config = self.config
@@ -595,20 +679,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # extra_kwargs are.
         extra_kwargs: dict[str, Any] = {}
 
-        # TODO: improve the logic on obtaining attention masks
-        layer = getattr(self.model_config, "layer", None)
-        attn_config = getattr(layer, "attention", None) if layer else None
-        attn_backend = getattr(attn_config, "attn_backend", "sdpa")
-        if attn_backend in ["flex", "varlen"]:
-            assert self.tokenizer is not None, (
-                "tokenizer is required for flex/varlen attention"
-            )
-            model = cast(Decoder, self.model_parts[0])
-            extra_kwargs["attention_masks"] = model.get_attention_masks(
+        # Always delegate mask creation to the model's get_attention_masks().
+        # Checking base attn_backend is insufficient: per-layer patterns (swa_pattern,
+        # rope_pattern) may promote individual layers to flex even when the base
+        # config says "sdpa". The model returns None for all-SDPA (no overhead),
+        # a dict for flex/mixed, or delegates to super() for varlen.
+        model = cast(Decoder, self.model_parts[0])
+        if hasattr(model, "get_attention_masks"):
+            attention_masks = model.get_attention_masks(
                 input_batch=inputs,
                 tokenizer=self.tokenizer,
                 extra_inputs=extra_inputs,
             )
+            if attention_masks is not None:
+                extra_kwargs["attention_masks"] = attention_masks
+
+        if self.config.training.enable_token_mask_for_moe:
+            loss_mask = labels != IGNORE_INDEX
+            extra_kwargs["loss_mask"] = loss_mask
 
         if self.parallel_dims.cp_enabled:
             inputs, labels, extra_kwargs = prepare_context_parallel_input(
@@ -718,6 +806,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
+        fwd_bwd_start = time.perf_counter()
         for input_dict, labels in microbatches:
             # Move tensors to GPU
             for k, v in input_dict.items():
@@ -733,23 +822,46 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
             accumulated_losses.append(loss.detach())
 
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.model_parts for p in m.parameters()],
-            self.config.training.max_norm,
-            foreach=True,
-            pp_mesh=parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=parallel_dims.ep_enabled,
-        )
+        self.metrics_processor.fwd_bwd_times.append(time.perf_counter() - fwd_bwd_start)
+
+        grad_norm = None
+
+        if self.config.training.max_norm > 0:
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.model_parts for p in m.parameters()],
+                self.config.training.max_norm,
+                foreach=True,
+                pp_mesh=parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=parallel_dims.ep_enabled,
+            )
         self.checkpointer.maybe_wait_for_staging()
+
+        # Here we let the optimizer know that we need to calculate the
+        # norm at the next step
+        need_to_calculate_norm = (
+            self.config.metrics.log_norm_freq > 0
+            and self.metrics_processor.should_log(self.step)
+            and (self.step == 1 or self.step % self.config.metrics.log_norm_freq == 0)
+        )
+        if need_to_calculate_norm:
+            self.optimizers.calculate_norm_at_next_step()
+
+        optim_step_start = time.perf_counter()
+
         self.optimizers.step()
         self.lr_schedulers.step()
-
+        self.data_mix_scheduler.step(self.step + 1)
+        self.metrics_processor.optim_step_times.append(
+            time.perf_counter() - optim_step_start
+        )
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
         # log metrics
         if not self.metrics_processor.should_log(self.step):
             return
+
+        data_mix, data_sampled = self.data_mix_scheduler.get_log_dict_at_step(self.step)
 
         if parallel_dims.dp_cp_enabled:
             loss = loss.detach()
@@ -775,19 +887,68 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     loss_mesh,
                 ),
             )
+            ##############################################################
+            # to communicate the data sampled across ranks
+            keys = sorted(data_sampled.keys())
+            keys_actual_sample_ratio = [
+                k.replace("data_sampled/", "actual_sample_ratio/") for k in keys
+            ]
+            sum_data_sampled = torch.stack([data_sampled[k] for k in keys]).to(
+                self.device
+            )
+
+            sum_data_sampled = dist_utils.dist_sum(
+                sum_data_sampled,
+                parallel_dims.get_optional_mesh("loss"),
+                keep_tensor=True,
+            )
+            if self.prev_data_sampled_tensor is None:
+                self.prev_data_sampled_tensor = torch.zeros_like(sum_data_sampled)
+            delta_data_sampled = sum_data_sampled - self.prev_data_sampled_tensor
+            self.prev_data_sampled_tensor = sum_data_sampled.clone()
+
+            total_data_sampled = delta_data_sampled.sum() / 100 + 1e-20
+
+            data_sampled = {
+                k: int(sum_data_sampled[i].item()) for i, k in enumerate(keys)
+            }
+            actual_sample_ratio = delta_data_sampled / total_data_sampled
+            actual_sample_ratio_dict = {
+                k: actual_sample_ratio[i].item()
+                for i, k in enumerate(keys_actual_sample_ratio)
+            }
         else:
             global_avg_loss = global_max_loss = loss.detach().item()
             global_ntokens_seen = self.ntokens_seen
+            actual_sample_ratio_dict = {}
 
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+        extra_metrics.update(self.optimizers.get_lrs())
+        extra_metrics.update(data_mix)
+        extra_metrics.update(data_sampled)
+        extra_metrics.update(actual_sample_ratio_dict)
+
+        if need_to_calculate_norm:
+            param_norms = self.optimizers.get_parameter_norms()
+            extra_metrics.update(param_norms)
+
+        self.optimizers.join_log_queue()
+        for model_part in self.model_parts:
+            for layer in model_part.layers.values():
+                if not hasattr(layer, "moe") or not hasattr(
+                    layer.moe, "_log_expert_metrics"
+                ):
+                    continue
+                extra_metrics.update(layer.moe._log_expert_metrics)
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
             global_max_loss,
-            grad_norm.item(),
+            grad_norm.item() if grad_norm is not None else grad_norm,
             extra_metrics=extra_metrics,
         )
 
@@ -797,7 +958,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         self.checkpointer.load(step=config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}")
-
+        self.data_mix_scheduler.step(self.step)
+        # lets over write the weights for the first step in case the weights are not set in configs
+        # cause for now the data mixing scheduler is stateless
         with (
             maybe_enable_profiling(
                 config.profiling,
@@ -840,7 +1003,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 # (assuming lazy init and compilation are finished)
                 if self.step == 1:
                     dist_utils.set_pg_timeouts(
-                        timeout=timedelta(seconds=config.comm.train_timeout_seconds),
+                        timeout=datetime.timedelta(
+                            seconds=config.comm.train_timeout_seconds
+                        ),
                         parallel_dims=self.parallel_dims,
                     )
 

@@ -182,8 +182,10 @@ def generate_permute_indices(
     # total tokens for each expert (sum over ranks)
     total_tokens_per_expert = tokens_per_expert_group.view(num_ranks, -1).sum(0)
 
-    # pad out empty experts to alignment requirement
-    total_tokens_per_expert = torch.clamp_min(total_tokens_per_expert, alignment)
+    # pad out empty experts only when alignment > 1. For alignment=1 we keep
+    # exact token counts and avoid introducing artificial padding.
+    if alignment > 1:
+        total_tokens_per_expert = torch.clamp_min(total_tokens_per_expert, alignment)
 
     # align the chunk sizes (cdiv)
     m_sizes = ((total_tokens_per_expert + alignment - 1) // alignment * alignment).to(

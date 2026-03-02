@@ -4,6 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
+import math
+
+import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
@@ -121,9 +125,9 @@ def scaled_orthogonal_(
         pass in a transposed weight matrix, i.e. ``nn.init.xavier_uniform_(w.T, ...)``.
     """
     with torch.no_grad():
-        assert tensor.ndim == 2, (
-            "Fan in and fan out can not be computed for tensor with other than 2 dimensions"
-        )
+        assert (
+            tensor.ndim == 2
+        ), "Fan in and fan out can not be computed for tensor with other than 2 dimensions"
         fan_out, fan_in = tensor.shape
         scale = math.sqrt(fan_out / fan_in)
         gain *= scale
@@ -138,9 +142,9 @@ def image_orthogonal_(
 ):
     """Image domain initialization as specified in the Scion paper."""
     with torch.no_grad():
-        assert tensor.ndim == 2, (
-            "Fan in and fan out can not be computed for tensor with other than 2 dimensions"
-        )
+        assert (
+            tensor.ndim == 2
+        ), "Fan in and fan out can not be computed for tensor with other than 2 dimensions"
         fan_out, fan_in = tensor.shape
         scale = max(math.sqrt(fan_out / fan_in), 1.0)
         gain *= scale
@@ -235,3 +239,40 @@ def parse_depth_init(depth_init):
     else:
         raise ValueError(f"Unknown depth_init: {depth_init}")
     return depth_init
+
+
+def setup_depth_init(depth_init: str | None, layer_id: int, n_layers: int):
+    residual_div_attn = 1.0
+    residual_div_ffn = 1.0
+    match depth_init:
+        case "relative_depth":
+            residual_div_attn = (2 * (layer_id + 1)) ** 0.5
+            residual_div_ffn = (2 * (layer_id + 2)) ** 0.5
+        case "total_depth":
+            residual_div_attn = (2 * n_layers) ** 0.5
+            residual_div_ffn = (2 * n_layers) ** 0.5
+        case None:
+            residual_div_attn = 1.0
+            residual_div_ffn = 1.0
+        case _:
+            raise ValueError(f"Invalid depth_init: {depth_init}")
+    return residual_div_attn, residual_div_ffn
+
+
+def setup_residual_scale(residual_scale: str, n_layers: int):
+    block_scale, identity_scale = 1.0, 1.0
+    match residual_scale:
+        case "depth_scale":
+            total_depth = 2 * n_layers
+            block_scale = 1 / total_depth
+            identity_scale = (total_depth - 1) / total_depth
+        case "complete_p":
+            total_depth = 2 * n_layers
+            block_scale = 1 / total_depth
+            identity_scale = 1.0
+        case "identity":
+            block_scale = 1.0
+            identity_scale = 1.0
+        case _:
+            raise ValueError(f"Invalid residual_scale: {residual_scale}")
+    return block_scale, identity_scale

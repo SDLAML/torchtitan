@@ -36,11 +36,29 @@ class TrainingConfig:
     seq_len: int = 2048
     """Sequence length"""
 
+    load_balance_loss_weight: float | None = None
+    """Weight of MoE auxiliary loss term."""
+
+    load_balance_coeff: float = 0.001
+    """Speed of MoE router bias update."""
+
+    enable_token_mask_for_moe: bool = False
+    """Whether to enable token mask for MoE, mainly for SFT"""
+
     max_norm: float | int = 1.0
     """Max norm for gradient clipping"""
 
     steps: int = 10000
     """How many train steps to run"""
+
+    data_mixing_scheduler_configs: str | None = None
+    """Path to the mixing scheduler configs file
+    The mixing scheduler configs file should be a JSON file with the following format:
+    {
+        "step": [weights_for_dataset_0, weights_for_dataset_1, ...],
+    }
+    and key "0" must exist.
+    """
 
     enable_cpu_offload: bool = False
     """
@@ -128,6 +146,12 @@ class ParallelismConfig:
 
     enable_async_tensor_parallel: bool = False
     """Whether to apply async tensor parallel (currently only effective when compile is enabled)"""
+
+    tensor_parallel_only_attention: bool = False
+    """Whether to only apply tensor parallelism to the Attention part of the model."""
+
+    enable_approx_mid_norm_for_tensor_parallel: bool = False
+    """Whether to use an approximate mid-norm with tensor parallelism."""
 
     pipeline_parallel_degree: int = 1
     """
@@ -390,5 +414,5 @@ class DebugConfig:
     print_config: bool = False
     """Print the job configs to terminal"""
 
-    save_config_file: str | None = None
+    save_config_file: bool = True
     """Path to save job config into"""

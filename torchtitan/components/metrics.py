@@ -7,7 +7,7 @@
 import os
 import time
 from collections import namedtuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -133,15 +133,10 @@ class WandBLogger(BaseLogger):
     """Logger implementation for Weights & Biases."""
 
     def __init__(
-        
         self,
-       
         log_dir: str,
-       
         config_dict: dict[str, Any] | None = None,
-       
         tag: str | None = None,
-    ,
         project: str | None = None,
         group: str | None = None,
         name: str | None = None,
@@ -155,14 +150,19 @@ class WandBLogger(BaseLogger):
         # Create logging directory
         os.makedirs(log_dir, exist_ok=True)
 
+        tags = tag or os.getenv("WANDB_RUN_TAGS", None)
+        group = group or os.getenv("WANDB_RUN_GROUP", None)
+        name = name or os.getenv("WANDB_RUN_NAME", None)
+        project = project or os.getenv("WANDB_PROJECT", "torchtitan")
+
         self.wandb.init(
             entity=os.getenv("WANDB_TEAM", None),
-            project=os.getenv("WANDB_PROJECT", "torchtitan"),
-            name=os.getenv("WANDB_RUN_NAME", None),
+            project=project,
+            name=name,
             id=os.getenv("WANDB_RUN_ID", None),
             notes=os.getenv("WANDB_RUN_NOTES", None),
-            tags=os.getenv("WANDB_RUN_TAGS", None),
-            group=os.getenv("WANDB_RUN_GROUP", None),
+            tags=tags,
+            group=group,
             job_type=os.getenv("WANDB_RUN_JOB_TYPE", None),
             resume_from=os.getenv("WANDB_RESUME_FROM", None),
             fork_from=os.getenv("WANDB_FORK_FROM", None),
@@ -266,7 +266,7 @@ def _get_metrics_rank(
     return (world_size // pp_size) * (pp_size - 1)
 
 
-class MetricsProcessor:
+class MetricsProcessor(Configurable):
     """Metrics processor to processes the metrics and log metrics.
 
     The current MetricsProcessor log some metrics to STDOUT and some metrics to
@@ -342,7 +342,6 @@ class MetricsProcessor:
         Weights & Biases run name. Use `None` if neither this is given
         nor the `WANDB_RUN_NAME` environment variable set.
         """
-
 
     config: Config
     logger: BaseLogger
@@ -439,8 +438,7 @@ class MetricsProcessor:
             )
             should_log = torch.distributed.get_rank() == metrics_rank
 
-
-        if metrics_config.save_first_dp_and_tp and should_log:
+        if config.save_first_dp_and_tp and should_log:
             # The first data-parallel group
 
             is_dp_rank_0 = (
@@ -492,7 +490,12 @@ class MetricsProcessor:
             name = config.wandb_name
             try:
                 wandb_logger = WandBLogger(
-                    base_log_dir, config_dict, tag=tag, project=project, group=group, name=name
+                    base_log_dir,
+                    config_dict,
+                    tag=tag,
+                    project=project,
+                    group=group,
+                    name=name,
                 )
                 logger_container.add_logger(wandb_logger)
             except Exception as e:
@@ -517,9 +520,8 @@ class MetricsProcessor:
         step: int,
         global_avg_loss: float,
         global_max_loss: float,
-        grad_norm: float,
+        grad_norm: float | None = None,
         extra_metrics: dict[str, Any] | None = None,
-        extra_print_data: str = "",
     ):
         """
         Log training metrics including loss, throughput, and memory statistics.
@@ -601,6 +603,12 @@ class MetricsProcessor:
             "memory/num_ooms": device_mem_stats.num_ooms,
         }
 
+        if grad_norm is None:
+            del metrics["grad_norm"]
+            grad_norm_str = ""
+        else:
+            grad_norm_str = f"{self.color.orange}grad_norm: {grad_norm:7.4f}  "
+
         if extra_metrics:
             metrics.update(extra_metrics)
 
@@ -610,7 +618,7 @@ class MetricsProcessor:
         logger.info(
             f"{color.red}step: {step:2}  "
             f"{color.green}loss: {global_avg_loss:8.5f}  "
-            f"{color.orange}grad_norm: {grad_norm:7.4f}  "
+            f"{grad_norm_str}"
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
@@ -619,7 +627,6 @@ class MetricsProcessor:
             f"{color.yellow}iso_tps: {round(iso_tps):,}  "
             f"{color.cyan}iso_tflops: {iso_tflops:,.2f}  "
             f"{color.magenta}iso_mfu: {iso_mfu:.2f}%{color.reset}"
-            f"{extra_print_data}"
         )
 
         self.ntokens_since_last_log = 0

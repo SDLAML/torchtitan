@@ -6,27 +6,27 @@
 
 import logging
 import re
+from collections import defaultdict
 from typing import Any
 
+import torch
 from torch.distributed.tensor import DTensor
+
+from torchtitan.protocols.model import BaseModel
+from torchtitan.models.utils import MoEStateDictAdapter
 
 logger = logging.getLogger()
 
-from torchtitan.models.utils import MoEStateDictAdapter
 
-from .args import MoEModelArgs
-
-
-class MoEllamaStateDictAdapter(MoEStateDictAdapter):
+class OPTMoEStateDictAdapter(MoEStateDictAdapter):
     def __init__(
         self,
-        model_args: MoEModelArgs,
+        model_config: BaseModel.Config,
         hf_assets_path: str | None,
     ):
-        super().__init__(model_args, hf_assets_path)
+        super().__init__(model_config, hf_assets_path)
+        # self.model_config and self.hf_assets_path already set by MoEStateDictAdapter
 
-        self.model_args = model_args
-        self.hf_assets_path = hf_assets_path
         self.from_hf_map = {
             "model.embed_tokens.weight": "tok_embeddings.weight",
             "model.norm.weight": "norm.weight",
@@ -35,6 +35,7 @@ class MoEllamaStateDictAdapter(MoEStateDictAdapter):
             "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
             "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
             "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
+            "model.layers.{}.self_attn.gate_proj.weight": "layers.{}.attention.gate_proj.weight",
             "model.layers.{}.self_attn.rotary_emb.inv_freq": None,
             "model.layers.{}.mlp.gate_proj.weight": "layers.{}.feed_forward.w1.weight",
             "model.layers.{}.mlp.up_proj.weight": "layers.{}.feed_forward.w3.weight",
@@ -52,43 +53,10 @@ class MoEllamaStateDictAdapter(MoEStateDictAdapter):
             "model.layers.{}.mlp.shared_experts.down_proj.weight": "layers.{}.moe.shared_experts.w2.weight",
         }
 
-    # HuggingFace permutation function (exact copy from their conversion script)
-    def _permute(self, w, n_heads_arg, dim1=None, dim2=None):
-        if dim1 is None:
-            dim1 = w.shape[0]
-        if dim2 is None:
-            dim2 = w.shape[1]
-        return (
-            w.view(n_heads_arg, dim1 // n_heads_arg // 2, 2, dim2)
-            .transpose(1, 2)
-            .reshape(dim1, dim2)
-            .clone()
-        )
-
-    def _reverse_permute(self, w, n_heads_arg, dim1=None, dim2=None):
-        if dim1 is None:
-            dim1 = w.shape[0]
-        if dim2 is None:
-            dim2 = w.shape[1]
-        return (
-            w.view(n_heads_arg, 2, dim1 // n_heads_arg // 2, dim2)
-            .transpose(1, 2)
-            .reshape(dim1, dim2)
-        )
-
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        # Both native (apply_rotary_emb_cos_sin / rotate_half) and HF use the
+        # "consecutive halves" RoPE convention, so wq/wk weights are copied verbatim.
         to_hf_map = {v: k for k, v in self.from_hf_map.items()}
-
-        n_heads = self.model_args.n_heads
-        n_kv_heads = (
-            self.model_args.n_kv_heads
-            if self.model_args.n_kv_heads is not None
-            else n_heads
-        )
-        dim = self.model_args.dim
-        head_dim = (
-            dim // n_heads if not self.model_args.head_dim else self.model_args.head_dim
-        )
         hf_state_dict = {}
 
         for key, value in state_dict.items():
@@ -104,15 +72,19 @@ class MoEllamaStateDictAdapter(MoEStateDictAdapter):
             if "layers" in key:
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 layer_num = re.search(r"\d+", key).group(0)
+
+                if abstract_key not in to_hf_map:
+                    logger.warning("Skipping unknown state dict key: %s", key)
+                    continue
+
                 new_key = to_hf_map[abstract_key]
-                # We need to permute the weights in wq and wk layer in order to account for the difference between
-                # the native Llama and huggingface RoPE implementation.
+
                 if "moe.experts" in key:
                     # Store the GroupedExperts Weight metadata for from_hf()
                     if isinstance(value, DTensor):
-                        self.grouped_expert_weight_placements[
-                            abstract_key
-                        ] = value.placements
+                        self.grouped_expert_weight_placements[abstract_key] = (
+                            value.placements
+                        )
                         self.grouped_expert_weight_shape[abstract_key] = value.shape
 
                         # Split GroupedExperts weight to local individual expert weights
@@ -127,48 +99,43 @@ class MoEllamaStateDictAdapter(MoEStateDictAdapter):
                     else:
                         # keep this path for offline conversion
                         split_values = self._split_experts_weights(
-                            value, self.model_args.moe_args.num_experts
+                            value, self.model_config.layer.moe.num_experts
                         )
 
-                        for expert_num in range(self.model_args.moe_args.num_experts):
+                        for expert_num in range(
+                            self.model_config.layer.moe.num_experts
+                        ):
                             expert_new_key = new_key.format(layer_num, expert_num)
                             hf_state_dict[expert_new_key] = split_values[
                                 expert_num
                             ].squeeze()
                 else:
-                    if abstract_key == "layers.{}.attention.wq.weight":
-                        value = self._permute(value, n_heads)
-                    if abstract_key == "layers.{}.attention.wk.weight":
-                        key_value_dim = head_dim * n_kv_heads
-                        value = self._permute(value, n_kv_heads, key_value_dim, dim)
-
                     if new_key is None:
                         continue
                     new_key = new_key.format(layer_num)
                     hf_state_dict[new_key] = value
             else:
+                if key not in to_hf_map:
+                    logger.warning("Skipping unknown state dict key: %s", key)
+                    continue
                 new_key = to_hf_map[key]
                 hf_state_dict[new_key] = value
 
         return hf_state_dict
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError("from_hf is not implemented for MoEllama")
-        n_heads = self.model_args.n_heads
-        n_kv_heads = (
-            self.model_args.n_kv_heads
-            if self.model_args.n_kv_heads is not None
-            else n_heads
-        )
-        dim = self.model_args.dim
-        head_dim = dim // n_heads
         state_dict: dict[str, Any] = {}
 
         # Temporary storage for HF MoE expert weights before regrouping:
-        # keyed by (layer_num, param_kind) where param_kind in {"w1","w2","w3"}
+        # keyed by (layer_num, native_key_template) e.g. ("0", "layers.{}.moe.experts.w1")
         grouped_experts: dict[tuple[str, str], dict[int, Any]] = defaultdict(dict)
 
-        num_experts = self.model_args.moe_args.num_experts
+        # Guard for dense models that have no MoE layers (layer.moe is None)
+        num_experts = (
+            self.model_config.layer.moe.num_experts
+            if self.model_config.layer.moe is not None
+            else 0
+        )
 
         for key, value in hf_state_dict.items():
             if "layers" in key:
@@ -196,36 +163,14 @@ class MoEllamaStateDictAdapter(MoEStateDictAdapter):
                         # nothing to do (unknown key)
                         continue
 
-                    # Identify which of w1 / w2 / w3 this is
-                    if ".gate_proj.weight" in key:
-                        param_kind = "w1"
-                    elif ".up_proj.weight" in key:
-                        param_kind = "w3"
-                    elif ".down_proj.weight" in key:
-                        param_kind = "w2"
-                    else:
-                        logger.warning(
-                            "Unrecognized MoE expert projection key: %s", key
-                        )
-                        continue
-
-                    grouped_experts[(layer_num, param_kind)][expert_num] = value
+                    grouped_experts[(layer_num, new_key_template)][expert_num] = value
                     continue  # don't write directly into state_dict yet
 
                 # --- Non-expert layer parameters (attention, FFN, router, shared_experts, etc.) ---
+                # Both models use "consecutive halves" RoPE — q_proj/k_proj copied verbatim.
                 new_key_template = self.from_hf_map.get(abstract_key, None)
                 if new_key_template is None:
-                    continue
-
-                # Undo RoPE permutations
-                if abstract_key == "model.layers.{}.self_attn.q_proj.weight":
-                    value = self._reverse_permute(value, n_heads)
-                elif abstract_key == "model.layers.{}.self_attn.k_proj.weight":
-                    key_value_dim = head_dim * n_kv_heads
-                    value = self._reverse_permute(value, n_kv_heads, key_value_dim, dim)
-
-                if new_key_template is None:
-                    # e.g. rotary_emb.inv_freq
+                    # e.g. rotary_emb.inv_freq or unknown keys
                     continue
 
                 new_key = new_key_template.format(layer_num)
@@ -237,7 +182,7 @@ class MoEllamaStateDictAdapter(MoEStateDictAdapter):
                 state_dict[new_key] = value
 
         # --- Rebuild grouped-expert weights from per-expert HF tensors ---
-        for (layer_num, param_kind), experts_dict in grouped_experts.items():
+        for (layer_num, native_key_template), experts_dict in grouped_experts.items():
             # Expect indices [0, num_experts-1]; warn if incomplete
             missing = [i for i in range(num_experts) if i not in experts_dict]
             if missing:
@@ -245,7 +190,7 @@ class MoEllamaStateDictAdapter(MoEStateDictAdapter):
                     "Missing experts %s for layer %s param %s when regrouping MoE weights",
                     missing,
                     layer_num,
-                    param_kind,
+                    native_key_template,
                 )
 
             # Order by expert index; only keep those we actually have
@@ -255,7 +200,7 @@ class MoEllamaStateDictAdapter(MoEStateDictAdapter):
             # Stack along expert dimension to invert _split_experts_weights
             grouped_weight = torch.stack(ordered_weights, dim=0)
 
-            native_key = f"layers.{layer_num}.moe.experts.{param_kind}"
+            native_key = native_key_template.format(layer_num)
             state_dict[native_key] = grouped_weight
 
         return state_dict

@@ -1,10 +1,10 @@
 {
-  "model_type": "StagingMoEllama",
-  "architectures": ["StagingMoEllamaForCausalLM"],
+  "model_type": "OptMoE",
+  "architectures": ["OptMoEForCausalLM"],
   "auto_map": {
-    "AutoConfig": "configuration_staging_MoEllama.StagingMoEllamaConfig",
-    "AutoModel": "modeling_staging_MoEllama.StagingMoEllamaModel",
-    "AutoModelForCausalLM": "modeling_staging_MoEllama.StagingMoEllamaForCausalLM"
+    "AutoConfig": "configuration_opt_moe.OptMoEConfig",
+    "AutoModel": "modeling_opt_moe.OptMoEModel",
+    "AutoModelForCausalLM": "modeling_opt_moe.OptMoEForCausalLM"
   },
   "attention_bias": false,
   "attention_dropout": 0.0,
@@ -34,6 +34,12 @@
   "vocab_size": 128256,
   "qk_norm": true,
   "norm_everywhere": true,
+  "gated_attention_type": null,
+  "sliding_window_size": -1,
+  "rope_pattern": null,
+  "swa_pattern": null,
+  "rope_theta_swa": null,
+  "rope_scaling_swa": null,
   "torch_dtype": "bfloat16",
   "transformers_version": "4.57.3"
 }

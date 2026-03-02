@@ -4,14 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from functools import partial
 from random import Random
-
-from typing import Any
+from typing import Any, Callable
 
 import torch
+
 from datasets import Dataset, load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
@@ -23,7 +23,7 @@ from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 
 
-def inter_snapshot_every_n_steps(
+def infer_dataloader_snapshot_every_n_steps(
     checkpoint_enabled: bool, checkpoint_interval: int, gradient_accumulation_steps: int
 ) -> int:
     if checkpoint_enabled:
@@ -41,11 +41,6 @@ def list_tree_to_tuple(obj):
 def _process_simple_text(sample: dict[str, Any], key: str) -> str:
     """Process a simple custom dataset's sample text."""
     return sample[key]
-
-
-def _process_c4_text(sample: dict[str, Any]) -> str:
-    """Process C4 dataset sample text."""
-    return _process_simple_text(sample, "text")
 
 
 def _load_simple_dataset(
@@ -80,25 +75,17 @@ DATASETS = {
     "c4": DatasetConfig(
         path="allenai/c4",
         loader=partial(_load_c4_dataset, dataset_split="train"),
-        text_processor=partial(_process_simple_text, key="text"),
+        sample_processor=partial(_process_simple_text, key="text"),
     ),
     "c4_test": DatasetConfig(
         path="tests/assets/c4_test",
         loader=partial(_load_simple_dataset, dataset_split="train"),
-        text_processor=partial(_process_simple_text, key="text"),
+        sample_processor=partial(_process_simple_text, key="text"),
     ),
-    "c4_validation": DatasetArgs(
+    "c4_validation": DatasetConfig(
         path="allenai/c4",
         loader=partial(_load_c4_dataset, dataset_split="validation"),
-        text_processor=partial(_process_simple_text, key="text"),
-    ),
-    "fineweb": DatasetArgs(
-        path="HuggingFaceFW/fineweb",
-        name="default",
-        files=None,
-        split="train",
-        streaming=True,
-        key="text",
+        sample_processor=partial(_process_simple_text, key="text"),
     ),
     "simple_custom": None,
 }
@@ -133,11 +120,11 @@ def _validate_dataset(
                 dataset_split,
                 dataset_streaming,
             ),
-            text_processor=lambda sample: _process_simple_text(sample, dataset_key),
+            sample_processor=lambda sample: _process_simple_text(sample, dataset_key),
         )
     path = dataset_path or config.path
     logger.info(f"Preparing {dataset_name} dataset from {path}")
-    return path, config.loader, config.text_processor
+    return path, config.loader, config.sample_processor
 
 
 class HuggingFaceDataset(IterableDataset, Stateful):
@@ -158,7 +145,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         # Force lowercase for consistent comparison
         dataset_name = dataset_name.lower()
 
-        path, dataset_loader, text_processor = _validate_dataset(
+        path, dataset_loader, sample_processor = _validate_dataset(
             dataset_name=dataset_name,
             dataset_path=dataset_path,
             dataset_inner_name=dataset_inner_name,
@@ -174,7 +161,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
         self._tokenizer = tokenizer
         self.infinite = infinite
-        self._text_processor = text_processor
+        self._sample_processor = sample_processor
 
         # Variables for checkpointing
         self._sample_idx = 0
@@ -197,7 +184,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                 self._sample_idx += 1
                 # Use the dataset-specific text processor
                 try:
-                    sample_text = self._text_processor(sample)
+                    sample_text = self._sample_processor(sample)
                 except Exception:
                     # bad row / missing key / load error -> skip, but state is correct
                     continue
@@ -303,9 +290,9 @@ class MixedDataset(IterableDataset, Stateful):
         return dataset_index
 
     def set_weights(self, weights: list[float]):
-        assert len(weights) == len(self.datasets), (
-            "weights must have the same length as datasets"
-        )
+        assert len(weights) == len(
+            self.datasets
+        ), "weights must have the same length as datasets"
         w = torch.tensor(weights, dtype=torch.float64)
         w[self.removed] = 0.0
         self.weights.copy_(w)
@@ -517,117 +504,6 @@ def _replace_none_with_literal(xs: list[str] | None) -> list[str | None] | None:
     return xs
 
 
-class HuggingFaceTextDataset(IterableDataset, Stateful):
-    def __init__(
-        self,
-        dataset_name: str,
-        dataset_path: str | None,
-        tokenizer: BaseTokenizer,
-        seq_len: int = 2048,
-        dp_rank: int = 0,
-        dp_world_size: int = 1,
-        infinite: bool = False,
-        num_mtp_tokens: int = 0,
-        dataset_inner_name: str | None = None,
-        dataset_files: str | Sequence[str] | None = None,
-        dataset_split: str = "train",
-        dataset_streaming: bool = False,
-        dataset_key: str = "text",
-    ) -> None:
-        # Force lowercase for consistent comparison
-        dataset_name = dataset_name.lower()
-
-        path, dataset_loader, text_processor = _validate_dataset(
-            dataset_name=dataset_name,
-            dataset_path=dataset_path,
-            dataset_inner_name=dataset_inner_name,
-            dataset_files=dataset_files,
-            dataset_split=dataset_split,
-            dataset_streaming=dataset_streaming,
-            dataset_key=dataset_key,
-        )
-        ds = dataset_loader(path)
-
-        self.dataset_name = dataset_name
-        self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
-        self._tokenizer = tokenizer
-        self.seq_len = seq_len
-        self.infinite = infinite
-        self.num_mtp_tokens = num_mtp_tokens
-        self._text_processor = text_processor
-
-        # Variables for checkpointing
-        self._sample_idx = 0
-        self._token_buffer: list[int] = []
-
-    def _get_data_iter(self):
-        # For map-style datasets, resume by skipping to the correct index
-        # For iterable-style datasets, the underlying iterator already points to the correct index
-        if isinstance(self._data, Dataset):
-            if self._sample_idx == len(self._data):
-                return iter([])
-            else:
-                return iter(self._data.skip(self._sample_idx))
-
-        return iter(self._data)
-
-    def __iter__(self):
-        max_buffer_token_len = 1 + self.seq_len + self.num_mtp_tokens
-
-        while True:
-            for sample in self._get_data_iter():
-                # Use the dataset-specific text processor
-                sample_text = self._text_processor(sample)
-                sample_tokens = self._tokenizer.encode(
-                    sample_text, add_bos=True, add_eos=True
-                )
-                self._token_buffer.extend(sample_tokens)
-                self._sample_idx += 1
-
-                while len(self._token_buffer) >= max_buffer_token_len:
-                    x = torch.LongTensor(self._token_buffer[:max_buffer_token_len])
-                    # update tokens to the remaining tokens
-                    self._token_buffer = self._token_buffer[max_buffer_token_len:]
-                    input = x[:-1]
-                    label = x[1:]
-                    yield {"input": input}, label
-
-            if not self.infinite:
-                logger.warning(f"Dataset {self.dataset_name} has run out of data")
-                break
-            else:
-                # Reset offset for the next iteration
-                self._sample_idx = 0
-                logger.warning(f"Dataset {self.dataset_name} is being re-looped")
-                # Ensures re-looping a dataset loaded from a checkpoint works correctly
-                if not isinstance(self._data, Dataset):
-                    if hasattr(self._data, "set_epoch") and hasattr(
-                        self._data, "epoch"
-                    ):
-                        self._data.set_epoch(self._data.epoch + 1)
-
-    def load_state_dict(self, state_dict):
-        self._token_buffer = state_dict["token_buffer"]
-
-        if isinstance(self._data, Dataset):
-            self._sample_idx = state_dict["sample_idx"]
-        else:
-            assert "data" in state_dict
-            self._data.load_state_dict(state_dict["data"])
-
-    def state_dict(self):
-        _state_dict: dict[str, Any] = {"token_buffer": self._token_buffer}
-
-        if isinstance(self._data, Dataset):
-            _state_dict["sample_idx"] = self._sample_idx
-        else:
-            # Save the iterable dataset's state to later efficiently resume from it
-            # https://huggingface.co/docs/datasets/v3.5.0/en/stream#save-a-dataset-checkpoint-and-resume-iteration
-            _state_dict["data"] = self._data.state_dict()
-
-        return _state_dict
-
-
 class HuggingFaceTextDataLoader(ParallelAwareDataloader):
     """Configurable text dataloader that wraps HuggingFaceTextDataset.
 
@@ -637,11 +513,69 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
 
     @dataclass(kw_only=True, slots=True)
     class Config(ParallelAwareDataloader.Config):
-        dataset: str = "c4_test"
+        infinite: bool = True
+        """Whether to loop the dataset indefinitely"""
+
+        dataset: list[str] = field(default_factory=lambda: ["c4_test"])
         """Dataset to use"""
 
-        infinite: bool = True
-        """Whether to loop the dataset infinitely"""
+        dataset_path: list[str] | None = None
+        """
+        Path to the dataset in the file system. If provided, data will be
+        loaded from this path instead of downloaded.
+        Entries with string "None" will be replaced with the Python literal `None`.
+        """
+
+        dataset_seed: int | None = None
+        """
+        Choose the base RNG seed used for data shuffling. By default,
+        use the same as `training.seed`.
+        """
+
+        dataset_shuffle_buffer_size: int = 0
+        """Buffer size of windowed shuffling buffer. 0 means no shuffling (the default)."""
+
+        dataset_weights: list[str] | None = None
+        """
+        Probability of sampling from each dataset, separated by commas.
+        If not given, sample uniformly.
+        """
+
+        dataset_mix_in_seq: bool = False
+        """
+        Whether to also mix datasets in the sequence dimension during
+        packing. If not given, only mix in batch dimension.
+        """
+
+        dataset_inner_name: list[str] | None = None
+        """
+        Dataset name to use (`name` argument of `datasets.load_dataset`).
+        Entries with string "None" will be replaced with the Python literal `None`.
+        """
+
+        dataset_files: list[str] | None = None
+        """Dataset files to use (only necessary for certain types of datasets)"""
+
+        dataset_split: list[str] = field(default_factory=lambda: ["train"])
+        """Dataset split to use"""
+
+        dataset_streaming: bool = False
+        """Whether to stream the dataset"""
+
+        dataset_key: list[str] = field(default_factory=lambda: ["text"])
+        """Key to use for extracting the relevant text data from the dataset's samples"""
+
+        data_mixing_scheduler_configs: str | None = None
+        """Path to the mixing scheduler configs file
+        The mixing scheduler configs file should be a JSON file with the following format:
+        {
+            "step": [weights_for_dataset_0, weights_for_dataset_1, ...],
+        }
+        and key "0" must exist.
+        """
+
+        drop_long_samples: bool = False
+        """Whether to drop samples longer than the sequence length"""
 
     def __init__(
         self,
@@ -684,54 +618,54 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         )
         drop_long_samples = config.drop_long_samples
 
-    if len(dataset_name) > 1:
-        assert dataset_files is None, (
-            "cannot supply dataset files when using multiple datasets"
-        )
-    for d in [
-        dataset_path,
-        dataset_inner_name,
-        dataset_split,
-        dataset_key,
-        dataset_weights,
-    ]:
-        assert len(d) == normed_list_length, (
-            f"list {d} does not match length of list of datasets (length = {normed_list_length})"
-        )
-    hf_datasets = []
-    for d_name, d_path, d_inner_name, d_split, d_key in zip(
-        dataset_name,
-        dataset_path,
-        dataset_inner_name,
-        dataset_split,
-        dataset_key,
-    ):
-        hf_ds = HuggingFaceDataset(
-            dataset_name=d_name,
-            dataset_path=d_path,
-            tokenizer=tokenizer,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            infinite=infinite,
-            dataset_inner_name=d_inner_name,
-            dataset_files=dataset_files,
-            dataset_split=d_split,
-            dataset_streaming=dataset_streaming,
-            dataset_key=d_key,
-        )
-        if not dataset_mix_in_seq:
-            hf_ds = GreedyPackedDataset(
-                dataset=hf_ds,
-                seq_len=seq_len,
+        if len(dataset_name) > 1:
+            assert (
+                dataset_files is None
+            ), "cannot supply dataset files when using multiple datasets"
+        for d in [
+            dataset_path,
+            dataset_inner_name,
+            dataset_split,
+            dataset_key,
+            dataset_weights,
+        ]:
+            assert (
+                len(d) == normed_list_length
+            ), f"list {d} does not match length of list of datasets (length = {normed_list_length})"
+        hf_datasets = []
+        for d_name, d_path, d_inner_name, d_split, d_key in zip(
+            dataset_name,
+            dataset_path,
+            dataset_inner_name,
+            dataset_split,
+            dataset_key,
+        ):
+            hf_ds = HuggingFaceDataset(
+                dataset_name=d_name,
+                dataset_path=d_path,
+                tokenizer=tokenizer,
+                dp_rank=dp_rank,
+                dp_world_size=dp_world_size,
                 infinite=infinite,
-                num_mtp_tokens=num_mtp_tokens,
-                drop_long_samples=drop_long_samples,
+                dataset_inner_name=d_inner_name,
+                dataset_files=dataset_files,
+                dataset_split=d_split,
+                dataset_streaming=dataset_streaming,
+                dataset_key=d_key,
             )
-        hf_datasets.append(hf_ds)
+            if not dataset_mix_in_seq:
+                hf_ds = GreedyPackedDataset(
+                    dataset=hf_ds,
+                    seq_len=seq_len,
+                    infinite=infinite,
+                    drop_long_samples=drop_long_samples,
+                )
+            hf_datasets.append(hf_ds)
 
         # First pack, then mix → data is only mixed in batch dimension.
         # First mix, then pack → data is also mixed inside packed sample.
         hf_ds = MixedDataset(hf_datasets, dp_rank, dataset_weights, seed=seed)
+
         if dataset_mix_in_seq:
             hf_ds = GreedyPackedDataset(
                 dataset=hf_ds,
@@ -744,9 +678,6 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             snapshot_every_n_steps = 1
         else:
             snapshot_every_n_steps = snapshot_every_n_steps
-        logger.info(
-            f" [DataLoader] snapshot_every_n_steps is set to {snapshot_every_n_steps}"
-        )
 
         dataloader_kwargs = {
             "num_workers": config.num_workers,

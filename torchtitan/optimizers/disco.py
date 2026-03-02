@@ -198,6 +198,14 @@ class DiSCO(AbstractDiSCO):
         )
 
         super().__init__(params, defaults, is_light=is_light)
+
+        if debug_mode:
+            # Force all groups to identity/none in debug mode. This must mutate
+            # param_groups directly because step() refreshes groups_info from them.
+            for group in self.param_groups:
+                group["norm_factor"] = "none"
+                group["backend"] = "identity"
+
         # Register light-mode grad state hooks if needed
         self.setup_light_state_hooks()
 
@@ -211,8 +219,8 @@ class DiSCO(AbstractDiSCO):
             wd = group["weight_decay"]
             param_kwargs = {
                 "eps": group["eps"],
-                "norm_factor": group["norm_factor"] if not debug_mode else "none",
-                "zeropower_backend": group["backend"] if not debug_mode else "identity",
+                "norm_factor": group["norm_factor"],
+                "zeropower_backend": group["backend"],
                 "backend_steps": group["backend_steps"],
                 "splits_into": group["splits_into"],
                 "splits_dim": group["splits_dim"],
@@ -270,12 +278,12 @@ class DiSCO(AbstractDiSCO):
 
                 # 1) scalar branch identical to step()
                 if p.numel() == 1:
-                    assert (
-                        group["backend"] == "identity"
-                    ), "scale params must use identity backend"
-                    assert (
-                        group["norm_factor"] == "sign"
-                    ), "scale params must use sign norm factor"
+                    assert group["backend"] == "identity", (
+                        "scale params must use identity backend"
+                    )
+                    assert group["norm_factor"] == "sign", (
+                        "scale params must use sign norm factor"
+                    )
                     self.scale_params.append(p)
                     self.scale_param_names.append(p_name)
                     continue
@@ -911,7 +919,31 @@ class DiSCO(AbstractDiSCO):
         world_size = fsdp_mesh.size()
 
         # Keep the original expert split (2 blocks). Stream pool can still be larger.
-        self._expert_blocks = [(0, L), (L, 3 * L)]
+        def _shape_key(idx: int) -> tuple[int, int]:
+            p = self.expert_params[idx]
+            return (int(p.shape[1]), int(p.shape[2]))
+
+        s0 = _shape_key(0)
+        s1 = _shape_key(L)
+        s2 = _shape_key(2 * L)
+        if s0 == s1 and s1 != s2:
+            self._expert_blocks = [(0, 2 * L), (2 * L, 3 * L)]
+        elif s0 != s1 and s1 == s2:
+            self._expert_blocks = [(0, L), (L, 3 * L)]
+        elif s0 == s1 and s1 == s2:
+            self._expert_blocks = [(0, 3 * L)]
+        else:
+            # Unexpected ordering/layout: fallback to contiguous shape-homogeneous blocks.
+            shape_keys: list[tuple[int, int]] = [_shape_key(i) for i in range(total)]
+            blocks: list[tuple[int, int]] = []
+            start = 0
+            for i in range(1, total):
+                if shape_keys[i] != shape_keys[i - 1]:
+                    blocks.append((start, i))
+                    start = i
+            blocks.append((start, total))
+            self._expert_blocks = blocks
+
         self._expert_ep_per_rank = math.ceil(
             self.expert_params[0].shape[0] / world_size
         )
@@ -1756,9 +1788,9 @@ class DiSCO(AbstractDiSCO):
         for k, g_local in enumerate(block_effective_grads):
             if g_local is None:
                 continue
-            assert (
-                g_local.ndim == 3
-            ), "Batching path assumes MoE expert weights are 3-D."
+            assert g_local.ndim == 3, (
+                "Batching path assumes MoE expert weights are 3-D."
+            )
             if g_local.shape[0] == 0:
                 continue
             if k >= len(dst_views_pre):
@@ -2905,13 +2937,13 @@ class DiSCO(AbstractDiSCO):
 
                 for norm_idx, norm_name in enumerate(self.norms_to_log):
                     idx = base + norm_idx
-                    final_norms[
-                        f"track_update_{norm_name}/{cleaned_p_name}"
-                    ] = gathered_update_norms[idx]
+                    final_norms[f"track_update_{norm_name}/{cleaned_p_name}"] = (
+                        gathered_update_norms[idx]
+                    )
                     if apply_on_weight and gathered_weight_norms is not None:
-                        final_norms[
-                            f"track_param_{norm_name}/{cleaned_p_name}"
-                        ] = gathered_weight_norms[idx]
+                        final_norms[f"track_param_{norm_name}/{cleaned_p_name}"] = (
+                            gathered_weight_norms[idx]
+                        )
 
         if self.is_dp_rank_0:
             self.norms_at_current_step.update(final_norms)
@@ -3244,7 +3276,6 @@ class DiSCO(AbstractDiSCO):
                 norms_of_update,
                 norms_of_weight,
                 fsdp_mesh,
-                rank,
                 device,
                 fsdp_param_names,
                 world_size,

@@ -41,7 +41,7 @@ def l1_to_rms_norm(W):
 
 
 @torch.no_grad()
-def rms_to_l1_norm(W):
+def rms_to_inf_norm(W):
     assert W.ndim == 2, "operator norm can only be applied to matrices"
     norm = torch.max(
         torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32)
@@ -96,7 +96,7 @@ def effective_rank(W):
 NORM_FUNCTIONS = {
     "rms_to_rms": rms_to_rms_norm,
     "l1_to_rms": l1_to_rms_norm,
-    "rms_to_l1": rms_to_l1_norm,
+    "rms_to_inf": rms_to_inf_norm,
     "supremum": supremum_norm,
     "condition_number": condition_number,
     "frobenius_norm": frobenius_norm,
@@ -106,8 +106,10 @@ NORM_FUNCTIONS = {
 }
 
 
+# here we use allow dynamic is to support the DDP running
 @torch.no_grad()
-@torch.compile(fullgraph=True)
+@torch.compile(dynamic=True)
+# @torch.compile(fullgraph=True)
 def fused_metrics(W, eps=1e-20):
     if W.ndim < 2:
         # Operator norms require a matrix.
@@ -125,7 +127,7 @@ def fused_metrics(W, eps=1e-20):
     col_l2 = colsqsum.sqrt()
 
     l1_to_rms = col_l2.max() / math.sqrt(fan_out)
-    rms_to_l1 = row_l2.max() * math.sqrt(fan_in)
+    rms_to_inf = row_l2.max() * math.sqrt(fan_in)
 
     S = torch.linalg.svdvals(Wf, driver="gesvd")
 
@@ -148,7 +150,7 @@ def fused_metrics(W, eps=1e-20):
     return {
         "rms_to_rms": spec,
         "l1_to_rms": l1_to_rms,
-        "rms_to_l1": rms_to_l1,
+        "rms_to_inf": rms_to_inf,
         "supremum": sup,
         "condition_number": cond,
         "frobenius_norm": frob_norm,
@@ -158,23 +160,68 @@ def fused_metrics(W, eps=1e-20):
     }
 
 
+def get_norms_to_log(norms_to_log: str | list[str]) -> list[str]:
+    """
+    Return a list of norms to log.
+    The following contents in `norms_to_log` are special:
+    - "default": replaced by
+                 ["rms_to_rms", "l1_to_rms", "rms_to_inf", "supremum", "condition_number"]
+    - "all" or "everything": log all norms
+    """
+    if isinstance(norms_to_log, str):
+        norms_to_log = [norms_to_log]
+    # Remove duplicates while keeping order.
+    norms_to_log = list(dict.fromkeys(norms_to_log))
+
+    if "all" in norms_to_log or "everything" in norms_to_log:
+        return list(NORM_FUNCTIONS.keys())
+
+    if "default" in norms_to_log:
+        # Replace the "default" entry.
+        update_index = norms_to_log.index("default")
+        norms_to_log = (
+            norms_to_log[:update_index]
+            + [
+                "rms_to_rms",
+                "l1_to_rms",
+                "rms_to_inf",
+                "supremum",
+                "condition_number",
+            ]
+            + norms_to_log[update_index + 1 :]
+        )
+
+    return norms_to_log
+
+
 def calculate_norm(
     W: torch.Tensor,
+    norms_to_log: list[str] | None = None,
     transpose: bool = False,
     use_fused_metrics: bool = True,
 ) -> dict[str, torch.Tensor]:
     """
     It is important to note that the order of the norms is the same
-    as the order of `NORM_FUNCTIONS.keys()`.
+    as the order of `norms_to_log`.
+
+    we expect the weights to be [D_out, D_in], otherwise, we need to set `transpose` to True
     """
+    if norms_to_log is None:
+        norms_to_log = list(NORM_FUNCTIONS.keys())
+
     W = W.to_local() if isinstance(W, DTensor) else W
+
+    if W.ndim == 1 and W.numel() > 1:
+        # we will expand the 1D tensor to a diagonal matrix
+        original_shape = W.shape
+        W = torch.diag_embed(W)
+
     if transpose:
         W = W.transpose(0, 1)
     if use_fused_metrics:
         norms = fused_metrics(W)
+        norms = {norm_name: norms[norm_name] for norm_name in norms_to_log}
     else:
-        norms = {
-            norm_name: norm_fn(W) for (norm_name, norm_fn) in NORM_FUNCTIONS.items()
-        }
+        norms = {norm_name: NORM_FUNCTIONS[norm_name](W) for norm_name in norms_to_log}
 
     return norms

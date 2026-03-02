@@ -30,11 +30,59 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple, TransformersKwargs
 
-from .configuration_staging_MoEllama import StagingMoEllamaConfig
+from .configuration_opt_moe import OptMoEConfig
+
+
+# ---------------------------------------------------------------------------
+# Helper: parse per-layer pattern strings ("RRRN", "SSSF") into bool lists
+# ---------------------------------------------------------------------------
+
+
+def _parse_pattern(
+    pattern: "str | list | None",
+    n_layers: int,
+    true_char: str,
+    false_char: str,
+    default: bool = True,
+) -> "list[bool]":
+    """Convert a layer pattern to a list of booleans.
+
+    Args:
+        pattern: None, a string like "RRRN"/"SSSF", or a list of bool/str.
+        n_layers: Number of layers.
+        true_char: Character that maps to True (e.g. 'R' or 'S').
+        false_char: Character that maps to False (e.g. 'N' or 'F').
+        default: Default value when pattern is None.
+    """
+    if pattern is None:
+        return [default] * n_layers
+    if isinstance(pattern, (list, tuple)):
+        result = []
+        for v in pattern:
+            if isinstance(v, bool):
+                result.append(v)
+            elif isinstance(v, str):
+                result.append(v.upper() == true_char.upper())
+            else:
+                result.append(bool(v))
+        return result
+    # string
+    result = []
+    for c in pattern:
+        if c.upper() == true_char.upper():
+            result.append(True)
+        elif c.upper() == false_char.upper():
+            result.append(False)
+        else:
+            raise ValueError(
+                f"Unknown character '{c}' in pattern '{pattern}'. "
+                f"Expected '{true_char}' or '{false_char}'."
+            )
+    return result
 
 
 @use_kernel_forward_from_hub("RMSNorm")
-class StagingMoEllamaRMSNorm(nn.Module):
+class OptMoERMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
         LlamaRMSNorm is equivalent to T5LayerNorm
@@ -53,10 +101,10 @@ class StagingMoEllamaRMSNorm(nn.Module):
         return f"eps={self.variance_epsilon}"
 
 
-class StagingMoEllamaRotaryEmbedding(nn.Module):
+class OptMoERotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
-    def __init__(self, config: StagingMoEllamaConfig, device=None):
+    def __init__(self, config: OptMoEConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
@@ -180,10 +228,10 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-class StaginMoEllamaAttention(nn.Module):
+class OptMoEAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: StagingMoEllamaConfig, layer_idx: int):
+    def __init__(self, config: OptMoEConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -220,20 +268,37 @@ class StaginMoEllamaAttention(nn.Module):
 
         qk_norm = config.qk_norm or config.norm_everywhere
         if qk_norm:
-            self.q_norm = StagingMoEllamaRMSNorm(self.head_dim, config.rms_norm_eps)
-            self.k_norm = StagingMoEllamaRMSNorm(self.head_dim, config.rms_norm_eps)
+            self.q_norm = OptMoERMSNorm(self.head_dim, config.rms_norm_eps)
+            self.k_norm = OptMoERMSNorm(self.head_dim, config.rms_norm_eps)
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
 
         if config.norm_everywhere:
-            self.v_norm = StagingMoEllamaRMSNorm(self.head_dim, config.rms_norm_eps)
-            self.mid_norm = StagingMoEllamaRMSNorm(
-                config.hidden_size, config.rms_norm_eps
-            )
+            self.v_norm = OptMoERMSNorm(self.head_dim, config.rms_norm_eps)
+            self.mid_norm = OptMoERMSNorm(config.hidden_size, config.rms_norm_eps)
         else:
             self.v_norm = nn.Identity()
             self.mid_norm = nn.Identity()
+
+        # Gated attention: head-wise or element-wise gate projection
+        self.gated_attention_type = getattr(config, "gated_attention_type", None)
+        if self.gated_attention_type == "head-wise":
+            self.gate_proj = nn.Linear(
+                config.hidden_size, config.num_attention_heads, bias=False
+            )
+        elif self.gated_attention_type == "element-wise":
+            self.gate_proj = nn.Linear(
+                config.hidden_size,
+                config.num_attention_heads * self.head_dim,
+                bias=False,
+            )
+
+        # Per-layer flags — set by OptMoEModel after layer creation
+        self.use_rope: bool = True
+        # True when this layer is a SWA layer that should use rotary_emb_swa
+        # (i.e. rope_theta_swa is configured and this layer uses SWA + RoPE)
+        self.use_swa_rope: bool = False
 
     def forward(
         self,
@@ -255,13 +320,18 @@ class StaginMoEllamaAttention(nn.Module):
         key_states = self.k_norm(key_states.contiguous())
         value_states = self.v_norm(value_states.contiguous())
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin
-        )
+        # Apply RoPE only for layers that use positional encoding
+        if self.use_rope and position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin
+            )
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            if self.use_rope and position_embeddings is not None:
+                cos, sin = position_embeddings
+            else:
+                cos, sin = None, None
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
@@ -284,13 +354,26 @@ class StaginMoEllamaAttention(nn.Module):
             **kwargs,
         )
 
+        # Apply gated attention output (head-wise or element-wise)
+        if self.gated_attention_type is not None:
+            gate = torch.sigmoid(self.gate_proj(hidden_states).to(attn_output.dtype))
+            if self.gated_attention_type == "head-wise":
+                # gate: [bs, seq, n_heads] → [bs, seq, n_heads, 1] for broadcasting
+                bsz, seq_len = hidden_states.shape[:2]
+                n_heads = self.config.num_attention_heads
+                gate = gate.unsqueeze(-1)  # [bs, seq, n_heads, 1]
+                attn_output = attn_output.view(bsz, seq_len, n_heads, self.head_dim)
+                attn_output = (attn_output * gate).view(bsz, seq_len, -1)
+            else:  # element-wise
+                attn_output = attn_output.reshape(*input_shape, -1) * gate
+
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.mid_norm(attn_output)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
 
-class StagingMoEllamaMLP(nn.Module):
+class OptMoEMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -308,9 +391,7 @@ class StagingMoEllamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
         if config.norm_everywhere:
-            self.mid_norm = StagingMoEllamaRMSNorm(
-                self.hidden_size, config.rms_norm_eps
-            )
+            self.mid_norm = OptMoERMSNorm(self.intermediate_size, config.rms_norm_eps)
         else:
             self.mid_norm = nn.Identity()
 
@@ -320,7 +401,7 @@ class StagingMoEllamaMLP(nn.Module):
         )
 
 
-class StagingMoEllamaSharedExperts(nn.Module):
+class OptMoESharedExperts(nn.Module):
     def __init__(
         self,
         hidden_size,
@@ -337,7 +418,7 @@ class StagingMoEllamaSharedExperts(nn.Module):
         self.act_fn = ACT2FN[hidden_act]
 
         if norm_everywhere:
-            self.mid_norm = StagingMoEllamaRMSNorm(hidden_size, rms_norm_eps)
+            self.mid_norm = OptMoERMSNorm(moe_intermediate_size, rms_norm_eps)
         else:
             self.mid_norm = nn.Identity()
 
@@ -351,7 +432,7 @@ class StagingMoEllamaSharedExperts(nn.Module):
 
 
 class TokenChoiceTopKRouter(nn.Module):
-    force_gate_on_fp32: bool = False
+    force_router_on_fp32: bool = False
 
     def __init__(self, dim, num_experts, top_k, route_scale):
         super().__init__()
@@ -365,7 +446,7 @@ class TokenChoiceTopKRouter(nn.Module):
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # scores shape (bs*slen, num_experts)
-        if self.force_gate_on_fp32:
+        if self.force_router_on_fp32:
             with torch.autocast(x.device, dtype=torch.float32):
                 scores = self.gate(x)
         else:
@@ -392,15 +473,15 @@ class TokenChoiceTopKRouter(nn.Module):
         return selected_experts_indices, top_scores
 
 
-class StagingMoEllamaMoE(nn.Module):
+class OptMoEMoE(nn.Module):
     experts_parallel_enabled = False
 
     def __init__(
         self,
-        config: StagingMoEllamaConfig,
+        config: OptMoEConfig,
     ):
         super().__init__()
-        self.shared_experts = StagingMoEllamaSharedExperts(
+        self.shared_experts = OptMoESharedExperts(
             hidden_size=config.hidden_size,
             moe_intermediate_size=config.moe_intermediate_size,
             norm_everywhere=config.norm_everywhere,
@@ -410,7 +491,7 @@ class StagingMoEllamaMoE(nn.Module):
 
         self.experts = nn.ModuleList(
             [
-                StagingMoEllamaSharedExperts(
+                OptMoESharedExperts(
                     hidden_size=config.hidden_size,
                     moe_intermediate_size=config.moe_intermediate_size,
                     norm_everywhere=config.norm_everywhere,
@@ -428,12 +509,8 @@ class StagingMoEllamaMoE(nn.Module):
             route_scale=config.moe_scaling_factor,
         )
 
-        # self.register_buffer(
-        #     "expert_bias", torch.zeros(config.n_total_experts, dtype=torch.float32)
-        # )
-        self.expert_bias = torch.nn.Parameter(
-            torch.zeros(config.n_total_experts, dtype=torch.float32),
-            requires_grad=False,  # set True if you trained it
+        self.register_buffer(
+            "expert_bias", torch.zeros(config.n_total_experts, dtype=torch.float32)
         )
 
     @torch.no_grad()
@@ -521,23 +598,28 @@ class StagingMoEllamaMoE(nn.Module):
         return y
 
 
-class StagingMoEllamaDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: StagingMoEllamaConfig, layer_idx: int):
+class OptMoEDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: OptMoEConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
 
-        self.self_attn = StaginMoEllamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = OptMoEAttention(config=config, layer_idx=layer_idx)
 
         if layer_idx < config.n_dense_layers:
-            self.mlp = StagingMoEllamaMLP(config)
+            self.mlp = OptMoEMLP(config)
         else:
-            self.mlp = StagingMoEllamaMoE(config)
-        self.input_layernorm = StagingMoEllamaRMSNorm(
+            self.mlp = OptMoEMoE(config)
+        self.input_layernorm = OptMoERMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = StagingMoEllamaRMSNorm(
+        self.post_attention_layernorm = OptMoERMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+        # Per-layer sliding window size (-1 = full attention, >0 = SWA).
+        # Set by OptMoEModel after construction.
+        self.sliding_window: int = -1
 
     def forward(
         self,
@@ -555,10 +637,39 @@ class StagingMoEllamaDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
+        # Apply sliding window mask for SWA layers
+        layer_attention_mask = attention_mask
+        if self.sliding_window > 0 and attention_mask is not None:
+            # Mask out positions that fall outside the sliding window.
+            # attention_mask is [bs, 1, q_len, k_len] with 0 for attended, large-neg for masked.
+            seq_len = hidden_states.shape[1]
+            if attention_mask.dim() == 4:
+                k_len = attention_mask.shape[-1]
+                # Build a sliding-window boolean mask: True where |q_pos - k_pos| >= window
+                q_pos = (
+                    cache_position.unsqueeze(-1)
+                    if cache_position is not None
+                    else torch.arange(seq_len, device=hidden_states.device).unsqueeze(
+                        -1
+                    )
+                )
+                k_pos = torch.arange(k_len, device=hidden_states.device).unsqueeze(0)
+                swa_mask = (q_pos - k_pos) >= self.sliding_window  # [q, k]
+                swa_bias = torch.zeros_like(attention_mask)
+                swa_bias[:, :, :seq_len, :] = torch.where(
+                    swa_mask.unsqueeze(0).unsqueeze(0),
+                    torch.full_like(
+                        swa_bias[:, :, :seq_len, :],
+                        torch.finfo(hidden_states.dtype).min,
+                    ),
+                    torch.zeros_like(swa_bias[:, :, :seq_len, :]),
+                )
+                layer_attention_mask = attention_mask + swa_bias
+
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
+            attention_mask=layer_attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -578,11 +689,11 @@ class StagingMoEllamaDecoderLayer(GradientCheckpointingLayer):
 
 
 @auto_docstring
-class StagingMoEllamaPreTrainedModel(PreTrainedModel):
-    config_class = StagingMoEllamaConfig
+class OptMoEPreTrainedModel(PreTrainedModel):
+    config_class = OptMoEConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["StagingMoEllamaDecoderLayer"]
+    _no_split_modules = ["OptMoEDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn_3 = True
     _supports_flash_attn_2 = True
@@ -593,23 +704,10 @@ class StagingMoEllamaPreTrainedModel(PreTrainedModel):
     _supports_static_cache = True
     _supports_attention_backend = True
 
-    # def _init_weights(self, module):
-    #     std = self.config.initializer_range
-    #     if isinstance(module, nn.Linear):
-    #         module.weight.data.normal_(mean=0.0, std=std)
-    #         if module.bias is not None:
-    #             module.bias.data.zero_()
-    #     elif isinstance(module, nn.Embedding):
-    #         module.weight.data.normal_(mean=0.0, std=std)
-    #         if module.padding_idx is not None:
-    #             module.weight.data[module.padding_idx].zero_()
-    #     # elif isinstance(module, LlamaRMSNorm):
-    #     #     module.weight.data.fill_(1.0)
-
 
 @auto_docstring
-class StagingMoEllamaModel(StagingMoEllamaPreTrainedModel):
-    def __init__(self, config: StagingMoEllamaConfig):
+class OptMoEModel(OptMoEPreTrainedModel):
+    def __init__(self, config: OptMoEConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -619,13 +717,53 @@ class StagingMoEllamaModel(StagingMoEllamaPreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                StagingMoEllamaDecoderLayer(config, layer_idx)
+                OptMoEDecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = StagingMoEllamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = StagingMoEllamaRotaryEmbedding(config=config)
+        self.norm = OptMoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = OptMoERotaryEmbedding(config=config)
+
+        # Second rotary embedding for SWA layers — fully independent from the global one.
+        # Mirrors native model's rope_of_swa: separate theta AND separate rope_scaling.
+        rope_theta_swa = getattr(config, "rope_theta_swa", None)
+        if rope_theta_swa is not None:
+            from copy import deepcopy
+
+            _swa_config = deepcopy(config)
+            # Override both theta and scaling independently so the two RoPE
+            # configurations are completely decoupled.
+            _swa_config.rope_theta = rope_theta_swa
+            _swa_config.rope_scaling = getattr(config, "rope_scaling_swa", None)
+            self.rotary_emb_swa = OptMoERotaryEmbedding(config=_swa_config)
+        else:
+            self.rotary_emb_swa = None
+
         self.gradient_checkpointing = False
+
+        # Apply per-layer rope_pattern and swa_pattern
+        use_rope_list = _parse_pattern(
+            getattr(config, "rope_pattern", None),
+            config.num_hidden_layers,
+            true_char="R",
+            false_char="N",
+            default=True,
+        )
+        use_swa_list = _parse_pattern(
+            getattr(config, "swa_pattern", None),
+            config.num_hidden_layers,
+            true_char="S",
+            false_char="F",
+            default=False,
+        )
+        sliding_window_size = getattr(config, "sliding_window_size", -1)
+        for i, layer in enumerate(self.layers):
+            layer.self_attn.use_rope = use_rope_list[i]
+            layer.sliding_window = sliding_window_size if use_swa_list[i] else -1
+            # SWA+RoPE layers use rotary_emb_swa when rope_theta_swa is configured
+            layer.self_attn.use_swa_rope = (
+                use_swa_list[i] and use_rope_list[i] and rope_theta_swa is not None
+            )
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -682,12 +820,25 @@ class StagingMoEllamaModel(StagingMoEllamaPreTrainedModel):
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+        # Compute SWA position embeddings (different theta) once if needed
+        position_embeddings_swa = (
+            self.rotary_emb_swa(hidden_states, position_ids=position_ids)
+            if self.rotary_emb_swa is not None
+            else None
+        )
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            # SWA+RoPE layers use the SWA-specific rotary embedding when available
+            pe = (
+                position_embeddings_swa
+                if position_embeddings_swa is not None
+                and decoder_layer.self_attn.use_swa_rope
+                else position_embeddings
+            )
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
-                position_embeddings=position_embeddings,
+                position_embeddings=pe,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -701,68 +852,16 @@ class StagingMoEllamaModel(StagingMoEllamaPreTrainedModel):
             past_key_values=past_key_values,
         )
 
-        """
-        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
-        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
-
-        Args:
-            attention_mask (`torch.Tensor`):
-                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape
-                `(batch_size, 1, query_length, key_value_length)`.
-            sequence_length (`int`):
-                The sequence length being processed.
-            target_length (`int`):
-                The target length: when generating with static cache, the mask should be as long as the static cache,
-                to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`torch.dtype`):
-                The dtype to use for the 4D attention mask.
-            cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            batch_size (`torch.Tensor`):
-                Batch size.
-        """
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
-            causal_mask = attention_mask
-        else:
-            min_dtype = torch.finfo(dtype).min
-            causal_mask = torch.full(
-                (sequence_length, target_length),
-                fill_value=min_dtype,
-                dtype=dtype,
-                device=cache_position.device,
-            )
-            if sequence_length != 1:
-                causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask *= torch.arange(
-                target_length, device=cache_position.device
-            ) > cache_position.reshape(-1, 1)
-            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = (
-                    causal_mask.clone()
-                )  # copy to contiguous memory for in-place edit
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[
-                    :, None, None, :
-                ].to(causal_mask.device)
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[
-                    :, :, :, :mask_length
-                ].masked_fill(padding_mask, min_dtype)
-
-        return causal_mask
-
 
 @auto_docstring
-class StagingMoEllamaForCausalLM(StagingMoEllamaPreTrainedModel, GenerationMixin):
+class OptMoEForCausalLM(OptMoEPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = StagingMoEllamaModel(config)
+        self.model = OptMoEModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -788,10 +887,10 @@ class StagingMoEllamaForCausalLM(StagingMoEllamaPreTrainedModel, GenerationMixin
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, MoEllamaForCausalLM
+        >>> from transformers import AutoTokenizer, OptMoEForCausalLM
 
-        >>> model = MoEllamaForCausalLM.from_pretrained("meta-llama/MoEllama-2-7b-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/MoEllama-2-7b-hf")
+        >>> model = OptMoEForCausalLM.from_pretrained("path/to/model")
+        >>> tokenizer = AutoTokenizer.from_pretrained("path/to/model")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
@@ -839,29 +938,29 @@ class StagingMoEllamaForCausalLM(StagingMoEllamaPreTrainedModel, GenerationMixin
         )
 
 
-class StagingMoEllamaForSequenceClassification(
-    GenericForSequenceClassification, StagingMoEllamaPreTrainedModel
-): ...
-
-
-class StagingMoEllamaForQuestionAnswering(
-    GenericForQuestionAnswering, StagingMoEllamaPreTrainedModel
+class OptMoEForSequenceClassification(
+    GenericForSequenceClassification, OptMoEPreTrainedModel
 ):
+    ...
+
+
+class OptMoEForQuestionAnswering(GenericForQuestionAnswering, OptMoEPreTrainedModel):
     base_model_prefix = (
         "transformer"  # For BC, where `transformer` was used instead of `model`
     )
 
 
-class StagingMoEllamaForTokenClassification(
-    GenericForTokenClassification, StagingMoEllamaPreTrainedModel
-): ...
+class OptMoEForTokenClassification(
+    GenericForTokenClassification, OptMoEPreTrainedModel
+):
+    ...
 
 
 __all__ = [
-    "StagingMoEllamaForCausalLM",
-    "StagingMoEllamaModel",
-    "StagingMoEllamaPreTrainedModel",
-    "StagingMoEllamaForSequenceClassification",
-    "StagingMoEllamaForQuestionAnswering",
-    "StagingMoEllamaForTokenClassification",
+    "OptMoEForCausalLM",
+    "OptMoEModel",
+    "OptMoEPreTrainedModel",
+    "OptMoEForSequenceClassification",
+    "OptMoEForQuestionAnswering",
+    "OptMoEForTokenClassification",
 ]

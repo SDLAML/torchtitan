@@ -4,12 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# ## below is the previous version of Norm calcualtion,
+# ## below is the previous version of Norm calculation,
 # this version can be used to compute norm for other optimizers
 
 # This is the naive version of parameter norm calculation.
 # It is used to compute norm for other optimizers.
-# In distributed scion, we will automatically calcuate the norms in distributed mode.
+# In distributed scion, we will automatically calculate the norms in distributed mode.
 
 
 import math
@@ -20,7 +20,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate
 
-from torchtitan.optimizers.distributed_scion import DistributedScion
+from torchtitan.optimizers.disco import DiSCO
 from torchtitan.optimizers.norm_helper import calculate_norm
 from torchtitan.optimizers.scion import Scion
 
@@ -30,7 +30,7 @@ from .utils import remove_orig_mod_and_weight_for_p_name
 """
 This is the naive version of parameter norm calculation.
 It is used to compute norm for other optimizers.
-In distributed scion, we will automatically calcuate the norms in distributed mode.
+In distributed scion, we will automatically calculate the norms in distributed mode.
 """
 
 
@@ -75,7 +75,7 @@ def gather_and_merge(local_stats: dict, dst: int = 0):
 
 
 def compute_grad(p, optimizer=None, **kwargs):
-    if isinstance(optimizer, (Scion, DistributedScion)):
+    if isinstance(optimizer, (Scion, DiSCO)):
         momentum = kwargs.pop("momentum")
         nesterov = kwargs.pop("nesterov")
         g = optimizer.get_momentum_or_grad(
@@ -137,7 +137,7 @@ def get_parameter_norms(model_parts, optimizers, norms_to_log):
         # NB: assumes correspondences between model parts and optimizers
         optimizer = optimizers[i]
         for group in optimizer.param_groups:
-            if isinstance(optimizer, (Scion, DistributedScion)):
+            if isinstance(optimizer, (Scion, DiSCO)):
                 param_kwargs = {
                     "momentum": group["momentum"],
                     "nesterov": group["nesterov"],

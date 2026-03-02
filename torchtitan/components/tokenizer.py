@@ -29,13 +29,16 @@ class BaseTokenizer(ABC, Configurable):
         self.eos_id = None
 
     @abstractmethod
-    def encode(self, *args, **kwargs) -> list[int]: ...
+    def encode(self, *args, **kwargs) -> list[int]:
+        ...
 
     @abstractmethod
-    def decode(self, *args, **kwargs) -> str: ...
+    def decode(self, *args, **kwargs) -> str:
+        ...
 
     @abstractmethod
-    def get_vocab_size(self) -> int: ...
+    def get_vocab_size(self) -> int:
+        ...
 
 
 class HuggingFaceTokenizer(BaseTokenizer):
@@ -430,43 +433,3 @@ class HuggingFaceByteTokenizer(HuggingFaceTokenizer):
         # tokens when encoding.
         tokenizer.encode_special_tokens = True
         return tokenizer
-
-
-def build_hf_tokenizer(
-    job_config: JobConfig,
-) -> Union[HuggingFaceTokenizer, BaseTokenizer]:
-    """
-    Builds a HuggingFaceTokenizer from the specified path.
-
-    This function creates a HuggingFaceTokenizer instance that handles BOS/EOS token
-    inference and intelligent encoding. The tokenizer automatically detects and loads
-    from various file formats and infers special token behavior.
-
-    Args:
-        JobConfig: A JobConfig object containing the path to the tokenizer directory.
-
-    Returns:
-        tokenizer (HuggingFaceTokenizer): Loaded tokenizer instance with intelligent BOS/EOS handling
-    """
-    tokenizer = HuggingFaceTokenizer(job_config.model.hf_assets_path)
-    return tokenizer
-
-
-def build_hf_byte_tokenizer(
-    job_config: JobConfig,
-) -> HuggingFaceByteTokenizer:
-    """
-    Builds a HuggingFaceByteTokenizer from the specified path.
-
-    This function creates a HuggingFaceByteTokenizer instance that handles BOS/EOS token
-    inference and intelligent encoding. The tokenizer automatically detects and loads
-    from various file formats and infers special token behavior.
-
-    Args:
-        JobConfig: A JobConfig object containing the path to the tokenizer directory.
-
-    Returns:
-        tokenizer (HuggingFaceByteTokenizer): Loaded tokenizer instance with intelligent BOS/EOS handling
-    """
-    tokenizer = HuggingFaceByteTokenizer(job_config.model.hf_assets_path)
-    return tokenizer

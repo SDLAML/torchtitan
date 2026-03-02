@@ -4,8 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Callable
-from typing import Literal
+from typing import Callable, Literal
 
 import torch
 
@@ -13,8 +12,8 @@ from torchtitan.tools.utils import _round_up
 
 from .kernels import generate_permute_indices
 
-TOKEN_GROUP_ALIGN_SIZE_M = 8
-ValidTokenGroupAlignmentSize = Literal[8, 16, 32]
+TOKEN_GROUP_ALIGN_SIZE_M = 1
+ValidTokenGroupAlignmentSize = Literal[16, 32]
 
 
 def set_token_group_alignment_size_m(
@@ -40,10 +39,20 @@ def set_token_group_alignment_size_m(
     TOKEN_GROUP_ALIGN_SIZE_M = alignment_size
 
 
+def need_indices_padding():
+    return TOKEN_GROUP_ALIGN_SIZE_M > 1
+
+
 def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
-    global TOKEN_GROUP_ALIGN_SIZE_M
-    x_padded_per_expert = x.shape[0] + num_local_experts * TOKEN_GROUP_ALIGN_SIZE_M
-    padded_max_len = _round_up(x_padded_per_expert, TOKEN_GROUP_ALIGN_SIZE_M)
+    # global TOKEN_GROUP_ALIGN_SIZE_M
+    if TOKEN_GROUP_ALIGN_SIZE_M == 1:
+        # No alignment padding: the permuted buffer length should be exactly
+        # the number of real tokens.
+        padded_max_len = x.shape[0]
+    else:
+        # allocate extra room for padding/alignment
+        x_padded_per_expert = x.shape[0] + num_local_experts * TOKEN_GROUP_ALIGN_SIZE_M
+        padded_max_len = _round_up(x_padded_per_expert, TOKEN_GROUP_ALIGN_SIZE_M)
     with torch.no_grad():
         (permuted_indices, num_tokens_per_expert, _offsets,) = generate_permute_indices(
             num_tokens_per_expert,
@@ -81,6 +90,7 @@ def indices_padding_wrapper(func: Callable) -> Callable:
         w3: torch.Tensor,
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
+        **kwargs,
     ) -> torch.Tensor:
         num_local_experts = w1.shape[0]
         ep_degree = num_tokens_per_expert.shape[0] // num_local_experts
@@ -89,7 +99,7 @@ def indices_padding_wrapper(func: Callable) -> Callable:
             x, num_tokens_per_expert, ep_degree, num_local_experts
         )
 
-        out = func(w1, w2, w3, x, num_tokens_per_expert)
+        out = func(w1, w2, w3, x, num_tokens_per_expert, **kwargs)
 
         out = _unpermute(out, input_shape, permuted_indices)
 

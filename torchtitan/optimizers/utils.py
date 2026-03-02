@@ -12,16 +12,24 @@ import torch
 from torchtitan.tools.logging import logger
 
 
-def remove_orig_mod_and_weight_for_p_name(name: str) -> str:
+def remove_orig_mod_and_weight_for_p_name(
+    name: str,
+    remove_orig_mod: bool = True,
+    remove_weight: bool = True,
+    remove_checkpoint_wrapped_module: bool = True,
+) -> str:
     """
     Remove "._orig_mod", ".weight", and "._checkpoint_wrapped_module" to
     get the clean layer name.
     """
-    name = re.sub(r"\._orig_mod", "", name)  # comes from compiled model
-    name = re.sub(r"\.weight", "", name)  # param.weight
-    name = re.sub(
-        r"\._checkpoint_wrapped_module", "", name
-    )  # comes from activation checkpointing
+    if remove_orig_mod:
+        name = re.sub(r"\._orig_mod", "", name)  # comes from compiled model
+    if remove_weight:
+        name = re.sub(r"\.weight", "", name)  # param.weight
+    if remove_checkpoint_wrapped_module:
+        name = re.sub(
+            r"\._checkpoint_wrapped_module", "", name
+        )  # comes from activation checkpointing
     return name
 
 
@@ -57,9 +65,9 @@ def create_disco_optimizer_kwargs_from_optimizer_config(
         hasattr(optimizer_config, "extra_param_group_split_rules")
         and optimizer_config.extra_param_group_split_rules
     ):
-        optimizer_kwargs[
-            "extra_param_group_split_rules"
-        ] = optimizer_config.extra_param_group_split_rules
+        optimizer_kwargs["extra_param_group_split_rules"] = (
+            optimizer_config.extra_param_group_split_rules
+        )
 
     return optimizer_kwargs
 
@@ -158,8 +166,8 @@ def create_disco_param_groups(
         # we could by default set backend to be identity
         if (
             group_config["norm_factor"].startswith("unembed")
-            and group_config["backend"] != "identity"
-        ):
+            or group_config["norm_factor"].startswith("sign")
+        ) and group_config["backend"] != "identity":
             group_config["backend"] = "identity"
             logger.info(
                 f"[DISCO][init], For {group_config['param_str_match']},"
@@ -170,7 +178,9 @@ def create_disco_param_groups(
 
     # Step 2: Extract actual parameters from the model
     param_dict = OrderedDict(
-        (n, p) for n, p in model.named_parameters() if p.requires_grad
+        (remove_orig_mod_and_weight_for_p_name(n, remove_weight=False), p)
+        for n, p in model.named_parameters()
+        if p.requires_grad
     )
     params = []
 
@@ -189,8 +199,8 @@ def create_disco_param_groups(
 
         if len(param_names) == 0:
             logger.warning(
-                f'Notice: No parameters found for `str_match` "{str_match}" on '
-                f"global rank {torch.distributed.get_rank()}"
+                f'\033[31m Notice: No parameters found for `str_match` "{str_match}" on '
+                f"global rank {torch.distributed.get_rank()}\033[0m"
             )
             continue
         group_params.update(group_config)

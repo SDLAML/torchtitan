@@ -3,17 +3,86 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import ast
 
+import copy
 import importlib
+import importlib.util
 import os
+import re
+
 import sys
 import warnings
 from dataclasses import field, fields, is_dataclass, make_dataclass
-from typing import Any
+from typing import Any, get_args, get_origin
 
 import tyro
 
 from torchtitan.tools.logging import logger
+
+
+def _deep_set(d: dict, path: list[str], value):
+    """Set d[path]=value; path segments support 'a' and 'a[3]'. Creates dicts/lists as needed."""
+    cur = d
+    for i, seg in enumerate(path):
+        m = re.fullmatch(r"([A-Za-z0-9_]+)(?:\[(\d+)\])?", seg)
+        if not m:
+            raise ValueError(f"Bad path segment: {seg}")
+        name, idx = m.group(1), m.group(2)
+        last = i == len(path) - 1
+
+        if idx is None:
+            if last:
+                cur[name] = value
+            else:
+                nxt = cur.get(name)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    cur[name] = nxt
+                cur = nxt
+        else:
+            j = int(idx)
+            seq = cur.get(name)
+            if not isinstance(seq, list):
+                seq = []
+                cur[name] = seq
+            while len(seq) <= j:
+                seq.append({})
+            if last:
+                seq[j] = value
+            else:
+                if not isinstance(seq[j], dict):
+                    seq[j] = {}
+                cur = seq[j]
+
+
+def _extract_indexed_overrides(raw_args: list[str]):
+    """
+    Capture tokens like:
+      --optimizer.extra-splits-rules[0].lr=1e-3
+      --optimizer.extra_param_group_split_rules[1].backend=identity
+    Return (remaining_args, overrides) where overrides = [(path_segments, value), ...].
+
+    We only intercept tokens that have both '[' and '=' to avoid stealing normal flags.
+    We also normalise '-' to '_' in keys to match your Python/TOML keys.
+    """
+
+    def _literal_eval_safe(s: str):
+        try:
+            return ast.literal_eval(s)
+        except Exception:
+            return s  # keep string if not a Python literal
+
+    remaining, overrides = [], []
+    for a in raw_args:
+        if a.startswith("-") and "[" in a and "=" in a:
+            key, val = a.lstrip("-").split("=", 1)
+            key = key.replace("-", "_")  # normalise hyphens to underscores
+            path = key.split(".")
+            overrides.append((path, _literal_eval_safe(val)))
+        else:
+            remaining.append(a)
+    return remaining, overrides
 
 
 class ConfigManager:
@@ -23,8 +92,13 @@ class ConfigManager:
     Configuration precedence:
         CLI args > config_registry function defaults
 
-    --module selects the module (e.g., llama3, deepseek_v3).
-    --config selects a config_registry function (e.g., llama3_debugmodel).
+    --module selects the module (e.g., llama3, deepseek_v3) when using in-repo
+    config_registry functions.
+    --config supports either:
+      1) config_registry function name (e.g., llama3_debugmodel)
+      2) external file path in one of these forms:
+         - /path/to/config.py
+         - /path/to/config.py:function_name
     CLI arguments use the format <section>.<key> to override config values.
     """
 
@@ -32,22 +106,312 @@ class ConfigManager:
         self.register_tyro_rules(custom_registry)
 
     def parse_args(self, args: list[str] = sys.argv[1:]):
-        loaded_config, args = self._load_config(args)
+
+        args, idx_overrides = _extract_indexed_overrides(args)
+
+        loaded_config, args, module_name = self._load_config(args)
+        self._normalize_scalar_list_fields(loaded_config)
+        args, model_flavor = self._extract_model_flavor_override(args)
+        if model_flavor is not None:
+            self._apply_model_flavor_override(
+                loaded_config=loaded_config,
+                model_flavor=model_flavor,
+                module_name=module_name,
+            )
         config_cls = type(loaded_config)
 
         self.config = tyro.cli(
             config_cls, args=args, default=loaded_config, registry=custom_registry
         )
+        self._normalize_scalar_list_fields(self.config)
 
         self._validate_config()
 
         return self.config
 
-    def _load_config(self, args: list[str]) -> tuple[object, list[str]]:
-        """Parse --module and --config from args, load config from config_registry.
+    @staticmethod
+    def _type_contains_list(type_hint: Any) -> bool:
+        origin = get_origin(type_hint)
+        if origin is list:
+            return True
+        return any(
+            ConfigManager._type_contains_list(arg) for arg in get_args(type_hint)
+        )
 
-        Both --module and --config are required.
-        Returns (loaded_config, filtered_args) with --module/--config stripped.
+    @staticmethod
+    def _normalize_scalar_list_fields(obj: Any) -> None:
+        """
+        Normalize dataclass fields typed as list[...] when a scalar/tuple was provided.
+
+        This is especially useful when configs are built in Python (not only via CLI),
+        where runtime assignment can bypass Tyro's parsing logic.
+        """
+        if not is_dataclass(obj):
+            return
+
+        for f in fields(obj):
+            value = getattr(obj, f.name)
+            if ConfigManager._type_contains_list(f.type):
+                if isinstance(value, str):
+                    setattr(obj, f.name, [value])
+                    value = getattr(obj, f.name)
+                elif isinstance(value, tuple):
+                    setattr(obj, f.name, list(value))
+                    value = getattr(obj, f.name)
+
+            if is_dataclass(value):
+                ConfigManager._normalize_scalar_list_fields(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if is_dataclass(item):
+                        ConfigManager._normalize_scalar_list_fields(item)
+
+    @staticmethod
+    def _extract_model_flavor_override(args: list[str]) -> tuple[list[str], str | None]:
+        """
+        Parse and strip model flavor overrides from args.
+
+        Supports:
+        - --model-flavor=<flavor>
+        - --model-flavor <flavor>
+        - --model.flavor=<flavor>
+        - --model.flavor <flavor>
+        """
+        remaining: list[str] = []
+        model_flavor: str | None = None
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg.startswith("--model-flavor="):
+                model_flavor = arg.split("=", 1)[1]
+            elif arg == "--model-flavor":
+                if i + 1 >= len(args):
+                    raise ValueError("--model-flavor requires a value")
+                model_flavor = args[i + 1]
+                i += 1
+            elif arg.startswith("--model.flavor="):
+                model_flavor = arg.split("=", 1)[1]
+            elif arg == "--model.flavor":
+                if i + 1 >= len(args):
+                    raise ValueError("--model.flavor requires a value")
+                model_flavor = args[i + 1]
+                i += 1
+            else:
+                remaining.append(arg)
+            i += 1
+        return remaining, model_flavor
+
+    @staticmethod
+    def _model_registry_candidates(
+        *,
+        module_name: str | None,
+        model_spec_name: str | None,
+    ) -> list[str]:
+        candidates: list[str] = []
+        if module_name:
+            candidates.extend(
+                [
+                    f"torchtitan.models.{module_name}",
+                    f"torchtitan.experiments.{module_name}",
+                ]
+            )
+        if model_spec_name:
+            normalized = model_spec_name.replace("/", ".")
+            candidates.extend(
+                [
+                    f"torchtitan.models.{normalized}",
+                    f"torchtitan.experiments.{normalized}",
+                ]
+            )
+
+        # Preserve order but deduplicate.
+        seen = set()
+        deduped: list[str] = []
+        for c in candidates:
+            if c in seen:
+                continue
+            seen.add(c)
+            deduped.append(c)
+        return deduped
+
+    def _apply_model_flavor_override(
+        self,
+        *,
+        loaded_config,
+        model_flavor: str,
+        module_name: str | None,
+    ) -> None:
+        """
+        Replace loaded_config.model_spec via module's model_registry(model_flavor),
+        while preserving user overrides under model_spec.model when possible.
+        """
+        model_spec = getattr(loaded_config, "model_spec", None)
+        model_spec_name = getattr(model_spec, "name", None)
+        candidates = self._model_registry_candidates(
+            module_name=module_name,
+            model_spec_name=model_spec_name,
+        )
+
+        registry_fn = None
+        chosen_module = None
+        for module_path in candidates:
+            try:
+                m = importlib.import_module(module_path)
+            except ImportError:
+                continue
+            candidate = getattr(m, "model_registry", None)
+            if callable(candidate):
+                registry_fn = candidate
+                chosen_module = module_path
+                break
+
+        if registry_fn is None:
+            raise ValueError(
+                "Could not resolve model_registry for --model-flavor override. "
+                f"Tried modules: {candidates}. "
+                "Provide --module with an importable model/experiment module."
+            )
+
+        previous_model_spec = getattr(loaded_config, "model_spec", None)
+        try:
+            new_model_spec = registry_fn(model_flavor)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to apply --model-flavor='{model_flavor}' "
+                f"via {chosen_module}.model_registry(...): {e}"
+            ) from e
+
+        # Preserve explicit user overrides under model_spec.model from the previous
+        # config object. This keeps external-config changes even when flavor is switched.
+        old_flavor = getattr(previous_model_spec, "flavor", None)
+        if (
+            old_flavor is not None
+            and old_flavor != model_flavor
+            and is_dataclass(getattr(previous_model_spec, "model", None))
+            and is_dataclass(getattr(new_model_spec, "model", None))
+        ):
+            old_base_spec = registry_fn(old_flavor)
+            overrides = self._dataclass_overrides(
+                old_base_spec.model,
+                previous_model_spec.model,
+            )
+            self._apply_dataclass_overrides(new_model_spec.model, overrides)
+
+        loaded_config.model_spec = new_model_spec
+
+    @staticmethod
+    def _dataclass_overrides(base_obj, current_obj) -> dict[str, Any]:
+        """Collect values in current_obj that differ from base_obj (recursively)."""
+        if not (is_dataclass(base_obj) and is_dataclass(current_obj)):
+            return {}
+
+        out: dict[str, Any] = {}
+        for f in fields(base_obj):
+            name = f.name
+            if not hasattr(current_obj, name):
+                continue
+            base_v = getattr(base_obj, name)
+            cur_v = getattr(current_obj, name)
+            if is_dataclass(base_v) and is_dataclass(cur_v):
+                sub = ConfigManager._dataclass_overrides(base_v, cur_v)
+                if sub:
+                    out[name] = sub
+            elif cur_v != base_v:
+                out[name] = copy.deepcopy(cur_v)
+        return out
+
+    @staticmethod
+    def _apply_dataclass_overrides(target_obj, overrides: dict[str, Any]) -> None:
+        """Apply recursive overrides (from _dataclass_overrides) to target_obj."""
+        for name, value in overrides.items():
+            if not hasattr(target_obj, name):
+                continue
+            target_v = getattr(target_obj, name)
+            if isinstance(value, dict) and is_dataclass(target_v):
+                ConfigManager._apply_dataclass_overrides(target_v, value)
+            else:
+                setattr(target_obj, name, copy.deepcopy(value))
+
+    @staticmethod
+    def _is_external_config_spec(config_name: str) -> bool:
+        """Heuristically determine whether --config points to an external Python file."""
+        if ".py" in config_name:
+            return True
+        if "/" in config_name or "\\" in config_name:
+            return True
+        if config_name.startswith(".") or config_name.startswith("~"):
+            return True
+        return False
+
+    @staticmethod
+    def _split_external_config_spec(config_spec: str) -> tuple[str, str | None]:
+        """Parse '/path/to/config.py[:function_name]' into (path, function_name)."""
+        if ":" not in config_spec:
+            return config_spec, None
+
+        maybe_path, maybe_func = config_spec.rsplit(":", 1)
+        if maybe_path.endswith(".py") and maybe_func:
+            return maybe_path, maybe_func
+        return config_spec, None
+
+    @staticmethod
+    def _public_callable_names(module_obj) -> list[str]:
+        return sorted(
+            name
+            for name in dir(module_obj)
+            if not name.startswith("_") and callable(getattr(module_obj, name))
+        )
+
+    def _load_external_config(self, config_spec: str):
+        """Load config object from an external Python file."""
+        config_path_raw, config_fn_name = self._split_external_config_spec(config_spec)
+        config_path = os.path.abspath(os.path.expanduser(config_path_raw))
+        if not os.path.isfile(config_path):
+            raise ValueError(
+                f"External config file '{config_path_raw}' was not found "
+                f"(resolved path: '{config_path}')."
+            )
+
+        module_name = f"torchtitan_external_config_{abs(hash(config_path))}"
+        spec = importlib.util.spec_from_file_location(module_name, config_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot import external config file '{config_path}'.")
+
+        config_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(config_module)
+
+        available = self._public_callable_names(config_module)
+        if config_fn_name is None:
+            preferred = ("make_config", "config", "get_config")
+            for candidate in preferred:
+                config_fn = getattr(config_module, candidate, None)
+                if callable(config_fn):
+                    return config_fn()
+
+            if len(available) == 1:
+                return getattr(config_module, available[0])()
+
+            raise ValueError(
+                f"External config file '{config_path}' requires selecting a function. "
+                "Use --config /path/to/config.py:function_name. "
+                f"Available callables: {available}"
+            )
+
+        config_fn = getattr(config_module, config_fn_name, None)
+        if config_fn is None or not callable(config_fn):
+            raise ValueError(
+                f"Config function '{config_fn_name}' not found in external config file "
+                f"'{config_path}'. Available callables: {available}"
+            )
+        return config_fn()
+
+    def _load_config(self, args: list[str]) -> tuple[object, list[str], str | None]:
+        """Parse --module and --config from args and load config object.
+
+        If --config is an external config path, --module is optional and ignored.
+        Otherwise, both --module and --config are required and --config must refer
+        to a function in the target module's config_registry.
+        Returns (loaded_config, filtered_args, module_name) with --module/--config stripped.
         """
         module_name = None
         config_name = None
@@ -80,13 +444,24 @@ class ConfigManager:
 
             i += 1
 
-        if module_name is None:
-            raise ValueError(
-                "--module is required. Example: --module llama3 --config llama3_debugmodel"
-            )
         if config_name is None:
             raise ValueError(
                 "--config is required. Example: --module llama3 --config llama3_debugmodel"
+            )
+
+        if self._is_external_config_spec(config_name):
+            if module_name is not None:
+                logger.warning(
+                    "--module is ignored when --config points to an external file "
+                    f"('{config_name}')."
+                )
+            loaded_config = self._load_external_config(config_name)
+            return loaded_config, filtered_args, module_name
+
+        if module_name is None:
+            raise ValueError(
+                "--module is required. Example: --module llama3 --config llama3_debugmodel. "
+                "For external configs, use --config /path/to/config.py:function_name."
             )
 
         from torchtitan.experiments import _supported_experiments
@@ -132,7 +507,7 @@ class ConfigManager:
             )
 
         loaded_config = config_fn()
-        return loaded_config, filtered_args
+        return loaded_config, filtered_args, module_name
 
     @staticmethod
     def _merge_configs(base, custom) -> type:
@@ -237,7 +612,6 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------------
 
     try:
-
         # pyrefly: ignore[missing-import]
         from rich import print as rprint
 

@@ -114,9 +114,9 @@ class MoEStateDictAdapter(StateDictAdapter):
         start_index, end_index = 0, dim_size
         if len(dim_i_placements) == 2:
             # Handle StridedShard(i) + Shard(i) case
-            assert isinstance(dim_i_placements[0], _StridedShard), (
-                "Expected StridedShard as first placement"
-            )
+            assert isinstance(
+                dim_i_placements[0], _StridedShard
+            ), "Expected StridedShard as first placement"
 
             strided_shard_mesh = device_mesh[mesh_names[0]]
             shard_mesh = device_mesh[mesh_names[1]]
@@ -132,9 +132,9 @@ class MoEStateDictAdapter(StateDictAdapter):
 
         elif len(dim_i_placements) == 1:
             # Handle single Shard(i) case
-            assert not isinstance(dim_i_placements[0], _StridedShard), (
-                "Expected regular Shard, not StridedShard"
-            )
+            assert not isinstance(
+                dim_i_placements[0], _StridedShard
+            ), "Expected regular Shard, not StridedShard"
 
             shard_mesh = device_mesh[mesh_names[0]]
             shard_degree = shard_mesh.size()
@@ -235,9 +235,9 @@ class MoEStateDictAdapter(StateDictAdapter):
         sub_mesh = device_mesh[tuple(sub_mesh_names)] if sub_mesh_names else None
 
         # Step 5: Create individual expert tensors
-        assert isinstance(grouped_expert_weight, DTensor), (
-            "Expected DTensor for grouped expert weight"
-        )
+        assert isinstance(
+            grouped_expert_weight, DTensor
+        ), "Expected DTensor for grouped expert weight"
 
         local_grouped_weights = grouped_expert_weight._local_tensor
         expected_local_experts = end_index - start_index
@@ -445,22 +445,9 @@ def get_moe_model_nparams_and_flops(
     n_heads: int,
     head_dims: int,
     seq_len: int,
-) -> tuple[int, int]:
+) -> tuple[int, int, int, int]:
     """
     Calculate nparams and nflops for MoE models.
-
-    Args:
-        model_config: BaseModel.Config object containing model configuration parameters including MoE settings.
-        model: nn.Module representing the MoE model.
-        n_heads: The number of attention heads.
-        head_dims: The sum of qk and v head dimensions.
-        seq_len: The sequence length in training configs.
-
-    Returns:
-        Tuple of (nparams, num_flops_per_token):
-            nparams: Total number of model parameters including all experts.
-            num_flops_per_token: Estimated number of floating point operations per token
-                                based on active parameters only.
     """
     nparams_embedding = 0
     nparams_moe_router = 0
@@ -485,34 +472,49 @@ def get_moe_model_nparams_and_flops(
     nparams = nparams_dense + nparams_sparse
 
     # pyrefly: ignore [missing-attribute]
-    moe_config = model_config.layer.moe
+    moe_config = getattr(model_config.layer, "moe", None)
+
     if moe_config is not None:
+        params_per_expert = nparams_experts // moe_config.num_experts
         nparams_sparse_active = (
             nparams_moe_router
             + nparams_shared_experts
-            + nparams_experts * moe_config.top_k // moe_config.num_experts
+            + params_per_expert * moe_config.top_k
         )
     else:
         nparams_sparse_active = 0
 
-    logger.info(
-        f"Total parameter count: dense {nparams_dense:,}, "
-        f"sparse {nparams_sparse:,}, active {nparams_dense + nparams_sparse_active:,}"
-    )
+    # Determine weight tying
+    is_weight_tied = getattr(model_config, "enable_weight_tying", False)
+
+    # Active parameters (Total params activated per token, excluding inactive experts)
+    active_params = nparams_dense + nparams_sparse_active
+
+    # FLOPs calculation logic
+    if is_weight_tied:
+        # Tied tensor acts as both embedding (no FLOPs) and LM head (FLOPs).
+        # Because PyTorch named_parameters() yields unique tensors, the LM head FLOPs
+        # are represented by keeping the embedding size in the active FLOP pool.
+        flops_active_params = nparams_dense + nparams_sparse_active
+    else:
+        # Separate tensors. We subtract embedding (no FLOPs), leaving the LM head in dense.
+        flops_active_params = (
+            nparams_dense - nparams_embedding
+        ) + nparams_sparse_active
 
     num_flops_per_token = (
-        6 * (nparams_dense - nparams_embedding + nparams_sparse_active)
+        6 * flops_active_params
         # pyrefly: ignore [missing-attribute]
         + 6 * model_config.n_layers * n_heads * head_dims * seq_len
     )
 
-    # If weight tying is enabled, subtract embedding parameters from total count
-    if (
-        hasattr(model_config, "enable_weight_tying")
-        and model_config.enable_weight_tying
-    ):
-        nparams = nparams - nparams_embedding
+    active_params_no_embed = active_params - nparams_embedding
 
-    active_params = nparams_sparse_active + nparams_embedding
+    logger.info(
+        f"Total parameter count: dense {nparams_dense:,}, "
+        f"sparse {nparams_sparse:,}, active (w/o embed) {active_params_no_embed:,}"
+    )
 
-    return active_params, nparams, num_flops_per_token
+    # Returning exactly what your original signature expected
+    # (assuming you wanted active_params without embeddings based on your original math)
+    return active_params_no_embed, nparams_embedding, nparams, num_flops_per_token

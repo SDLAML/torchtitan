@@ -8,10 +8,12 @@
 # [1] https://github.com/volcengine/verl/blob/main/verl/utils/dataset/multiturn_sft_dataset.py
 # [2] https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/datasets/sft_dataset.py#L35
 # [3] https://github.com/volcengine/verl/blob/main/verl/utils/dataset/sft_dataset.py#L33
-from dataclasses import asdict, field
-from functools import partial
-from typing import Any, Callable, Optional
 import json
+from collections.abc import Callable
+from dataclasses import field
+from functools import partial
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 
@@ -24,8 +26,6 @@ from torchtitan.components.dataloader import ParallelAwareDataloader
 
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.config.job_config import JobConfig
-from torchtitan.experiments.sft.job_config import SFTConfig
 from torchtitan.tools.logging import logger
 
 
@@ -231,11 +231,11 @@ class SFTDataset(IterableDataset, Stateful):
         dataset,
         tokenizer: BaseTokenizer,
         message_builder: Callable,
+        sft_config,
         seq_len: int = 2048,
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
-        sft_config: SFTConfig = field(default_factory=SFTConfig()),
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
@@ -330,8 +330,8 @@ class SFTDataset(IterableDataset, Stateful):
         self,
         index: int,
         message: dict[str, Any],
-        tools: Optional[list[dict[str, Any]]] = None,
-        enable_thinking: Optional[bool] = None,
+        tools: list[dict[str, Any]] | None = None,
+        enable_thinking: bool | None = None,
     ) -> tuple[list[int], list[int], list[int]]:
         """Tokenize one conversation turn while applying template overrides."""
         apply_chat_template_kwargs = {**self.apply_chat_template_kwargs}
@@ -428,7 +428,7 @@ class SFTDataset(IterableDataset, Stateful):
             _input_ids, _loss_mask = self._process_single_message(
                 index=i,
                 message=message,
-                # here we assume the defination of tools is given only in system message.
+                # here we assume the definition of tools is given only in system message.
                 tools=tools if i == 0 else None,
                 enable_thinking=enable_thinking,
             )
@@ -539,7 +539,6 @@ class SFTDataset(IterableDataset, Stateful):
             for sample in self._get_data_iter():
                 input_ids, labels, positions = self._process_one_row(sample)
                 new_len = input_ids.shape[0]
-
                 if self.pad_mode == "right_padding":
                     # Yield consistent dict structure immediately
                     return_dict = {
@@ -581,133 +580,94 @@ class SFTDataset(IterableDataset, Stateful):
                         self._data.set_epoch(self._data.epoch + 1)
 
 
-def build_sft_text_dataloader(
-    dp_world_size: int,
-    dp_rank: int,
-    tokenizer: BaseTokenizer,
-    job_config: JobConfig,
-    infinite: bool = True,
-) -> ParallelAwareDataloader:
-    """Build a data loader for HuggingFace datasets."""
-    dataset_name = job_config.training.dataset
-    dataset_path = job_config.training.dataset_path
-    batch_size = job_config.training.local_batch_size
-    seq_len = job_config.training.seq_len
+class SFTDataLoader(ParallelAwareDataloader):
+    """Configurable SFT dataloader wrapping SFTDataset.
 
-    rng = torch.Generator()
-    if job_config.training.dataset_seed is not None:
-        rng.manual_seed(job_config.training.dataset_seed)
+    Follows the Configurable pattern so that Trainer can call
+    ``config.dataloader.build(dp_world_size=..., dp_rank=..., tokenizer=..., ...)``.
+    """
 
-    # lets not use multiple datasets for now
-    dataset_name = dataset_name[0] if isinstance(dataset_name, list) else dataset_name
-    dataset_path = dataset_path[0] if isinstance(dataset_path, list) else dataset_path
+    @dataclass(kw_only=True, slots=True)
+    class Config(ParallelAwareDataloader.Config):
+        # inherited from BaseDataLoader.Config:
+        #   dataset: str = ""          (message builder name, e.g. "multi_turn")
+        #   dataset_path: str | None = None  (HuggingFace dataset path)
+        # inherited from ParallelAwareDataloader.Config:
+        #   num_workers, persistent_workers, pin_memory, prefetch_factor
 
-    sft_config = job_config.sft_config
-    # TODO: Improving the dataset loading, its easy to fix
-    dataset = load_dataset(
-        dataset_path,
-        sft_config.dataset_subset,
-        split=sft_config.split,
-        streaming=sft_config.stream_dataset,
-    )
+        dataset_subset: str | None = None
+        """HuggingFace dataset subset / name (passed as `name` to load_dataset)."""
 
-    message_builder = DATASET_MESSAGE_BUILDERS[dataset_name]
-    hf_ds = SFTDataset(
-        dataset=dataset,
-        message_builder=message_builder,
-        tokenizer=tokenizer,
-        seq_len=seq_len,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        infinite=infinite,
-        sft_config=sft_config,
-    )
+        dataset_split: str = "train"
+        """Dataset split to use."""
 
-    if job_config.checkpoint.enable:
-        global_batch_size = job_config.training.global_batch_size
-        if global_batch_size < 0:
-            global_batch_size = job_config.training.local_batch_size * dp_world_size
-        gradient_accumulation_steps = global_batch_size // (
-            job_config.training.local_batch_size * dp_world_size
+        dataset_streaming: bool = True
+        """Whether to stream the dataset."""
+
+        dataset_seed: int | None = None
+        """RNG seed for data shuffling (falls back to trainer seed when None)."""
+
+        # SFT-specific fields (mirrors SFTConfig)
+        apply_chat_template: bool = False
+        """Apply tokenizer chat template to messages."""
+
+        pad_mode: Literal["right_padding", "greedy_packing"] = "greedy_packing"
+        """How to pad/pack sequences into a fixed-length batch."""
+
+        chat_template_kwargs: dict = field(default_factory=dict)
+        """Extra kwargs forwarded to tokenizer.apply_chat_template."""
+
+        ignore_input_ids_mismatch: bool = False
+        """Ignore input_ids mismatch when applying chat template per-turn."""
+
+        openai_harmony_eos: bool = False
+        """Replace last <|end|> with EOS instead of appending a no-grad EOS."""
+
+    def __init__(
+        self,
+        config: "SFTDataLoader.Config",
+        *,
+        dp_world_size: int,
+        dp_rank: int,
+        tokenizer: BaseTokenizer,
+        seq_len: int,
+        local_batch_size: int,
+        snapshot_every_n_steps: int = 1,
+        seed: int | None = None,
+        **kwargs,
+    ):
+        dataset = load_dataset(
+            config.dataset_path,
+            config.dataset_subset,
+            split=config.dataset_split,
+            streaming=config.dataset_streaming,
         )
-        ckpt_freq = job_config.checkpoint.interval * gradient_accumulation_steps
-    elif len(dataset_name) == 1:
-        ckpt_freq = 1
-    else:
-        ckpt_freq = 999999999999
-    logger.info(f" [DataLoader] snapshot_every_n_steps is set to {ckpt_freq}")
 
-    dataloader_kwargs = {
-        **asdict(job_config.training.dataloader),
-        "batch_size": batch_size,
-        "generator": rng,
-        "snapshot_every_n_steps": ckpt_freq,
-    }
+        message_builder = DATASET_MESSAGE_BUILDERS[config.dataset]
+        hf_ds = SFTDataset(
+            dataset=dataset,
+            message_builder=message_builder,
+            tokenizer=tokenizer,
+            seq_len=seq_len,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            infinite=True,
+            sft_config=config,
+        )
 
-    return ParallelAwareDataloader(
-        hf_ds,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        **dataloader_kwargs,
-    )
+        rng = torch.Generator()
+        if seed is not None:
+            rng.manual_seed(seed)
 
-
-def build_sft_validation_dataloader(
-    dp_world_size: int,
-    dp_rank: int,
-    tokenizer: BaseTokenizer,
-    job_config: JobConfig,
-    infinite: bool = False,
-) -> ParallelAwareDataloader:
-    """Build a validation data loader for HuggingFace datasets."""
-    dataset_name = job_config.validation.dataset
-    dataset_path = job_config.validation.dataset_path
-    batch_size = job_config.validation.local_batch_size
-    seq_len = job_config.validation.seq_len
-
-    rng = torch.Generator()
-    if job_config.validation.seed is not None:
-        rng.manual_seed(job_config.validation.seed)
-
-    sft_config = job_config.sft_config
-    # TODO: Improving the dataset loading, its easy to fix
-    dataset = load_dataset(
-        dataset_path,
-        sft_config.dataset_subset,
-        split=sft_config.split,
-        streaming=sft_config.stream_dataset,
-    )
-
-    message_builder = DATASET_MESSAGE_BUILDERS[dataset_name]
-    hf_ds = SFTDataset(
-        dataset=dataset,
-        message_builder=message_builder,
-        tokenizer=tokenizer,
-        seq_len=seq_len,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        infinite=infinite,
-        sft_config=sft_config,
-    )
-
-    if job_config.checkpoint.enable:
-        ckpt_freq = job_config.checkpoint.interval
-    elif len(dataset_name) == 1:
-        ckpt_freq = 1
-    else:
-        ckpt_freq = 999999999999
-    logger.info(f" [DataLoader] snapshot_every_n_steps is set to {ckpt_freq}")
-
-    dataloader_kwargs = {
-        **asdict(job_config.validation.dataloader),
-        "batch_size": batch_size,
-        "generator": rng,
-        "snapshot_every_n_steps": ckpt_freq,
-    }
-
-    return ParallelAwareDataloader(
-        hf_ds,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        **dataloader_kwargs,
-    )
+        super().__init__(
+            hf_ds,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            batch_size=local_batch_size,
+            generator=rng,
+            snapshot_every_n_steps=snapshot_every_n_steps,
+            num_workers=config.num_workers,
+            persistent_workers=config.persistent_workers,
+            pin_memory=config.pin_memory,
+            prefetch_factor=config.prefetch_factor,
+        )

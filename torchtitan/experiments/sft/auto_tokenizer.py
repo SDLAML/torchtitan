@@ -4,20 +4,34 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass
+
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.config import JobConfig
 from torchtitan.tools.logging import logger
 from transformers import AutoTokenizer as HF_AutoTokenizer
 
 
 class HuggingFaceAutoTokenizer(BaseTokenizer):
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseTokenizer.Config):
+        eos_token: str = ""
+        """EOS token string."""
+        pad_token_id: int = -1
+        """PAD token ID."""
+        pad_token: str | None = None
+        """PAD token string override. If None, inferred from pad_token_id."""
+
     def __init__(
         self,
+        config: Config,
+        *,
         tokenizer_path: str,
-        eos_token: str,
-        pad_token_id: int,
-        pad_token: str | None = None,
     ):
+        super().__init__()
+        eos_token = config.eos_token
+        pad_token_id = config.pad_token_id
+        pad_token = config.pad_token
+
         self.tokenizer = HF_AutoTokenizer.from_pretrained(
             tokenizer_path, eos_token=eos_token, use_fast=True
         )
@@ -73,18 +87,3 @@ class HuggingFaceAutoTokenizer(BaseTokenizer):
 
     def __call__(self, text: str, *args, **kwargs):
         return self.tokenizer(text, *args, **kwargs)
-
-
-def build_auto_tokenizer(job_config: JobConfig) -> HuggingFaceAutoTokenizer:
-    eos_token = job_config.sft_config.eos_token
-    pad_token_id = job_config.sft_config.pad_token_id
-    pad_token = job_config.sft_config.pad_token
-    assert (
-        eos_token is not None and pad_token_id is not None
-    ), "EOS and PAD token IDs must be provided"
-    return HuggingFaceAutoTokenizer(
-        job_config.model.hf_assets_path,
-        eos_token=eos_token,
-        pad_token_id=pad_token_id,
-        pad_token=pad_token,
-    )

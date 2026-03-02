@@ -6,6 +6,7 @@
 
 import argparse
 import importlib
+import json
 from pathlib import Path
 
 import torch
@@ -15,97 +16,153 @@ from torchtitan.components.checkpoint import ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
 
 
+def _apply_config_overrides(model_config, config_path: Path):
+    """Load JSON config overrides and apply them to model_config in-place.
+
+    This is used to match the exact hyperparameters of a saved checkpoint
+    instead of the default values registered in model_registry.
+    """
+    overrides = json.loads(config_path.read_text())
+
+    # Zero out expensive init functions so CPU model construction is cheap
+    def _zero_init_fns(d):
+        if isinstance(d, dict):
+            for k, v in d.items():
+                if "init_fn_type" in k:
+                    d[k] = "zeros"
+                elif isinstance(v, dict):
+                    _zero_init_fns(v)
+
+    _zero_init_fns(overrides)
+
+    from torchtitan.tools.config_utils import update_dataclass_from_dict
+
+    update_dataclass_from_dict(model_config, overrides)
+
+
 @torch.inference_mode()
 def convert_to_hf(
-    input_dir,
-    output_dir,
-    model_name,
-    model_flavor,
-    hf_assets_path,
-    export_dtype,
+    input_dir: Path,
+    output_dir: Path,
+    model_name: str,
+    model_flavor: str,
+    hf_assets_path: "Path | None",
+    export_dtype: str,
+    model_config_path: "Path | None" = None,
 ):
-    # load model and model args so that we can get the state dict shape
-    train_spec = train_spec_module.get_train_spec(model_name)
-    model_args = train_spec.model_args[model_flavor]
+    """Convert a DCP checkpoint to HuggingFace safetensors format.
 
-    actual_model_args = json.load(open(actual_model_args, "r"))
+    Steps:
+      1. Load ModelSpec from the model registry.
+      2. Optionally apply config overrides from a JSON file.
+      3. Build an empty CPU model and wrap it.
+      4. Create a state dict adapter.
+      5. Load the DCP checkpoint.
+      6. Convert native → HF state dict.
+      7. Optionally cast dtype.
+      8. Write HF safetensors via HuggingFaceStorageWriter.
+      9. Copy HF config/modeling files and generate config.json.
+    """
+    # 1. Get ModelSpec from the model registry
+    model_module = importlib.import_module(f"torchtitan.models.{model_name}")
+    model_spec = model_module.model_registry(model_flavor)
 
-    # this is a monkey patch to avoid running SVD/QR decompositoin for model init
-    def recursively_set_init_fn_to_zeros(d):
-        """Recursively find and set all keys containing 'init_fn_type' to 'zeros'."""
-        if isinstance(d, dict):
-            for key, value in d.items():
-                if "init_fn_type" in key:
-                    d[key] = "zeros"
-                elif isinstance(value, dict):
-                    recursively_set_init_fn_to_zeros(value)
+    # 2. Optionally apply config overrides
+    model_config = model_spec.model
+    if model_config_path is not None:
+        _apply_config_overrides(model_config, model_config_path)
 
-    recursively_set_init_fn_to_zeros(actual_model_args)
-
-    update_dataclass_from_dict(model_args, actual_model_args)
-
+    # 3. Build empty model on CPU
     with torch.device("cpu"):
         model = model_config.build()
     model = ModelWrapper(model)
 
-    # pyrefly: ignore[bad-instantiation, not-callable]
-    sd_adapter = train_spec.state_dict_adapter(model_args, hf_assets_path)
-    assert sd_adapter is not None, (
-        "trying to convert checkpoint from DCP to HF safetensors format, but sd_adapter is not provided."
+    # 4. Create state dict adapter (new API: model_config, not model_args)
+    assert model_spec.state_dict_adapter is not None, (
+        "state_dict_adapter is required for HF checkpoint conversion. "
+        f"Model '{model_name}/{model_flavor}' has none registered."
     )
+    sd_adapter = model_spec.state_dict_adapter(model_config, hf_assets_path)
 
-    # allocate state dict memory with empty weights to load checkpoint
+    # 5. Load DCP checkpoint into empty state dict
     state_dict = model._get_state_dict()
-    dcp.load(
-        state_dict,
-        checkpoint_id=input_dir,
-    )
+    dcp.load(state_dict, checkpoint_id=str(input_dir))
 
-    # convert state dict tt->hf
+    # 6. Convert native → HF state dict
     hf_state_dict = sd_adapter.to_hf(state_dict)
 
+    # 7. Apply export dtype if requested
+    target_dtype = TORCH_DTYPE_MAP[export_dtype]
+    if target_dtype != torch.float32:
+        hf_state_dict = {k: v.to(target_dtype) for k, v in hf_state_dict.items()}
+
+    # 8. Write HF safetensors
+    output_dir.mkdir(parents=True, exist_ok=True)
     storage_writer = HuggingFaceStorageWriter(
-        path=output_dir,
+        path=str(output_dir),
         save_distributed=True,
         fqn_to_index_mapping=sd_adapter.fqn_to_index_mapping,
         enable_consolidation=True,
         thread_count_consolidation=5,
     )
+    dcp.save(hf_state_dict, storage_writer=storage_writer)
 
-    # map and apply export dtype if needed
-    target_dtype = TORCH_DTYPE_MAP[export_dtype]
-    if target_dtype != torch.float32:
-        hf_state_dict = {k: v.to(target_dtype) for k, v in hf_state_dict.items()}
-
-    dcp.save(
-        hf_state_dict,
-        storage_writer=storage_writer,
-    )
+    # 9. Copy HF config/modeling files and generate config.json
+    if model_spec.hf_assets_setup_fn is not None:
+        model_spec.hf_assets_setup_fn(model.module, model_config, str(output_dir))
+    else:
+        print(
+            f"[WARNING] No hf_assets_setup_fn registered for '{model_name}/{model_flavor}'. "
+            "Skipping config.json generation."
+        )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert DCP weights to HF format.")
-    parser.add_argument(
-        "input_dir", type=Path, help="Input directory with DCP weights."
+    parser = argparse.ArgumentParser(
+        description="Convert a DCP checkpoint to HuggingFace safetensors format."
     )
     parser.add_argument(
-        "output_dir", type=Path, help="Output directory for HF checkpoint."
+        "input_dir",
+        type=Path,
+        help="Input directory containing the DCP checkpoint.",
+    )
+    parser.add_argument(
+        "output_dir",
+        type=Path,
+        help="Output directory for the HF checkpoint.",
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="opt_moe",
+        help="Model module name under torchtitan.models (default: opt_moe).",
+    )
+    parser.add_argument(
+        "--model_flavor",
+        type=str,
+        default="bsc-1B-7B-opt-g",
+        help="Model flavor / config key (default: bsc-1B-7B-opt-g).",
     )
     parser.add_argument(
         "--hf_assets_path",
         type=Path,
-        help="Path to HF assets directory. This is used to get the model.safetensors.index.json mapping",
-        default="./assets/hf/Llama-3.1-8B",
+        default=None,
+        help="Path to a pre-existing HF assets directory containing "
+             "model.safetensors.index.json for fqn_to_index_mapping.",
     )
-    parser.add_argument("--model_name", type=str, nargs="?", default="llama3")
-    parser.add_argument("--model_flavor", type=str, nargs="?", default="8B")
+    parser.add_argument(
+        "--model_config_path",
+        type=Path,
+        default=None,
+        help="Optional JSON file with model config overrides (e.g. saved "
+             "checkpoint config). Used to match the exact training hyperparameters.",
+    )
     parser.add_argument(
         "--export_dtype",
         type=str,
-        nargs="?",
-        choices=["float16", "bfloat16", "float32"],
         default="float32",
-        help="Export dtype for HF checkpoint (default: float32)",
+        choices=["float16", "bfloat16", "float32"],
+        help="Export dtype for HF checkpoint (default: float32).",
     )
     args = parser.parse_args()
 
@@ -116,4 +173,5 @@ if __name__ == "__main__":
         args.model_flavor,
         args.hf_assets_path,
         args.export_dtype,
+        args.model_config_path,
     )

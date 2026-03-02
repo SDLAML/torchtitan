@@ -9,9 +9,7 @@ import os
 
 import torch
 
-
 from torchtitan.components.dataloader import BaseDataLoader
-from torchtitan.config import JobConfig
 
 __all__ = [
     "DataMixScheduler",
@@ -28,9 +26,11 @@ class DataMixScheduler:
         self,
         dataloader,
         mixing_configs,
+        datasets_names,
     ):
         self.dataloader = dataloader
         self.mixing_configs = mixing_configs
+        self.datasets_names = datasets_names
         self.step_milestones = sorted(mixing_configs.keys(), reverse=True)
 
     def get_weights_at_step(self, current_step: int):
@@ -67,9 +67,9 @@ class DataMixScheduler:
             data_mix_log[f"data_mixing/{self.datasets_names[data_i]}"] = all_weights[
                 data_i
             ]
-            data_sampled_log[f"data_sampled/{self.datasets_names[data_i]}"] = (
-                self.dataloader.dataset.num_sampled_per_dataset[data_i]
-            )
+            data_sampled_log[
+                f"data_sampled/{self.datasets_names[data_i]}"
+            ] = self.dataloader.dataset.num_sampled_per_dataset[data_i]
         return data_mix_log, data_sampled_log
 
     def step(self, current_step: int):
@@ -96,19 +96,21 @@ class DummyDataMixScheduler:
         pass
 
 
-def build_data_mix_scheduler(dataloader: BaseDataLoader, job_config: JobConfig):
+def build_data_mix_scheduler(
+    dataloader: BaseDataLoader, mixing_scheduler_configs: str | None
+):
     if not hasattr(dataloader.dataset, "weights") or not hasattr(
         dataloader.dataset, "datasets"
     ):
         return DummyDataMixScheduler()
-    mixing_scheduler_configs = job_config.training.data_mixing_scheduler_configs
-    mixing_configs = None
+    mixing_configs, datasets_names = None, None
     if mixing_scheduler_configs:
         if os.path.isfile(mixing_scheduler_configs):
             try:
                 mixing_configs = json.load(open(mixing_scheduler_configs))
+                datasets_names = mixing_configs.pop("names", None)
                 mixing_configs = {int(k): v for k, v in mixing_configs.items()}
-            except Exception as e:
+            except Exception:
                 pass
 
     """
@@ -135,15 +137,15 @@ def build_data_mix_scheduler(dataloader: BaseDataLoader, job_config: JobConfig):
             f"{len(dataloader.dataset.datasets)} and len(datasets_names) = "
             f"{len(datasets_names)} but got datasets_names = {datasets_names}"
         )
-    assert 0 in mixing_configs, (
-        "mixing_configs must contain at least one entry for step 0"
-    )
+    assert (
+        0 in mixing_configs
+    ), "mixing_configs must contain at least one entry for step 0"
 
-        for step, weights in mixing_configs.items():
-            assert len(weights) == len(dataloader.dataset.datasets), (
-                f"weights must have the same length as datasets get len(datasets) = "
-                f"{len(dataloader.dataset.datasets)} and len(weights) = "
-                f"{len(weights)}"
-            )
+    for step, weights in mixing_configs.items():
+        assert len(weights) == len(dataloader.dataset.datasets), (
+            f"weights must have the same length as datasets get len(datasets) = "
+            f"{len(dataloader.dataset.datasets)} and len(weights) = "
+            f"{len(weights)}"
+        )
 
-    return DataMixScheduler(dataloader, mixing_configs)
+    return DataMixScheduler(dataloader, mixing_configs, datasets_names)

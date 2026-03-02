@@ -412,6 +412,7 @@ def dispatch_tokens(
     Returns:
         (permuted_tokens, tokens_per_expert, state_for_combine)
     """
+
     selected_experts_indices = selected_experts_indices.contiguous()
     top_scores = top_scores.contiguous()
 
@@ -451,7 +452,6 @@ def dispatch_tokens(
         is_token_in_rank,
         num_tokens_per_expert_dispatch,
     )
-
     num_recv_tokens = hidden_states.shape[0]
 
     hidden_states, permuted_scores, permuted_indices = _permute_tokens(
@@ -494,7 +494,5 @@ def combine_tokens(
     hidden_states = _unpermute_tokens(
         hidden_states, state.permuted_indices, state.num_recv_tokens
     )
-
     hidden_states = torch.ops.deepep.combine(hidden_states, state.handle_id)
-
     return hidden_states

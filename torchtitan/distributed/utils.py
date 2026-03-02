@@ -32,6 +32,7 @@ def _dist_reduce(
     reduceOp: str,
     mesh: DeviceMesh | None,
     extra_pg: dist.ProcessGroup | None,
+    keep_tensor: bool = False,
 ) -> float:
     """Perform distributed reduction on a tensor.
 
@@ -51,11 +52,14 @@ def _dist_reduce(
     if extra_pg is not None:
         x = funcol.all_reduce(x, reduceOp=reduceOp, group=extra_pg)
 
-    if mesh is None:
-        return x.item()
+    if mesh is not None:
+        x = funcol.all_reduce(x, reduceOp=reduceOp, group=mesh)
 
-    assert x.numel() == 1  # required by `.item()`
-    return funcol.all_reduce(x, reduceOp=reduceOp, group=mesh).item()
+    if keep_tensor:
+        return x
+
+    assert x.numel() == 1, "Input must be a scalar (1 element) when keep_tensor=False"
+    return x.item()
 
 
 # TODO: rename this to maybe_dist_max
@@ -63,9 +67,14 @@ def dist_max(
     x: torch.Tensor,
     mesh: DeviceMesh | None = None,
     extra_pg: dist.ProcessGroup | None = None,
+    keep_tensor: bool = False,
 ) -> float:
     return _dist_reduce(
-        x, reduceOp=c10d.ReduceOp.MAX.name, mesh=mesh, extra_pg=extra_pg
+        x,
+        reduceOp=c10d.ReduceOp.MAX.name,
+        mesh=mesh,
+        extra_pg=extra_pg,
+        keep_tensor=keep_tensor,
     )
 
 
@@ -73,9 +82,14 @@ def dist_sum(
     x: torch.Tensor,
     mesh: DeviceMesh | None = None,
     extra_pg: dist.ProcessGroup | None = None,
+    keep_tensor: bool = False,
 ) -> float:
     return _dist_reduce(
-        x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg
+        x,
+        reduceOp=c10d.ReduceOp.SUM.name,
+        mesh=mesh,
+        extra_pg=extra_pg,
+        keep_tensor=keep_tensor,
     )
 
 
@@ -83,9 +97,14 @@ def dist_mean(
     x: torch.Tensor,
     mesh: DeviceMesh | None = None,
     extra_pg: dist.ProcessGroup | None = None,
+    keep_tensor: bool = False,
 ) -> float:
     return _dist_reduce(
-        x, reduceOp=c10d.ReduceOp.AVG.name, mesh=mesh, extra_pg=extra_pg
+        x,
+        reduceOp=c10d.ReduceOp.AVG.name,
+        mesh=mesh,
+        extra_pg=extra_pg,
+        keep_tensor=keep_tensor,
     )
 
 
@@ -127,7 +146,7 @@ def set_determinism(
         # reproducibility, since the autotune results may not be deterministic.
         from torch.nn.attention.flex_attention import flex_attention
 
-        from torchtitan.models.common.attention import FlexAttentionWrapper
+        from torchtitan.models.attention import FlexAttentionWrapper
 
         FlexAttentionWrapper._compiled_flex_attn = torch.compile(flex_attention)
 
