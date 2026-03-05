@@ -35,6 +35,7 @@
   "qk_norm": true,
   "norm_everywhere": true,
   "gated_attention_type": null,
+  "use_rope": true,
   "sliding_window_size": -1,
   "rope_pattern": null,
   "swa_pattern": null,

@@ -6,14 +6,13 @@
 
 import logging
 import re
-from collections import defaultdict
 from typing import Any
 
-import torch
 from torch.distributed.tensor import DTensor
 
-from torchtitan.protocols.model import BaseModel
 from torchtitan.models.utils import MoEStateDictAdapter
+
+from torchtitan.protocols.model import BaseModel
 
 logger = logging.getLogger()
 
@@ -82,9 +81,9 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
                 if "moe.experts" in key:
                     # Store the GroupedExperts Weight metadata for from_hf()
                     if isinstance(value, DTensor):
-                        self.grouped_expert_weight_placements[abstract_key] = (
-                            value.placements
-                        )
+                        self.grouped_expert_weight_placements[
+                            abstract_key
+                        ] = value.placements
                         self.grouped_expert_weight_shape[abstract_key] = value.shape
 
                         # Split GroupedExperts weight to local individual expert weights
@@ -125,12 +124,8 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
         state_dict: dict[str, Any] = {}
+        expert_weights_by_layer = {}  # {layer: {abstract_key: {expert_id: tensor}}}
 
-        # Temporary storage for HF MoE expert weights before regrouping:
-        # keyed by (layer_num, native_key_template) e.g. ("0", "layers.{}.moe.experts.w1")
-        grouped_experts: dict[tuple[str, str], dict[int, Any]] = defaultdict(dict)
-
-        # Guard for dense models that have no MoE layers (layer.moe is None)
         num_experts = (
             self.model_config.layer.moe.num_experts
             if self.model_config.layer.moe is not None
@@ -139,68 +134,64 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
 
         for key, value in hf_state_dict.items():
             if "layers" in key:
-                # collect all numeric indices (layer, expert, ...)
-                nums = re.findall(r"\d+", key)
-                if not nums:
-                    # shouldn't happen, but be defensive
-                    continue
-                layer_num = nums[0]
-
-                # Generalise *all* numeric indices so MoE patterns match too
-                abstract_key = re.sub(r"(\d+)", "{}", key)
-
                 # --- MoE experts (two indices: layer + expert) ---
                 if ".mlp.experts." in key:
+                    abstract_key = re.sub(r"(\d+)", "{}", key, count=2)
+                    nums = re.findall(r"\d+", key)
                     if len(nums) < 2:
                         logger.warning(
                             "Found MoE expert key without expert index: %s", key
                         )
                         continue
-                    expert_num = int(nums[1])
 
+                    layer_num, expert_num = nums[0], nums[1]
                     new_key_template = self.from_hf_map.get(abstract_key, None)
                     if new_key_template is None:
-                        # nothing to do (unknown key)
                         continue
 
-                    grouped_experts[(layer_num, new_key_template)][expert_num] = value
-                    continue  # don't write directly into state_dict yet
+                    if layer_num not in expert_weights_by_layer:
+                        expert_weights_by_layer[layer_num] = {}
+                    if new_key_template not in expert_weights_by_layer[layer_num]:
+                        expert_weights_by_layer[layer_num][new_key_template] = {}
+                    expert_weights_by_layer[layer_num][new_key_template][
+                        int(expert_num)
+                    ] = value
 
-                # --- Non-expert layer parameters (attention, FFN, router, shared_experts, etc.) ---
-                # Both models use "consecutive halves" RoPE — q_proj/k_proj copied verbatim.
-                new_key_template = self.from_hf_map.get(abstract_key, None)
-                if new_key_template is None:
-                    # e.g. rotary_emb.inv_freq or unknown keys
+                    # Online mode: local_experts_indices was populated during to_hf().
+                    if new_key_template in self.local_experts_indices:
+                        stacked_value = self._concatenate_expert_weights_dtensor(
+                            expert_weights_by_layer,
+                            new_key_template,
+                            layer_num,
+                        )
+                    else:
+                        # Offline conversion path.
+                        stacked_value = self._concatenate_expert_weights(
+                            expert_weights_by_layer,
+                            new_key_template,
+                            layer_num,
+                            num_experts,
+                        )
+
+                    if stacked_value is not None:
+                        new_key = new_key_template.format(layer_num)
+                        state_dict[new_key] = stacked_value
                     continue
 
-                new_key = new_key_template.format(layer_num)
-                state_dict[new_key] = value
+                # --- Non-expert layer parameters (attention, FFN, router, shared_experts, etc.) ---
+                nums = re.findall(r"\d+", key)
+                if not nums:
+                    continue
+                layer_num = nums[0]
+                abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
+                new_key_template = self.from_hf_map.get(abstract_key, None)
+                if new_key_template is None:
+                    continue
+                state_dict[new_key_template.format(layer_num)] = value
             else:
                 new_key = self.from_hf_map.get(key, None)
                 if new_key is None:
                     continue
                 state_dict[new_key] = value
-
-        # --- Rebuild grouped-expert weights from per-expert HF tensors ---
-        for (layer_num, native_key_template), experts_dict in grouped_experts.items():
-            # Expect indices [0, num_experts-1]; warn if incomplete
-            missing = [i for i in range(num_experts) if i not in experts_dict]
-            if missing:
-                logger.warning(
-                    "Missing experts %s for layer %s param %s when regrouping MoE weights",
-                    missing,
-                    layer_num,
-                    native_key_template,
-                )
-
-            # Order by expert index; only keep those we actually have
-            ordered_expert_ids = sorted(experts_dict.keys())
-            ordered_weights = [experts_dict[i] for i in ordered_expert_ids]
-
-            # Stack along expert dimension to invert _split_experts_weights
-            grouped_weight = torch.stack(ordered_weights, dim=0)
-
-            native_key = native_key_template.format(layer_num)
-            state_dict[native_key] = grouped_weight
 
         return state_dict

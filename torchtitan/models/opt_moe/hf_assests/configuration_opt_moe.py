@@ -60,6 +60,7 @@ class OptMoEConfig(PretrainedConfig):
         qk_norm=False,
         norm_everywhere=False,
         gated_attention_type=None,
+        use_rope=True,
         sliding_window_size=-1,
         rope_pattern=None,
         swa_pattern=None,
@@ -100,7 +101,12 @@ class OptMoEConfig(PretrainedConfig):
         )
         self.norm_everywhere = norm_everywhere
         self.qk_norm = qk_norm
+        if isinstance(gated_attention_type, str):
+            normalized = gated_attention_type.strip().lower()
+            if normalized in {"", "none", "null"}:
+                gated_attention_type = None
         self.gated_attention_type = gated_attention_type
+        self.use_rope = use_rope
         self.sliding_window_size = sliding_window_size
         self.rope_pattern = rope_pattern
         self.swa_pattern = swa_pattern

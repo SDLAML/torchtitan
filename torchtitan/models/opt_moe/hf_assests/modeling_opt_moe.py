@@ -57,16 +57,28 @@ def _parse_pattern(
     if pattern is None:
         return [default] * n_layers
     if isinstance(pattern, (list, tuple)):
+        if len(pattern) != n_layers:
+            raise ValueError(
+                f"Pattern list length {len(pattern)} != n_layers {n_layers}"
+            )
         result = []
         for v in pattern:
             if isinstance(v, bool):
                 result.append(v)
             elif isinstance(v, str):
+                upper = v.upper()
+                if upper not in {true_char.upper(), false_char.upper()}:
+                    raise ValueError(
+                        f"Unknown value '{v}' in pattern list. "
+                        f"Expected '{true_char}' or '{false_char}'."
+                    )
                 result.append(v.upper() == true_char.upper())
             else:
                 result.append(bool(v))
         return result
     # string
+    if len(pattern) != n_layers:
+        raise ValueError(f"Pattern string length {len(pattern)} != n_layers {n_layers}")
     result = []
     for c in pattern:
         if c.upper() == true_char.upper():
@@ -79,6 +91,19 @@ def _parse_pattern(
                 f"Expected '{true_char}' or '{false_char}'."
             )
     return result
+
+
+def _normalize_gated_attention_type(value: "str | None") -> "str | None":
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"", "none", "null"}:
+        return None
+    if normalized == "head-wise":
+        return "head-wise"
+    if normalized == "element-wise":
+        return "element-wise"
+    return value
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -282,7 +307,9 @@ class OptMoEAttention(nn.Module):
             self.mid_norm = nn.Identity()
 
         # Gated attention: head-wise or element-wise gate projection
-        self.gated_attention_type = getattr(config, "gated_attention_type", None)
+        self.gated_attention_type = _normalize_gated_attention_type(
+            getattr(config, "gated_attention_type", None)
+        )
         if self.gated_attention_type == "head-wise":
             self.gate_proj = nn.Linear(
                 config.hidden_size, config.num_attention_heads, bias=False
@@ -481,9 +508,12 @@ class OptMoEMoE(nn.Module):
         config: OptMoEConfig,
     ):
         super().__init__()
+        shared_hidden = int(config.moe_intermediate_size) * max(
+            1, int(getattr(config, "n_shared_experts", 1))
+        )
         self.shared_experts = OptMoESharedExperts(
             hidden_size=config.hidden_size,
-            moe_intermediate_size=config.moe_intermediate_size,
+            moe_intermediate_size=shared_hidden,
             norm_everywhere=config.norm_everywhere,
             rms_norm_eps=config.rms_norm_eps,
             hidden_act=config.hidden_act,
@@ -742,19 +772,22 @@ class OptMoEModel(OptMoEPreTrainedModel):
         self.gradient_checkpointing = False
 
         # Apply per-layer rope_pattern and swa_pattern
+        base_use_rope = bool(getattr(config, "use_rope", True))
+        base_use_swa = int(getattr(config, "sliding_window_size", -1)) > 0
+
         use_rope_list = _parse_pattern(
             getattr(config, "rope_pattern", None),
             config.num_hidden_layers,
             true_char="R",
             false_char="N",
-            default=True,
+            default=base_use_rope,
         )
         use_swa_list = _parse_pattern(
             getattr(config, "swa_pattern", None),
             config.num_hidden_layers,
             true_char="S",
             false_char="F",
-            default=False,
+            default=base_use_swa,
         )
         sliding_window_size = getattr(config, "sliding_window_size", -1)
         for i, layer in enumerate(self.layers):

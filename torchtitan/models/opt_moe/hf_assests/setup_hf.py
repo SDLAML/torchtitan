@@ -96,7 +96,10 @@ def overwrite_config(model, model_config):
     default_config["n_dense_layers"] = model_config.layer.n_dense_layers
 
     # Gated attention type and SWA config
-    default_config["gated_attention_type"] = getattr(attn_cfg, "gated_attention_type", None)
+    default_config["gated_attention_type"] = getattr(
+        attn_cfg, "gated_attention_type", None
+    )
+    default_config["use_rope"] = bool(getattr(attn_cfg, "use_rope", True))
     default_config["sliding_window_size"] = getattr(attn_cfg, "sliding_window_size", -1)
 
     # Per-layer patterns (store as-is: None, str, or list)
@@ -106,7 +109,9 @@ def overwrite_config(model, model_config):
     # Separate RoPE config for SWA layers (native model's rope_of_swa).
     # rope_theta_swa and rope_scaling_swa are fully independent from the primary rope.
     rope_of_swa = getattr(model_config, "rope_of_swa", None)
-    default_config["rope_theta_swa"] = float(rope_of_swa.theta) if rope_of_swa is not None else None
+    default_config["rope_theta_swa"] = (
+        float(rope_of_swa.theta) if rope_of_swa is not None else None
+    )
     default_config["rope_scaling_swa"] = _native_to_hf_rope_scaling(rope_of_swa)
 
     if model_config.layer.n_dense_layers > 0:

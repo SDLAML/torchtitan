@@ -312,7 +312,6 @@ class OPTMoEModel(Decoder):
                     "SWA requires attn_backend='flex'. "
                     f"Got attn_backend='{self.layer.attention.attn_backend}'."
                 )
-
             if self.n_layers == self.layer.n_dense_layers:
                 # Dense model
                 assert self.layer.feed_forward is not None
