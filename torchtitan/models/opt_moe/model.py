@@ -153,6 +153,7 @@ class OPTMoETransformerBlock(TransformerBlock):
             f"layer_id={self.layer_id}, "
             f"rope_theta={self._repr_rope_theta}, "
             f"use_rope={self._repr_use_rope}, "
+            f"qk_rope_dim={self.attention.qk_rope_dim}, "
             f"swa_window_size={self._repr_swa_window_size}"
         )
 

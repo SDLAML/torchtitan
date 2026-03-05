@@ -45,6 +45,11 @@ class GatedNormSWAttention(BaseAttention):
         attn_mask_type: str = "causal"
 
         rope_backend: str = "cos_sin"  # "complex" or "cos_sin"
+        qk_rope_dim: int | None = None
+        # Number of head dimensions to apply RoPE to.  None (default) means full
+        # head_dim (standard RoPE).  Set to a smaller value for partial RoPE where
+        # only the first qk_rope_dim dims are rotated and the rest pass through.
+        # rope.dim in the model config must equal qk_rope_dim when this is set.
         sliding_window_size: int = -1
 
         wq_init_fn_type: str = "scaled_orthogonal"
@@ -80,6 +85,12 @@ class GatedNormSWAttention(BaseAttention):
         self.enable_gqa = self.n_heads > self.n_kv_heads
         self.use_rope = config.use_rope
         self.rope_backend = config.rope_backend
+        self.qk_rope_dim: int = (
+            config.qk_rope_dim if config.qk_rope_dim is not None else self.head_dim
+        )
+        assert (
+            self.qk_rope_dim <= self.head_dim
+        ), f"qk_rope_dim ({self.qk_rope_dim}) must be less than or equal to head_dim ({self.head_dim})"
 
         self.gated_attention_type = config.gated_attention_type
         self.sliding_window_size = config.sliding_window_size
@@ -152,7 +163,27 @@ class GatedNormSWAttention(BaseAttention):
 
         # Apply rotary embeddings
         if self.use_rope:
-            if self.rope_backend == "cos_sin":
+            if self.qk_rope_dim != self.head_dim:
+                # Partial RoPE: rotate only the first qk_rope_dim dims, pass the rest through.
+                xq_rot, xq_pass = (
+                    xq[..., : self.qk_rope_dim],
+                    xq[..., self.qk_rope_dim :],
+                )
+                xk_rot, xk_pass = (
+                    xk[..., : self.qk_rope_dim],
+                    xk[..., self.qk_rope_dim :],
+                )
+                if self.rope_backend == "cos_sin":
+                    xq_rot, xk_rot = apply_rotary_emb_cos_sin(
+                        xq_rot, xk_rot, rope_cache, positions
+                    )
+                else:
+                    xq_rot, xk_rot = apply_rotary_emb_complex(
+                        xq_rot, xk_rot, freqs_cis=rope_cache, positions=positions
+                    )
+                xq = torch.cat([xq_rot, xq_pass], dim=-1)
+                xk = torch.cat([xk_rot, xk_pass], dim=-1)
+            elif self.rope_backend == "cos_sin":
                 xq, xk = apply_rotary_emb_cos_sin(xq, xk, rope_cache, positions)
             else:
                 xq, xk = apply_rotary_emb_complex(

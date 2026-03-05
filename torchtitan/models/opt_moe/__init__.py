@@ -462,6 +462,7 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
                 gated_attention_type="element-wise",
                 sliding_window_size=512,
+                qk_rope_dim=32,
             ),
         ),
         rope=RoPE.Config(
@@ -522,6 +523,7 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
                 gated_attention_type="element-wise",
                 sliding_window_size=512,
+                qk_rope_dim=32,
             ),
         ),
         rope=RoPE.Config(
@@ -552,6 +554,7 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
                 gated_attention_type="element-wise",
                 sliding_window_size=512,
+                qk_rope_dim=64,
             ),
         ),
         rope=RoPE.Config(
