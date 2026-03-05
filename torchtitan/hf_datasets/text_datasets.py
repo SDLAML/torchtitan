@@ -4,11 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from random import Random
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -535,7 +535,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         dataset_shuffle_buffer_size: int = 0
         """Buffer size of windowed shuffling buffer. 0 means no shuffling (the default)."""
 
-        dataset_weights: list[str] | None = None
+        dataset_weights: list[float] | None = None
         """
         Probability of sampling from each dataset, separated by commas.
         If not given, sample uniformly.
