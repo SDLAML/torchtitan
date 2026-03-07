@@ -674,11 +674,24 @@ class OptMoEMoE(nn.Module):
         return y
 
 
+def _compute_residual_scales(residual_scale: str, n_layers: int) -> tuple[float, float]:
+    """Return (block_scale, identity_scale) matching native setup_residual_scale."""
+    if residual_scale == "depth_scale":
+        total_depth = 2 * n_layers
+        return 1.0 / total_depth, (total_depth - 1) / total_depth
+    return 1.0, 1.0  # "identity"
+
+
 class OptMoEDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: OptMoEConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+
+        residual_scale = getattr(config, "residual_scale", "identity")
+        self.block_scale, self.identity_scale = _compute_residual_scales(
+            residual_scale, config.num_hidden_layers
+        )
 
         self.self_attn = OptMoEAttention(config=config, layer_idx=layer_idx)
 
@@ -753,13 +766,17 @@ class OptMoEDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = (
+            self.identity_scale * residual + self.block_scale * hidden_states
+        )
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = (
+            self.identity_scale * residual + self.block_scale * hidden_states
+        )
 
         return hidden_states
 

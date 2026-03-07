@@ -80,6 +80,14 @@ def _weightless_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
     return RMSNorm(hidden_size, eps=eps, has_weight=False)
 
 
+def _compute_residual_scales(residual_scale: str, n_layers: int) -> tuple[float, float]:
+    """Return (block_scale, identity_scale) matching native setup_residual_scale."""
+    if residual_scale == "depth_scale":
+        total_depth = 2 * n_layers
+        return 1.0 / total_depth, (total_depth - 1) / total_depth
+    return 1.0, 1.0  # "identity"
+
+
 def _get_partial_rotary_factor(config: Any) -> float | None:
     partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
     if partial_rotary_factor is not None:
@@ -991,6 +999,11 @@ class OptMoEDecoderLayer(nn.Module):
             config.hidden_size, eps=float(getattr(config, "rms_norm_eps", 1e-6))
         )
 
+        residual_scale = getattr(config, "residual_scale", "identity")
+        self.block_scale, self.identity_scale = _compute_residual_scales(
+            residual_scale, config.num_hidden_layers
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1008,11 +1021,15 @@ class OptMoEDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
-        hidden_after_attn = hidden_input + attn_output
+        hidden_after_attn = (
+            self.identity_scale * hidden_input + self.block_scale * attn_output
+        )
 
         mlp_input = self.post_attention_layernorm(hidden_after_attn)
         mlp_output = self.mlp(mlp_input)
-        hidden_out = hidden_after_attn + mlp_output
+        hidden_out = (
+            self.identity_scale * hidden_after_attn + self.block_scale * mlp_output
+        )
 
         return hidden_out, None
 

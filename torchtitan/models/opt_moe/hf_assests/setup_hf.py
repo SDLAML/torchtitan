@@ -113,6 +113,10 @@ def overwrite_config(model, model_config):
         default_config["qk_rope_dim"] / default_config["head_dim"]
     )
 
+    default_config["residual_scale"] = getattr(
+        model_config.layer, "residual_scale", "identity"
+    )
+
     # Per-layer patterns (store as-is: None, str, or list)
     default_config["rope_pattern"] = getattr(model_config, "rope_pattern", None)
     default_config["swa_pattern"] = getattr(model_config, "swa_pattern", None)

@@ -45,6 +45,7 @@
   "swa_pattern": null,
   "rope_theta_swa": null,
   "rope_scaling_swa": null,
+  "residual_scale": "identity",
   "torch_dtype": "bfloat16",
   "transformers_version": "4.57.3"
 }

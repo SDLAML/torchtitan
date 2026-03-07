@@ -90,6 +90,7 @@ class OptMoEConfig(PretrainedConfig):
         swa_pattern=None,
         rope_theta_swa=None,
         rope_scaling_swa=None,
+        residual_scale="identity",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -169,6 +170,12 @@ class OptMoEConfig(PretrainedConfig):
                 f"partial_rotary_factor={partial_rotary_factor}."
             )
         self.partial_rotary_factor = derived_partial_rotary_factor
+
+        if residual_scale not in ("identity", "depth_scale"):
+            raise ValueError(
+                f"residual_scale must be 'identity' or 'depth_scale', got {residual_scale!r}"
+            )
+        self.residual_scale = residual_scale
 
         self.rope_pattern = rope_pattern
         self.swa_pattern = swa_pattern
