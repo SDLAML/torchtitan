@@ -106,6 +106,15 @@ def _normalize_gated_attention_type(value: "str | None") -> "str | None":
     return value
 
 
+def _normalize_mid_norm_position(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in {"after", "before"}:
+        raise ValueError(
+            "mid_norm_position must be either 'after' or 'before', " f"got {value!r}"
+        )
+    return normalized
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class OptMoERMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -263,12 +272,22 @@ class OptMoEAttention(nn.Module):
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
+        self.qk_rope_dim = getattr(config, "qk_rope_dim", self.head_dim)
+        if not (0 < self.qk_rope_dim <= self.head_dim):
+            raise ValueError(
+                f"qk_rope_dim must be in (0, head_dim], got {self.qk_rope_dim} "
+                f"for head_dim={self.head_dim}."
+            )
         self.num_key_value_groups = (
             config.num_attention_heads // config.num_key_value_heads
         )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
+        self.gate_only = bool(getattr(config, "gate_only", False))
+        self.mid_norm_position = _normalize_mid_norm_position(
+            getattr(config, "mid_norm_position", "after")
+        )
 
         self.q_proj = nn.Linear(
             config.hidden_size,
@@ -301,7 +320,13 @@ class OptMoEAttention(nn.Module):
 
         if config.norm_everywhere:
             self.v_norm = OptMoERMSNorm(self.head_dim, config.rms_norm_eps)
-            self.mid_norm = OptMoERMSNorm(config.hidden_size, config.rms_norm_eps)
+            if self.mid_norm_position == "after":
+                self.mid_norm = OptMoERMSNorm(
+                    config.num_attention_heads * self.head_dim,
+                    config.rms_norm_eps,
+                )
+            else:
+                self.mid_norm = OptMoERMSNorm(self.head_dim, config.rms_norm_eps)
         else:
             self.v_norm = nn.Identity()
             self.mid_norm = nn.Identity()
@@ -310,6 +335,7 @@ class OptMoEAttention(nn.Module):
         self.gated_attention_type = _normalize_gated_attention_type(
             getattr(config, "gated_attention_type", None)
         )
+        self.gate_proj = nn.Identity()
         if self.gated_attention_type == "head-wise":
             self.gate_proj = nn.Linear(
                 config.hidden_size, config.num_attention_heads, bias=False
@@ -350,9 +376,22 @@ class OptMoEAttention(nn.Module):
         # Apply RoPE only for layers that use positional encoding
         if self.use_rope and position_embeddings is not None:
             cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin
-            )
+            if self.qk_rope_dim != self.head_dim:
+                query_rot, query_pass = (
+                    query_states[..., : self.qk_rope_dim],
+                    query_states[..., self.qk_rope_dim :],
+                )
+                key_rot, key_pass = (
+                    key_states[..., : self.qk_rope_dim],
+                    key_states[..., self.qk_rope_dim :],
+                )
+                query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin)
+                query_states = torch.cat((query_rot, query_pass), dim=-1)
+                key_states = torch.cat((key_rot, key_pass), dim=-1)
+            else:
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin
+                )
 
         if past_key_values is not None:
             if self.use_rope and position_embeddings is not None:
@@ -381,21 +420,28 @@ class OptMoEAttention(nn.Module):
             **kwargs,
         )
 
+        if self.mid_norm_position == "before" and not self.gate_only:
+            attn_output = self.mid_norm(attn_output)
+
         # Apply gated attention output (head-wise or element-wise)
         if self.gated_attention_type is not None:
-            gate = torch.sigmoid(self.gate_proj(hidden_states).to(attn_output.dtype))
+            orig_dtype = attn_output.dtype
+            gate = torch.sigmoid(self.gate_proj(hidden_states).float())
             if self.gated_attention_type == "head-wise":
                 # gate: [bs, seq, n_heads] → [bs, seq, n_heads, 1] for broadcasting
                 bsz, seq_len = hidden_states.shape[:2]
                 n_heads = self.config.num_attention_heads
                 gate = gate.unsqueeze(-1)  # [bs, seq, n_heads, 1]
                 attn_output = attn_output.view(bsz, seq_len, n_heads, self.head_dim)
-                attn_output = (attn_output * gate).view(bsz, seq_len, -1)
+                attn_output = (attn_output.float() * gate).to(orig_dtype)
             else:  # element-wise
-                attn_output = attn_output.reshape(*input_shape, -1) * gate
+                attn_output = (attn_output.reshape(*input_shape, -1).float() * gate).to(
+                    orig_dtype
+                )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.mid_norm(attn_output)
+        if self.mid_norm_position == "after" and not self.gate_only:
+            attn_output = self.mid_norm(attn_output)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 

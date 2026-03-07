@@ -71,15 +71,16 @@ def overwrite_config(model, model_config):
         dict suitable for writing as config.json.
     """
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    default_config = json.load(open(os.path.join(current_dir, "config.json")))
+    with open(os.path.join(current_dir, "config.json")) as f:
+        default_config = json.load(f)
 
     attn_cfg = model_config.layer.attention
 
     # Inspect the first layer's attention module for runtime sizes
     attention = model.layers["0"].attention
 
-    default_config["num_hidden_layers"] = model.n_layers
-    default_config["vocab_size"] = model.vocab_size
+    default_config["num_hidden_layers"] = model_config.n_layers
+    default_config["vocab_size"] = model_config.vocab_size
     default_config["rms_norm_eps"] = model_config.norm_eps
     default_config["qk_norm"] = attn_cfg.qk_norm
     default_config["norm_everywhere"] = attn_cfg.norm_everywhere
@@ -99,8 +100,18 @@ def overwrite_config(model, model_config):
     default_config["gated_attention_type"] = getattr(
         attn_cfg, "gated_attention_type", None
     )
+    default_config["gate_only"] = bool(getattr(attn_cfg, "gate_only", False))
+    default_config["mid_norm_position"] = getattr(
+        attn_cfg, "mid_norm_position", "after"
+    )
     default_config["use_rope"] = bool(getattr(attn_cfg, "use_rope", True))
     default_config["sliding_window_size"] = getattr(attn_cfg, "sliding_window_size", -1)
+    default_config["qk_rope_dim"] = getattr(
+        attention, "qk_rope_dim", getattr(attn_cfg, "qk_rope_dim", attention.head_dim)
+    )
+    default_config["partial_rotary_factor"] = (
+        default_config["qk_rope_dim"] / default_config["head_dim"]
+    )
 
     # Per-layer patterns (store as-is: None, str, or list)
     default_config["rope_pattern"] = getattr(model_config, "rope_pattern", None)
@@ -115,15 +126,14 @@ def overwrite_config(model, model_config):
     default_config["rope_scaling_swa"] = _native_to_hf_rope_scaling(rope_of_swa)
 
     if model_config.layer.n_dense_layers > 0:
-        ffn = model.layers["0"].feed_forward
-        default_config["intermediate_size"] = ffn.hidden_dim
+        default_config["intermediate_size"] = model_config.layer.feed_forward.hidden_dim
 
     if len(model.layers) > model_config.layer.n_dense_layers:
         moe = model.layers[str(len(model.layers) - 1)].moe
-        default_config["moe_intermediate_size"] = moe.experts.dim_hidden
-        default_config["n_active_experts"] = moe.topk
-        default_config["n_total_experts"] = moe.num_experts
-        default_config["moe_scaling_factor"] = moe.router.route_scale
+        default_config["moe_intermediate_size"] = model_config.layer.moe.hidden_dim
+        default_config["n_active_experts"] = model_config.layer.moe.top_k
+        default_config["n_total_experts"] = model_config.layer.moe.num_experts
+        default_config["moe_scaling_factor"] = moe.scaling_factor
         default_config["n_shared_experts"] = model_config.layer.moe.num_shared_experts
 
     return default_config

@@ -38,8 +38,10 @@ class GatedNormSWAttention(BaseAttention):
         qk_norm: bool = False
         norm_everywhere: bool = False
         gated_attention_type: str | None = None  # "none", "head-wise", "element-wise"
+        gate_only: bool = False
         norm_eps: float = 1e-30
         norm_type: str = "np_rmsnorm"
+        mid_norm_position: str = "after"  # "after" or "before"
         use_rope: bool = True
         attn_backend: str = "sdpa"
         attn_mask_type: str = "causal"
@@ -93,7 +95,13 @@ class GatedNormSWAttention(BaseAttention):
         ), f"qk_rope_dim ({self.qk_rope_dim}) must be less than or equal to head_dim ({self.head_dim})"
 
         self.gated_attention_type = config.gated_attention_type
+        self.gate_only = config.gate_only
         self.sliding_window_size = config.sliding_window_size
+        self.mid_norm_position = config.mid_norm_position
+        assert self.mid_norm_position in [
+            "after",
+            "before",
+        ], f"mid_norm_position ({self.mid_norm_position}) must be either 'after' or 'before'"
 
         self.q_norm = nn.Identity()
         self.k_norm = nn.Identity()
@@ -110,7 +118,10 @@ class GatedNormSWAttention(BaseAttention):
             self.k_norm = build_attention_norm(dim=self.head_dim)
         if config.norm_everywhere:
             self.v_norm = build_attention_norm(dim=self.head_dim)
-            self.mid_norm = build_attention_norm(dim=self.n_heads * self.head_dim)
+            if self.mid_norm_position == "after":
+                self.mid_norm = build_attention_norm(dim=self.n_heads * self.head_dim)
+            else:
+                self.mid_norm = build_attention_norm(dim=self.head_dim)
 
         if self.gated_attention_type == "head-wise":
             # G1-style: one gate per attention head.
@@ -234,18 +245,28 @@ class GatedNormSWAttention(BaseAttention):
             case _:
                 raise ValueError(f"Unknown attention type: {self.attn_backend}")
 
+        # "before" mid-norm: per-head norm applied before gating
+        # output shape here: [bs, seqlen, n_local_heads, head_dim]
+        if self.mid_norm_position == "before" and not self.gate_only:
+            output = self.mid_norm(output)
+
         if self.gated_attention_type is not None:
-            gate = torch.sigmoid(self.gate_proj(x)).to(output.dtype)
+            # Compute gate and multiply in float32 for numeric stability, then cast back.
+            orig_dtype = output.dtype
+            gate = torch.sigmoid(self.gate_proj(x).float())
             if self.gated_attention_type == "head-wise":
                 # gate: [bs, seqlen, n_local_heads]
-                output = output * gate.unsqueeze(-1)
+                # result: [g1*norm(o1), g2*norm(o2), ...] per head
+                output = (output.float() * gate.unsqueeze(-1)).to(orig_dtype)
             elif self.gated_attention_type == "element-wise":
                 # gate: [bs, seqlen, n_local_heads * head_dim]
-                output_flat = output.reshape(bs, seqlen, -1)
-                output = output_flat * gate
+                output_flat = output.reshape(bs, seqlen, -1).float()
+                output = (output_flat * gate).to(orig_dtype)
 
         output = output.reshape(bs, seqlen, -1)
-        output = self.mid_norm(output)
+        # "after" mid-norm: norm applied over the full concatenated head output
+        if self.mid_norm_position == "after" and not self.gate_only:
+            output = self.mid_norm(output)
         return self.wo(output)
 
     def init_weights(self, residual_div: float):

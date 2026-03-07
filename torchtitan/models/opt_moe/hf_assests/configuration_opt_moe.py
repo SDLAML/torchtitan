@@ -4,8 +4,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
+
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
+
+
+def _normalize_gated_attention_type(value):
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"", "none", "null"}:
+        return None
+    return value
+
+
+def _normalize_mid_norm_position(value):
+    normalized = value.strip().lower()
+    if normalized not in {"after", "before"}:
+        raise ValueError(
+            "mid_norm_position must be either 'after' or 'before', " f"got {value!r}"
+        )
+    return normalized
 
 
 class OptMoEConfig(PretrainedConfig):
@@ -60,8 +80,12 @@ class OptMoEConfig(PretrainedConfig):
         qk_norm=False,
         norm_everywhere=False,
         gated_attention_type=None,
+        gate_only=False,
+        mid_norm_position="after",
         use_rope=True,
         sliding_window_size=-1,
+        qk_rope_dim=None,
+        partial_rotary_factor=None,
         rope_pattern=None,
         swa_pattern=None,
         rope_theta_swa=None,
@@ -101,13 +125,51 @@ class OptMoEConfig(PretrainedConfig):
         )
         self.norm_everywhere = norm_everywhere
         self.qk_norm = qk_norm
-        if isinstance(gated_attention_type, str):
-            normalized = gated_attention_type.strip().lower()
-            if normalized in {"", "none", "null"}:
-                gated_attention_type = None
-        self.gated_attention_type = gated_attention_type
+        self.gated_attention_type = _normalize_gated_attention_type(
+            gated_attention_type
+        )
+        self.gate_only = bool(gate_only)
+        self.mid_norm_position = _normalize_mid_norm_position(mid_norm_position)
         self.use_rope = use_rope
         self.sliding_window_size = sliding_window_size
+
+        if qk_rope_dim is None:
+            if partial_rotary_factor is None:
+                qk_rope_dim = self.head_dim
+            else:
+                qk_rope_dim = int(self.head_dim * partial_rotary_factor)
+                if not math.isclose(
+                    qk_rope_dim / self.head_dim,
+                    partial_rotary_factor,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ):
+                    raise ValueError(
+                        "partial_rotary_factor must map to an integer qk_rope_dim. "
+                        f"Got head_dim={self.head_dim}, "
+                        f"partial_rotary_factor={partial_rotary_factor}."
+                    )
+        self.qk_rope_dim = int(qk_rope_dim)
+        if not (0 < self.qk_rope_dim <= self.head_dim):
+            raise ValueError(
+                f"qk_rope_dim must be in (0, head_dim], got {self.qk_rope_dim} "
+                f"for head_dim={self.head_dim}."
+            )
+
+        derived_partial_rotary_factor = self.qk_rope_dim / self.head_dim
+        if partial_rotary_factor is not None and not math.isclose(
+            partial_rotary_factor,
+            derived_partial_rotary_factor,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                "qk_rope_dim and partial_rotary_factor disagree. "
+                f"Got qk_rope_dim={self.qk_rope_dim}, head_dim={self.head_dim}, "
+                f"partial_rotary_factor={partial_rotary_factor}."
+            )
+        self.partial_rotary_factor = derived_partial_rotary_factor
+
         self.rope_pattern = rope_pattern
         self.swa_pattern = swa_pattern
         self.rope_theta = rope_theta

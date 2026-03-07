@@ -209,7 +209,12 @@ def calculate_norm(
     if norms_to_log is None:
         norms_to_log = list(NORM_FUNCTIONS.keys())
 
-    W = W.to_local() if isinstance(W, DTensor) else W
+    # Unwrap Parameter first (its .data may still be a DTensor)
+    if isinstance(W, torch.nn.Parameter):
+        W = W.data
+    # Then strip DTensor to get a plain local Tensor for torch.compile
+    if isinstance(W, DTensor):
+        W = W.to_local()
 
     if W.ndim == 1 and W.numel() > 1:
         # we will expand the 1D tensor to a diagonal matrix

@@ -52,6 +52,18 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
             "model.layers.{}.mlp.shared_experts.down_proj.weight": "layers.{}.moe.shared_experts.w2.weight",
         }
 
+    @staticmethod
+    def _is_unsupported_norm_key(key: str) -> bool:
+        return bool(
+            re.match(
+                r"layers\.\d+\.(attention\.(q_norm|k_norm|v_norm|mid_norm)"
+                r"|feed_forward\.mid_norm"
+                r"|moe\.experts\.mid_norm"
+                r"|moe\.shared_experts\.mid_norm)\.",
+                key,
+            )
+        )
+
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         # Both native (apply_rotary_emb_cos_sin / rotate_half) and HF use the
         # "consecutive halves" RoPE convention, so wq/wk weights are copied verbatim.
@@ -69,6 +81,13 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
                 continue
 
             if "layers" in key:
+                if self._is_unsupported_norm_key(key):
+                    raise ValueError(
+                        "HF opt_moe export does not support learned norm tensors for "
+                        f"'{key}'. The HF template currently mirrors the parameter-free "
+                        "native norm path, so exporting this checkpoint would silently "
+                        "drop weights."
+                    )
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 layer_num = re.search(r"\d+", key).group(0)
 

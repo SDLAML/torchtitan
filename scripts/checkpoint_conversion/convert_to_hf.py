@@ -40,6 +40,50 @@ def _apply_config_overrides(model_config, config_path: Path):
     update_dataclass_from_dict(model_config, overrides)
 
 
+def _validate_exported_hf_config(
+    *,
+    model_name: str,
+    model_config,
+    output_dir: Path,
+):
+    if model_name != "opt_moe":
+        return
+
+    config_path = output_dir / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Expected HF config at {config_path}, but it was not created."
+        )
+
+    exported_config = json.loads(config_path.read_text())
+    attention_config = model_config.layer.attention
+    expected_qk_rope_dim = getattr(attention_config, "qk_rope_dim", None)
+    if expected_qk_rope_dim is None:
+        expected_qk_rope_dim = (
+            getattr(attention_config, "head_dim", None)
+            or model_config.dim // attention_config.n_heads
+        )
+    expected_fields = {
+        "gate_only": bool(getattr(attention_config, "gate_only", False)),
+        "mid_norm_position": getattr(attention_config, "mid_norm_position", "after"),
+        "qk_rope_dim": expected_qk_rope_dim,
+    }
+
+    mismatches = {
+        field: (expected_value, exported_config.get(field))
+        for field, expected_value in expected_fields.items()
+        if exported_config.get(field) != expected_value
+    }
+    if mismatches:
+        mismatch_text = ", ".join(
+            f"{field}: expected {expected!r}, got {actual!r}"
+            for field, (expected, actual) in mismatches.items()
+        )
+        raise ValueError(
+            "HF config export lost opt_moe attention settings: " f"{mismatch_text}."
+        )
+
+
 @torch.inference_mode()
 def convert_to_hf(
     input_dir: Path,
@@ -110,6 +154,11 @@ def convert_to_hf(
     # 9. Copy HF config/modeling files and generate config.json
     if model_spec.hf_assets_setup_fn is not None:
         model_spec.hf_assets_setup_fn(model.module, model_config, str(output_dir))
+        _validate_exported_hf_config(
+            model_name=model_name,
+            model_config=model_config,
+            output_dir=output_dir,
+        )
     else:
         print(
             f"[WARNING] No hf_assets_setup_fn registered for '{model_name}/{model_flavor}'. "
@@ -148,14 +197,14 @@ if __name__ == "__main__":
         type=Path,
         default=None,
         help="Path to a pre-existing HF assets directory containing "
-             "model.safetensors.index.json for fqn_to_index_mapping.",
+        "model.safetensors.index.json for fqn_to_index_mapping.",
     )
     parser.add_argument(
         "--model_config_path",
         type=Path,
         default=None,
         help="Optional JSON file with model config overrides (e.g. saved "
-             "checkpoint config). Used to match the exact training hyperparameters.",
+        "checkpoint config). Used to match the exact training hyperparameters.",
     )
     parser.add_argument(
         "--export_dtype",
