@@ -16,6 +16,20 @@ from torchtitan.components.checkpoint import ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
 
 
+def _normalize_layer_pattern_for_validation(pattern):
+    """Match HF export normalization for per-layer pattern fields."""
+    if pattern is None:
+        return None
+    if isinstance(pattern, tuple):
+        pattern = list(pattern)
+    if isinstance(pattern, list):
+        if len(pattern) == 1 and isinstance(pattern[0], str):
+            return pattern[0]
+        if pattern and all(isinstance(x, str) and len(x) == 1 for x in pattern):
+            return "".join(pattern)
+    return pattern
+
+
 def _apply_config_overrides(model_config, config_path: Path):
     """Load JSON config overrides and apply them to model_config in-place.
 
@@ -67,6 +81,14 @@ def _validate_exported_hf_config(
         "gate_only": bool(getattr(attention_config, "gate_only", False)),
         "mid_norm_position": getattr(attention_config, "mid_norm_position", "after"),
         "qk_rope_dim": expected_qk_rope_dim,
+        # HF router is always fp32 by design.
+        "force_router_on_fp32": True,
+        "rope_pattern": _normalize_layer_pattern_for_validation(
+            getattr(model_config, "rope_pattern", None)
+        ),
+        "swa_pattern": _normalize_layer_pattern_for_validation(
+            getattr(model_config, "swa_pattern", None)
+        ),
     }
 
     mismatches = {

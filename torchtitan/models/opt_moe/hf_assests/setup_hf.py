@@ -9,6 +9,24 @@ import os
 import shutil
 
 
+def _normalize_layer_pattern_for_export(pattern):
+    """Normalize native per-layer patterns to HF-friendly JSON forms.
+
+    Native accepts list-wrapped pattern strings such as ``['SSSF']``; HF/vLLM
+    parsers expect either a plain pattern string or list[bool].
+    """
+    if pattern is None:
+        return None
+    if isinstance(pattern, tuple):
+        pattern = list(pattern)
+    if isinstance(pattern, list):
+        if len(pattern) == 1 and isinstance(pattern[0], str):
+            return pattern[0]
+        if pattern and all(isinstance(x, str) and len(x) == 1 for x in pattern):
+            return "".join(pattern)
+    return pattern
+
+
 def _native_to_hf_rope_scaling(rope_cfg):
     """Convert a native RoPE.Config's scaling fields to an HF rope_scaling dict.
 
@@ -84,6 +102,8 @@ def overwrite_config(model, model_config):
     default_config["rms_norm_eps"] = model_config.norm_eps
     default_config["qk_norm"] = attn_cfg.qk_norm
     default_config["norm_everywhere"] = attn_cfg.norm_everywhere
+    # HF router always runs its matmul in fp32 for deterministic routing behavior.
+    default_config["force_router_on_fp32"] = True
     default_config["max_position_embeddings"] = model_config.rope.max_seq_len
 
     default_config["num_attention_heads"] = attention.n_heads
@@ -117,9 +137,13 @@ def overwrite_config(model, model_config):
         model_config.layer, "residual_scale", "identity"
     )
 
-    # Per-layer patterns (store as-is: None, str, or list)
-    default_config["rope_pattern"] = getattr(model_config, "rope_pattern", None)
-    default_config["swa_pattern"] = getattr(model_config, "swa_pattern", None)
+    # Per-layer patterns: normalize list-wrapped strings for HF/vLLM parsers.
+    default_config["rope_pattern"] = _normalize_layer_pattern_for_export(
+        getattr(model_config, "rope_pattern", None)
+    )
+    default_config["swa_pattern"] = _normalize_layer_pattern_for_export(
+        getattr(model_config, "swa_pattern", None)
+    )
 
     # Separate RoPE config for SWA layers (native model's rope_of_swa).
     # rope_theta_swa and rope_scaling_swa are fully independent from the primary rope.

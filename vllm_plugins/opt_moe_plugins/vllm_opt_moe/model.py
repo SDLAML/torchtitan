@@ -227,25 +227,22 @@ def _parse_pattern(
     if pattern is None:
         return [default] * n_layers
     if isinstance(pattern, (list, tuple)):
-        if len(pattern) != n_layers:
-            raise ValueError(
-                f"Pattern list length {len(pattern)} != n_layers {n_layers}"
-            )
-        result = []
-        for v in pattern:
-            if isinstance(v, bool):
-                result.append(v)
-            elif isinstance(v, str):
-                upper = v.upper()
-                if upper not in {true_char.upper(), false_char.upper()}:
-                    raise ValueError(
-                        f"Unknown value '{v}' in pattern list. "
-                        f"Expected '{true_char}' or '{false_char}'."
-                    )
-                result.append(v.upper() == true_char.upper())
-            else:
-                result.append(bool(v))
-        return result
+        # Keep compatibility with native parser:
+        #   ['SSSF'] and ['S', 'S', 'S', 'F'] are valid string forms.
+        if len(pattern) == 1 and isinstance(pattern[0], str):
+            pattern = pattern[0]
+        elif pattern and all(isinstance(v, str) and len(v) == 1 for v in pattern):
+            pattern = "".join(pattern)
+        else:
+            if len(pattern) != n_layers:
+                raise ValueError(
+                    f"Pattern list length {len(pattern)} != n_layers {n_layers}"
+                )
+            if not all(isinstance(v, bool) for v in pattern):
+                raise ValueError(
+                    "Pattern list must be list[bool], ['PATTERN'], or list of single-character strings."
+                )
+            return list(pattern)
     if len(pattern) != n_layers:
         raise ValueError(f"Pattern string length {len(pattern)} != n_layers {n_layers}")
     result = []

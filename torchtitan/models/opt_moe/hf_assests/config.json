@@ -34,6 +34,7 @@
   "vocab_size": 128256,
   "qk_norm": true,
   "norm_everywhere": true,
+  "force_router_on_fp32": true,
   "gated_attention_type": null,
   "gate_only": false,
   "mid_norm_position": "after",
