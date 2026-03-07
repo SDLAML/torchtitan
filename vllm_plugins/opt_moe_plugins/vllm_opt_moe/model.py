@@ -10,7 +10,7 @@ Supports:
 - Dense-only, MoE-only, or hybrid (first N layers dense, rest MoE)
 - Per-layer RoPE pattern ("RRRN" etc.) — NoPE layers skip rotary embeddings
 - Per-layer SWA pattern ("SSSF" etc.) — SWA layers use sliding-window attention
-- Independent SWA-specific RoPE theta (rope_theta_swa + rope_scaling_swa)
+- Independent SWA-specific RoPE theta (rope_theta_swa + rope_parameters_swa)
 - Gated attention: head-wise or element-wise sigmoid gating
 - gate_only and before/after attention mid-norm placement
 - QK norm + norm-everywhere (parameter-free mid RMSNorm in FFN/experts)
@@ -29,7 +29,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm.attention.layer import Attention
+try:
+    from vllm.attention.layer import Attention
+except ImportError:
+    from vllm.model_executor.layers.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, get_current_vllm_config, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -103,10 +106,6 @@ def _get_partial_rotary_factor(config: Any) -> float | None:
 def _get_rope_parameters(config: Any) -> dict[str, Any]:
     """Parse RoPE config from HF config into vLLM get_rope() kwargs."""
     rope_parameters: dict[str, Any] = {}
-    rope_scaling = getattr(config, "rope_scaling", None)
-    if isinstance(rope_scaling, dict):
-        rope_parameters.update(dict(rope_scaling))
-
     raw_rope_parameters = getattr(config, "rope_parameters", None)
     if isinstance(raw_rope_parameters, dict):
         if raw_rope_parameters and all(
@@ -153,12 +152,12 @@ def _get_rope_parameters(config: Any) -> dict[str, Any]:
 
 
 def _get_swa_rope_parameters(config: Any) -> dict[str, Any]:
-    """Parse SWA-specific RoPE parameters (rope_theta_swa + rope_scaling_swa)."""
+    """Parse SWA-specific RoPE parameters (rope_theta_swa + rope_parameters_swa)."""
     rope_parameters: dict[str, Any] = {"rope_type": "default"}
 
-    rope_scaling_swa = getattr(config, "rope_scaling_swa", None)
-    if isinstance(rope_scaling_swa, dict):
-        rope_parameters.update(dict(rope_scaling_swa))
+    rope_parameters_swa = getattr(config, "rope_parameters_swa", None)
+    if isinstance(rope_parameters_swa, dict):
+        rope_parameters.update(dict(rope_parameters_swa))
         if "type" in rope_parameters and "rope_type" not in rope_parameters:
             rope_parameters["rope_type"] = rope_parameters["type"]
 
@@ -201,7 +200,7 @@ def _normalize_mid_norm_position(value: Any) -> str:
     normalized = str(value).strip().lower()
     if normalized not in {"after", "before"}:
         raise ValueError(
-            "mid_norm_position must be either 'after' or 'before', " f"got {value!r}"
+            f"mid_norm_position must be either 'after' or 'before', got {value!r}"
         )
     return normalized
 
@@ -476,7 +475,9 @@ class OptMoEAttention(nn.Module):
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            sliding_window=self.sliding_window if self.sliding_window > 0 else None,
+            per_layer_sliding_window=self.sliding_window
+            if self.sliding_window > 0
+            else None,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
@@ -1079,11 +1080,11 @@ class OptMoEModel(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda pfx: OptMoEDecoderLayer(
+            lambda prefix: OptMoEDecoderLayer(
                 config=config,
                 cache_config=cache_config,
                 quant_config=quant_config,
-                prefix=pfx,
+                prefix=prefix,
                 enable_eplb=self.enable_eplb,
                 num_redundant_experts=self.num_redundant_experts,
             ),

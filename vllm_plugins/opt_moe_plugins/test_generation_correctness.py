@@ -458,9 +458,6 @@ def _canonicalize_config_value(value: Any) -> Any:
 
 def _resolve_rope_config(config_obj: Any) -> Any:
     rope_merged: dict[str, Any] = {}
-    rope_scaling = getattr(config_obj, "rope_scaling", None)
-    if isinstance(rope_scaling, dict):
-        rope_merged.update(dict(rope_scaling))
     rope_parameters = getattr(config_obj, "rope_parameters", None)
     if isinstance(rope_parameters, dict):
         if rope_parameters and all(

@@ -7,11 +7,13 @@
 import argparse
 import importlib
 import json
+
+import os, shutil
 from pathlib import Path
 
 import torch
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import HuggingFaceStorageWriter
+from huggingface_hub import save_torch_state_dict
 from torchtitan.components.checkpoint import ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
 
@@ -28,30 +30,6 @@ def _normalize_layer_pattern_for_validation(pattern):
         if pattern and all(isinstance(x, str) and len(x) == 1 for x in pattern):
             return "".join(pattern)
     return pattern
-
-
-def _apply_config_overrides(model_config, config_path: Path):
-    """Load JSON config overrides and apply them to model_config in-place.
-
-    This is used to match the exact hyperparameters of a saved checkpoint
-    instead of the default values registered in model_registry.
-    """
-    overrides = json.loads(config_path.read_text())
-
-    # Zero out expensive init functions so CPU model construction is cheap
-    def _zero_init_fns(d):
-        if isinstance(d, dict):
-            for k, v in d.items():
-                if "init_fn_type" in k:
-                    d[k] = "zeros"
-                elif isinstance(v, dict):
-                    _zero_init_fns(v)
-
-    _zero_init_fns(overrides)
-
-    from torchtitan.tools.config_utils import update_dataclass_from_dict
-
-    update_dataclass_from_dict(model_config, overrides)
 
 
 def _validate_exported_hf_config(
@@ -102,8 +80,29 @@ def _validate_exported_hf_config(
             for field, (expected, actual) in mismatches.items()
         )
         raise ValueError(
-            "HF config export lost opt_moe attention settings: " f"{mismatch_text}."
+            f"HF config export lost opt_moe attention settings: {mismatch_text}."
         )
+
+
+def try_to_copy_tokenizer(output_dir, hf_assets_path):
+    """
+    if these files exist in the hf_assets_path, then copy them to the output_dir
+    """
+    if hf_assets_path is None:
+        return
+
+    tokenizer_assests_lists = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+        "generation_config.json",
+    ]
+    for asset in tokenizer_assests_lists:
+        if os.path.exists(os.path.join(hf_assets_path, asset)):
+            shutil.copy(
+                os.path.join(hf_assets_path, asset), os.path.join(output_dir, asset)
+            )
 
 
 @torch.inference_mode()
@@ -114,68 +113,62 @@ def convert_to_hf(
     model_flavor: str,
     hf_assets_path: "Path | None",
     export_dtype: str,
-    model_config_path: "Path | None" = None,
 ):
     """Convert a DCP checkpoint to HuggingFace safetensors format.
 
     Steps:
       1. Load ModelSpec from the model registry.
-      2. Optionally apply config overrides from a JSON file.
-      3. Build an empty CPU model and wrap it.
-      4. Create a state dict adapter.
-      5. Load the DCP checkpoint.
-      6. Convert native → HF state dict.
-      7. Optionally cast dtype.
-      8. Write HF safetensors via HuggingFaceStorageWriter.
-      9. Copy HF config/modeling files and generate config.json.
+      2. Build an empty CPU model and wrap it.
+      3. Create a state dict adapter.
+      4. Load the DCP checkpoint.
+      5. Convert native → HF state dict.
+      6. Optionally cast dtype.
+      7. Write HF safetensors.
+      8. Copy HF config/modeling files and generate config.json.
     """
     # 1. Get ModelSpec from the model registry
     model_module = importlib.import_module(f"torchtitan.models.{model_name}")
     model_spec = model_module.model_registry(model_flavor)
 
-    # 2. Optionally apply config overrides
+    # 2. Build empty model on CPU
     model_config = model_spec.model
-    if model_config_path is not None:
-        _apply_config_overrides(model_config, model_config_path)
-
-    # 3. Build empty model on CPU
     with torch.device("cpu"):
-        model = model_config.build()
-    model = ModelWrapper(model)
+        actual_model = model_config.build()
+    model_config = getattr(actual_model, "config", model_config)
+    model = ModelWrapper(actual_model)
 
-    # 4. Create state dict adapter (new API: model_config, not model_args)
+    # 3. Create state dict adapter (new API: model_config, not model_args)
     assert model_spec.state_dict_adapter is not None, (
         "state_dict_adapter is required for HF checkpoint conversion. "
         f"Model '{model_name}/{model_flavor}' has none registered."
     )
     sd_adapter = model_spec.state_dict_adapter(model_config, hf_assets_path)
 
-    # 5. Load DCP checkpoint into empty state dict
+    # 4. Load DCP checkpoint into empty state dict
     state_dict = model._get_state_dict()
     dcp.load(state_dict, checkpoint_id=str(input_dir))
 
-    # 6. Convert native → HF state dict
+    # 5. Convert native → HF state dict
     hf_state_dict = sd_adapter.to_hf(state_dict)
 
-    # 7. Apply export dtype if requested
+    # 6. Apply export dtype if requested
     target_dtype = TORCH_DTYPE_MAP[export_dtype]
     if target_dtype != torch.float32:
         hf_state_dict = {k: v.to(target_dtype) for k, v in hf_state_dict.items()}
 
-    # 8. Write HF safetensors
+    # 7. Write HF safetensors
     output_dir.mkdir(parents=True, exist_ok=True)
-    storage_writer = HuggingFaceStorageWriter(
-        path=str(output_dir),
-        save_distributed=True,
-        fqn_to_index_mapping=sd_adapter.fqn_to_index_mapping,
-        enable_consolidation=True,
-        thread_count_consolidation=5,
+    save_torch_state_dict(
+        hf_state_dict,
+        output_dir,
+        max_shard_size="5GB",
+        safe_serialization=True,
+        metadata={"format": "pt"},
     )
-    dcp.save(hf_state_dict, storage_writer=storage_writer)
 
-    # 9. Copy HF config/modeling files and generate config.json
+    # 8. Copy HF config/modeling files and generate config.json
     if model_spec.hf_assets_setup_fn is not None:
-        model_spec.hf_assets_setup_fn(model.module, model_config, str(output_dir))
+        model_spec.hf_assets_setup_fn(actual_model, model_config, str(output_dir))
         _validate_exported_hf_config(
             model_name=model_name,
             model_config=model_config,
@@ -186,6 +179,13 @@ def convert_to_hf(
             f"[WARNING] No hf_assets_setup_fn registered for '{model_name}/{model_flavor}'. "
             "Skipping config.json generation."
         )
+
+    # hf_assets_setup_fn will create a dummy chat-template.jinja,
+    # we need to copy the tokenizer files to the output_dir
+    # to maybe override the dummy chat-template.jinja
+    try_to_copy_tokenizer(output_dir, hf_assets_path)
+
+    print(f"model is saved to {output_dir}")
 
 
 if __name__ == "__main__":
@@ -222,13 +222,6 @@ if __name__ == "__main__":
         "model.safetensors.index.json for fqn_to_index_mapping.",
     )
     parser.add_argument(
-        "--model_config_path",
-        type=Path,
-        default=None,
-        help="Optional JSON file with model config overrides (e.g. saved "
-        "checkpoint config). Used to match the exact training hyperparameters.",
-    )
-    parser.add_argument(
         "--export_dtype",
         type=str,
         default="float32",
@@ -244,5 +237,4 @@ if __name__ == "__main__":
         args.model_flavor,
         args.hf_assets_path,
         args.export_dtype,
-        args.model_config_path,
     )

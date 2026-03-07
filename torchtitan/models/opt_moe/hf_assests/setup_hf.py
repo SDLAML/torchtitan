@@ -9,6 +9,18 @@ import os
 import shutil
 
 
+def _resolve_model_config(model, model_config=None):
+    materialized_config = getattr(model, "config", None)
+    if materialized_config is not None:
+        return materialized_config
+    if model_config is not None:
+        return model_config
+    raise ValueError(
+        "opt_moe HF asset export requires a materialized model.config or an "
+        "explicit model_config."
+    )
+
+
 def _normalize_layer_pattern_for_export(pattern):
     """Normalize native per-layer patterns to HF-friendly JSON forms.
 
@@ -27,29 +39,38 @@ def _normalize_layer_pattern_for_export(pattern):
     return pattern
 
 
-def _native_to_hf_rope_scaling(rope_cfg):
-    """Convert a native RoPE.Config's scaling fields to an HF rope_scaling dict.
-
-    Returns None if scaling == "none" (the common case), or a dict matching the
-    HF rope_scaling format for "llama3" / "yarn" types.
-    """
-    if rope_cfg is None or rope_cfg.scaling == "none":
+def _native_to_hf_rope_parameters(rope_cfg, *, partial_rotary_factor: float):
+    """Convert a native RoPE.Config to current HF rope_parameters format."""
+    if rope_cfg is None:
         return None
+    rope_parameters = {
+        "rope_type": "default",
+        "rope_theta": rope_cfg.theta,
+        "partial_rotary_factor": partial_rotary_factor,
+    }
+    if rope_cfg.scaling == "none":
+        return rope_parameters
     if rope_cfg.scaling == "llama":
-        return {
-            "rope_type": "llama3",
-            "factor": rope_cfg.scaling_factor,
-            "low_freq_factor": rope_cfg.low_freq_factor,
-            "high_freq_factor": rope_cfg.high_freq_factor,
-            "original_max_position_embeddings": rope_cfg.original_max_position_embeddings,
-        }
+        rope_parameters.update(
+            {
+                "rope_type": "llama3",
+                "factor": rope_cfg.scaling_factor,
+                "low_freq_factor": rope_cfg.low_freq_factor,
+                "high_freq_factor": rope_cfg.high_freq_factor,
+                "original_max_position_embeddings": rope_cfg.original_max_position_embeddings,
+            }
+        )
+        return rope_parameters
     if rope_cfg.scaling == "yarn":
-        return {
-            "rope_type": "yarn",
-            "factor": rope_cfg.rope_factor,
-            "original_max_position_embeddings": rope_cfg.original_seq_len,
-        }
-    return None  # unknown scaling type — leave as null
+        rope_parameters.update(
+            {
+                "rope_type": "yarn",
+                "factor": rope_cfg.rope_factor,
+                "original_max_position_embeddings": rope_cfg.original_seq_len,
+            }
+        )
+        return rope_parameters
+    return rope_parameters
 
 
 def copy_and_overwrite_model_config(model, model_config, dst_path: str):
@@ -61,6 +82,7 @@ def copy_and_overwrite_model_config(model, model_config, dst_path: str):
         model_config: OPTMoEModel.Config instance with training hyperparameters.
         dst_path: Destination directory for HF checkpoint.
     """
+    model_config = _resolve_model_config(model, model_config)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     src_config_path = os.path.join(current_dir, "configuration_opt_moe.py")
     src_modeling_path = os.path.join(current_dir, "modeling_opt_moe.py")
@@ -69,6 +91,8 @@ def copy_and_overwrite_model_config(model, model_config, dst_path: str):
     dst_modeling_py_path = os.path.join(dst_path, "modeling_opt_moe.py")
     dst_config_json_path = os.path.join(dst_path, "config.json")
 
+    dummy_chat_template_path = os.path.join(current_dir, "chat_template.jinja")
+
     new_config = overwrite_config(model, model_config)
 
     if os.path.exists(dst_path):
@@ -76,9 +100,13 @@ def copy_and_overwrite_model_config(model, model_config, dst_path: str):
         shutil.copy(src_modeling_path, dst_modeling_py_path)
         with open(dst_config_json_path, "w") as f:
             json.dump(new_config, f, indent=4)
+        if os.path.exists(dummy_chat_template_path):
+            shutil.copy(
+                dummy_chat_template_path, os.path.join(dst_path, "chat_template.jinja")
+            )
 
 
-def overwrite_config(model, model_config):
+def overwrite_config(model, model_config=None):
     """Build a config.json dict from the model and model_config.
 
     Args:
@@ -88,6 +116,7 @@ def overwrite_config(model, model_config):
     Returns:
         dict suitable for writing as config.json.
     """
+    model_config = _resolve_model_config(model, model_config)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(current_dir, "config.json")) as f:
         default_config = json.load(f)
@@ -110,7 +139,6 @@ def overwrite_config(model, model_config):
     default_config["num_key_value_heads"] = attention.n_kv_heads
     default_config["head_dim"] = attention.head_dim
     default_config["rope_theta"] = model_config.rope.theta
-    default_config["rope_scaling"] = _native_to_hf_rope_scaling(model_config.rope)
 
     default_config["hidden_size"] = model.tok_embeddings.weight.shape[1]
 
@@ -132,6 +160,10 @@ def overwrite_config(model, model_config):
     default_config["partial_rotary_factor"] = (
         default_config["qk_rope_dim"] / default_config["head_dim"]
     )
+    default_config["rope_parameters"] = _native_to_hf_rope_parameters(
+        model_config.rope,
+        partial_rotary_factor=default_config["partial_rotary_factor"],
+    )
 
     default_config["residual_scale"] = getattr(
         model_config.layer, "residual_scale", "identity"
@@ -146,12 +178,15 @@ def overwrite_config(model, model_config):
     )
 
     # Separate RoPE config for SWA layers (native model's rope_of_swa).
-    # rope_theta_swa and rope_scaling_swa are fully independent from the primary rope.
+    # rope_theta_swa and rope_parameters_swa are fully independent from the primary rope.
     rope_of_swa = getattr(model_config, "rope_of_swa", None)
     default_config["rope_theta_swa"] = (
         float(rope_of_swa.theta) if rope_of_swa is not None else None
     )
-    default_config["rope_scaling_swa"] = _native_to_hf_rope_scaling(rope_of_swa)
+    default_config["rope_parameters_swa"] = _native_to_hf_rope_parameters(
+        rope_of_swa,
+        partial_rotary_factor=default_config["partial_rotary_factor"],
+    )
 
     if model_config.layer.n_dense_layers > 0:
         default_config["intermediate_size"] = model_config.layer.feed_forward.hidden_dim

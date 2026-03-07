@@ -4,33 +4,269 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Callable, Optional, Union
+import logging
+from functools import wraps
+from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
 
+try:
+    from typing import TypedDict, Unpack
+except ImportError:
+    from typing_extensions import TypedDict, Unpack
+
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import create_causal_mask
-from transformers.modeling_layers import (
-    GenericForQuestionAnswering,
-    GenericForSequenceClassification,
-    GenericForTokenClassification,
-    GradientCheckpointingLayer,
-)
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from transformers.modeling_rope_utils import dynamic_rope_update, ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.processing_utils import Unpack
-from transformers.utils import auto_docstring, can_return_tuple, TransformersKwargs
+from transformers.modeling_utils import PreTrainedModel
+
+try:
+    from transformers.integrations import use_kernel_forward_from_hub
+except ImportError:
+    try:
+        from transformers.integrations.hub_kernels import use_kernel_forward_from_hub
+    except ImportError:
+
+        def use_kernel_forward_from_hub(_kernel_name):
+            def decorator(obj):
+                return obj
+
+            return decorator
+
+
+try:
+    from transformers.masking_utils import create_causal_mask
+except ImportError:
+
+    def create_causal_mask(
+        config,
+        inputs_embeds=None,
+        attention_mask=None,
+        cache_position=None,
+        past_key_values=None,
+        position_ids=None,
+        input_embeds=None,
+        **kwargs,
+    ):
+        del config, kwargs, position_ids
+        if inputs_embeds is None:
+            inputs_embeds = input_embeds
+        if inputs_embeds is None:
+            raise ValueError("`inputs_embeds` must be provided to build a causal mask.")
+        if attention_mask is not None and attention_mask.dim() == 4:
+            return attention_mask
+
+        batch_size, query_length = inputs_embeds.shape[:2]
+        dtype = inputs_embeds.dtype
+        device = inputs_embeds.device
+        min_dtype = torch.finfo(dtype).min
+
+        if cache_position is None:
+            past_seen_tokens = 0
+            if past_key_values is not None and hasattr(
+                past_key_values, "get_seq_length"
+            ):
+                try:
+                    past_seen_tokens = int(past_key_values.get_seq_length())
+                except TypeError:
+                    past_seen_tokens = int(past_key_values.get_seq_length(0))
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + query_length,
+                device=device,
+            )
+
+        key_length = (
+            int(cache_position[-1].item()) + 1
+            if cache_position.numel() > 0
+            else query_length
+        )
+        if attention_mask is not None and attention_mask.dim() == 2:
+            key_length = max(key_length, attention_mask.shape[-1])
+
+        key_positions = torch.arange(key_length, device=device)
+        causal_mask = key_positions.view(1, 1, key_length) > cache_position.view(
+            1, query_length, 1
+        )
+        causal_mask = causal_mask.to(dtype=dtype) * min_dtype
+        causal_mask = causal_mask.unsqueeze(1).expand(
+            batch_size, 1, query_length, key_length
+        )
+
+        if attention_mask is None:
+            return causal_mask
+        if attention_mask.dim() != 2:
+            return attention_mask
+
+        if attention_mask.shape[-1] < key_length:
+            attention_mask = nn.functional.pad(
+                attention_mask,
+                (0, key_length - attention_mask.shape[-1]),
+                value=1,
+            )
+        padding_mask = attention_mask[:, None, None, :key_length] > 0
+        padding_bias = torch.zeros(
+            (batch_size, 1, 1, key_length), dtype=dtype, device=device
+        )
+        padding_bias = padding_bias.masked_fill(~padding_mask, min_dtype)
+        return causal_mask + padding_bias
+
+
+try:
+    from transformers.modeling_layers import (
+        GenericForQuestionAnswering,
+        GenericForSequenceClassification,
+        GenericForTokenClassification,
+        GradientCheckpointingLayer,
+    )
+except ImportError:
+
+    class GradientCheckpointingLayer(nn.Module):
+        gradient_checkpointing = False
+
+    class _UnsupportedHeadMixin:
+        _compat_message = (
+            "This OptMoE task head requires `transformers.modeling_layers`, "
+            "which is not available in this transformers version."
+        )
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError(self._compat_message)
+
+    class GenericForSequenceClassification(_UnsupportedHeadMixin):
+        pass
+
+    class GenericForQuestionAnswering(_UnsupportedHeadMixin):
+        pass
+
+    class GenericForTokenClassification(_UnsupportedHeadMixin):
+        pass
+
+
+try:
+    from transformers.modeling_rope_utils import (
+        dynamic_rope_update,
+        ROPE_INIT_FUNCTIONS,
+    )
+except ImportError:
+    try:
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    except ImportError:
+        ROPE_INIT_FUNCTIONS = {}
+
+    def dynamic_rope_update(fn):
+        return fn
+
+
+try:
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+except ImportError:
+    ALL_ATTENTION_FUNCTIONS = {}
+
+try:
+    from transformers.utils import auto_docstring
+except ImportError:
+    try:
+        from transformers.utils.auto_docstring import auto_docstring
+    except ImportError:
+
+        def auto_docstring(obj=None, **_kwargs):
+            if obj is None:
+
+                def decorator(inner):
+                    return inner
+
+                return decorator
+            return obj
+
+
+try:
+    from transformers.utils import can_return_tuple
+except ImportError:
+    try:
+        from transformers.utils.generic import can_return_tuple
+    except ImportError:
+
+        def can_return_tuple(func):
+            @wraps(func)
+            def wrapper(self, *args, **kwargs):
+                return_dict = getattr(
+                    getattr(self, "config", None), "return_dict", True
+                )
+                return_dict = kwargs.pop("return_dict", return_dict)
+                output = func(self, *args, **kwargs)
+                if not return_dict and not isinstance(output, tuple):
+                    output = output.to_tuple()
+                return output
+
+            return wrapper
+
+
+try:
+    from transformers.utils import TransformersKwargs
+except ImportError:
+    try:
+        from transformers.utils.generic import TransformersKwargs
+    except ImportError:
+
+        class TransformersKwargs(TypedDict, total=False):
+            output_hidden_states: Optional[bool]
+            output_attentions: Optional[bool]
+            position_ids: Optional[torch.LongTensor]
+            is_causal: Optional[bool]
+
 
 from .configuration_opt_moe import OptMoEConfig
+
+
+logger = logging.getLogger(__name__)
+
+
+def _warning_once(message):
+    if hasattr(logger, "warning_once"):
+        logger.warning_once(message)
+    else:
+        logger.warning(message)
+
+
+def _get_attention_interface(attn_implementation: str) -> Callable:
+    if attn_implementation in (None, "eager"):
+        return eager_attention_forward
+    if hasattr(ALL_ATTENTION_FUNCTIONS, "get_interface"):
+        try:
+            return ALL_ATTENTION_FUNCTIONS.get_interface(
+                attn_implementation, eager_attention_forward
+            )
+        except TypeError:
+            return ALL_ATTENTION_FUNCTIONS.get_interface(attn_implementation)
+    if isinstance(ALL_ATTENTION_FUNCTIONS, dict):
+        return ALL_ATTENTION_FUNCTIONS[attn_implementation]
+    return ALL_ATTENTION_FUNCTIONS[attn_implementation]
+
+
+def _build_dynamic_cache(config: OptMoEConfig) -> DynamicCache:
+    try:
+        return DynamicCache(config=config)
+    except TypeError:
+        return DynamicCache()
+
+
+def _causal_lm_loss(
+    logits: torch.Tensor, labels: torch.Tensor, vocab_size: int
+) -> torch.Tensor:
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    return nn.functional.cross_entropy(
+        shift_logits.view(-1, vocab_size),
+        shift_labels.view(-1),
+        ignore_index=-100,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -135,24 +371,48 @@ class OptMoERMSNorm(nn.Module):
 class OptMoERotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
+    @staticmethod
+    def compute_default_rope_parameters(
+        config: OptMoEConfig | None = None,
+        device: Optional["torch.device"] = None,
+        seq_len: int | None = None,
+    ) -> tuple["torch.Tensor", float]:
+        """Compute inverse frequencies for the non-scaled/default RoPE path."""
+        assert config is not None
+        base = config.rope_parameters["rope_theta"]
+        partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
+        head_dim = getattr(config, "head_dim", None) or (
+            config.hidden_size // config.num_attention_heads
+        )
+        dim = int(head_dim * partial_rotary_factor)
+        attention_factor = 1.0
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.int64).to(
+                    device=device, dtype=torch.float
+                )
+                / dim
+            )
+        )
+        return inv_freq, attention_factor
+
     def __init__(self, config: OptMoEConfig, device=None):
         super().__init__()
-        # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type")
-            )
-        else:
-            self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        # Normalize to the current transformers rope_parameters contract.
+        self.config.standardize_rope_params()
+        self.rope_type = self.config.rope_parameters["rope_type"]
+        rope_init_fn: Callable = self.compute_default_rope_parameters
+        if self.rope_type != "default":
+            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
 
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
@@ -402,9 +662,9 @@ class OptMoEAttention(nn.Module):
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
+            attention_interface = _get_attention_interface(
                 self.config._attn_implementation
-            ]
+            )
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -810,7 +1070,7 @@ class OptMoEModel(OptMoEPreTrainedModel):
         self.rotary_emb = OptMoERotaryEmbedding(config=config)
 
         # Second rotary embedding for SWA layers — fully independent from the global one.
-        # Mirrors native model's rope_of_swa: separate theta AND separate rope_scaling.
+        # Mirrors native model's rope_of_swa: separate theta AND separate rope_parameters.
         rope_theta_swa = getattr(config, "rope_theta_swa", None)
         if rope_theta_swa is not None:
             from copy import deepcopy
@@ -819,7 +1079,7 @@ class OptMoEModel(OptMoEPreTrainedModel):
             # Override both theta and scaling independently so the two RoPE
             # configurations are completely decoupled.
             _swa_config.rope_theta = rope_theta_swa
-            _swa_config.rope_scaling = getattr(config, "rope_scaling_swa", None)
+            _swa_config.rope_parameters = getattr(config, "rope_parameters_swa", None)
             self.rotary_emb_swa = OptMoERotaryEmbedding(config=_swa_config)
         else:
             self.rotary_emb_swa = None
@@ -882,7 +1142,7 @@ class OptMoEModel(OptMoEPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            past_key_values = _build_dynamic_cache(self.config)
 
         if cache_position is None:
             past_seen_tokens = (
@@ -899,7 +1159,7 @@ class OptMoEModel(OptMoEPreTrainedModel):
 
         causal_mask = create_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             cache_position=cache_position,
             past_key_values=past_key_values,
@@ -1010,12 +1270,15 @@ class OptMoEForCausalLM(OptMoEPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.vocab_size,
-                **kwargs,
-            )
+            if hasattr(self, "loss_function"):
+                loss = self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.vocab_size,
+                    **kwargs,
+                )
+            else:
+                loss = _causal_lm_loss(logits, labels, self.config.vocab_size)
 
         return CausalLMOutputWithPast(
             loss=loss,

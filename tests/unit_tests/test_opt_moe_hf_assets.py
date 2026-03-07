@@ -109,7 +109,7 @@ class TestOptMoEHFAssets(unittest.TestCase):
         )
         model = model_config.build()
 
-        exported = overwrite_config(model, model_config)
+        exported = overwrite_config(model)
 
         self.assertTrue(exported["gate_only"])
         self.assertEqual(exported["mid_norm_position"], "before")

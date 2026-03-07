@@ -26,7 +26,7 @@ The `vllm_opt_moe` plugin extends the staging plugin with:
 | Per-layer NoPE/RoPE | `rope_pattern` | `"RRRN"` — last layer has no RoPE |
 | Per-layer SWA | `swa_pattern` | `"SSFF"` — first 2 layers use sliding-window attention |
 | Independent SWA theta | `rope_theta_swa` | `500000.0` |
-| Independent SWA rope_scaling | `rope_scaling_swa` | `{...}` |
+| Independent SWA rope_parameters | `rope_parameters_swa` | `{...}` |
 | SWA window size | `sliding_window_size` | `4096` |
 | Head-wise gated attention | `gated_attention_type` | `"head-wise"` |
 | Element-wise gated attention | `gated_attention_type` | `"element-wise"` |
