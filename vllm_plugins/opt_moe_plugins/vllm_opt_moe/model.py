@@ -91,6 +91,40 @@ def _compute_residual_scales(residual_scale: str, n_layers: int) -> tuple[float,
     return 1.0, 1.0  # "identity"
 
 
+def _get_attention_norm_everywhere(config: Any) -> bool:
+    return bool(
+        getattr(
+            config,
+            "attention_norm_everywhere",
+            getattr(config, "norm_everywhere", False),
+        )
+    )
+
+
+def _get_ffn_norm_everywhere(config: Any) -> bool:
+    return bool(
+        getattr(
+            config,
+            "ffn_norm_everywhere",
+            getattr(config, "norm_everywhere", False),
+        )
+    )
+
+
+def _get_moe_norm_everywhere(config: Any) -> bool:
+    return bool(
+        getattr(
+            config,
+            "moe_norm_everywhere",
+            getattr(
+                config,
+                "ffn_norm_everywhere",
+                getattr(config, "norm_everywhere", False),
+            ),
+        )
+    )
+
+
 def _get_partial_rotary_factor(config: Any) -> float | None:
     partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
     if partial_rotary_factor is not None:
@@ -395,7 +429,7 @@ class OptMoEAttention(nn.Module):
         )
 
         # --- Norms ---
-        use_norm_everywhere = bool(getattr(config, "norm_everywhere", False))
+        use_norm_everywhere = _get_attention_norm_everywhere(config)
         use_qk_norm = bool(getattr(config, "qk_norm", False))
         if use_norm_everywhere:
             self.norm_mode = self._NORM_MODE_QKVO
@@ -694,7 +728,7 @@ class OptMoEMoE(nn.Module):
             "VLLM_OPT_MOE_DISABLE_FUSED_TOPK_BIAS", False
         )
         disable_fused_moe = _env_bool("VLLM_OPT_MOE_DISABLE_FUSED", False)
-        use_norm_everywhere = bool(getattr(config, "norm_everywhere", False))
+        use_norm_everywhere = _get_moe_norm_everywhere(config)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
         self.router = OptMoERouter(
@@ -976,7 +1010,7 @@ class OptMoEDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
-                norm_everywhere=bool(getattr(config, "norm_everywhere", False)),
+                norm_everywhere=_get_ffn_norm_everywhere(config),
                 bias=bool(getattr(config, "mlp_bias", False)),
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",

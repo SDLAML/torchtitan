@@ -122,6 +122,8 @@ def overwrite_config(model, model_config=None):
         default_config = json.load(f)
 
     attn_cfg = model_config.layer.attention
+    feed_forward_cfg = getattr(model_config.layer, "feed_forward", None)
+    moe_cfg = getattr(model_config.layer, "moe", None)
 
     # Inspect the first layer's attention module for runtime sizes
     attention = model.layers["0"].attention
@@ -130,7 +132,20 @@ def overwrite_config(model, model_config=None):
     default_config["vocab_size"] = model_config.vocab_size
     default_config["rms_norm_eps"] = model_config.norm_eps
     default_config["qk_norm"] = attn_cfg.qk_norm
+    # Keep legacy norm_everywhere for backward compatibility with older runtimes,
+    # but export split flags so attention/FFN/MoE can differ.
     default_config["norm_everywhere"] = attn_cfg.norm_everywhere
+    default_config["attention_norm_everywhere"] = attn_cfg.norm_everywhere
+    default_config["ffn_norm_everywhere"] = (
+        bool(feed_forward_cfg.norm_everywhere)
+        if feed_forward_cfg is not None
+        else False
+    )
+    default_config["moe_norm_everywhere"] = (
+        bool(moe_cfg.norm_everywhere)
+        if moe_cfg is not None
+        else default_config["ffn_norm_everywhere"]
+    )
     # HF router always runs its matmul in fp32 for deterministic routing behavior.
     default_config["force_router_on_fp32"] = True
     default_config["max_position_embeddings"] = model_config.rope.max_seq_len

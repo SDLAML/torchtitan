@@ -348,6 +348,40 @@ def _normalize_mid_norm_position(value: str) -> str:
     return normalized
 
 
+def _get_attention_norm_everywhere(config) -> bool:
+    return bool(
+        getattr(
+            config,
+            "attention_norm_everywhere",
+            getattr(config, "norm_everywhere", False),
+        )
+    )
+
+
+def _get_ffn_norm_everywhere(config) -> bool:
+    return bool(
+        getattr(
+            config,
+            "ffn_norm_everywhere",
+            getattr(config, "norm_everywhere", False),
+        )
+    )
+
+
+def _get_moe_norm_everywhere(config) -> bool:
+    return bool(
+        getattr(
+            config,
+            "moe_norm_everywhere",
+            getattr(
+                config,
+                "ffn_norm_everywhere",
+                getattr(config, "norm_everywhere", False),
+            ),
+        )
+    )
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class OptMoERMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -567,7 +601,8 @@ class OptMoEAttention(nn.Module):
             bias=config.attention_bias,
         )
 
-        qk_norm = config.qk_norm or config.norm_everywhere
+        attention_norm_everywhere = _get_attention_norm_everywhere(config)
+        qk_norm = config.qk_norm or attention_norm_everywhere
         if qk_norm:
             self.q_norm = OptMoERMSNorm(self.head_dim, config.rms_norm_eps)
             self.k_norm = OptMoERMSNorm(self.head_dim, config.rms_norm_eps)
@@ -575,7 +610,7 @@ class OptMoEAttention(nn.Module):
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
 
-        if config.norm_everywhere:
+        if attention_norm_everywhere:
             self.v_norm = OptMoERMSNorm(self.head_dim, config.rms_norm_eps)
             if self.mid_norm_position == "after":
                 self.mid_norm = OptMoERMSNorm(
@@ -720,7 +755,7 @@ class OptMoEMLP(nn.Module):
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-        if config.norm_everywhere:
+        if _get_ffn_norm_everywhere(config):
             self.mid_norm = OptMoERMSNorm(self.intermediate_size, config.rms_norm_eps)
         else:
             self.mid_norm = nn.Identity()
@@ -809,10 +844,11 @@ class OptMoEMoE(nn.Module):
         shared_hidden = int(config.moe_intermediate_size) * max(
             1, int(getattr(config, "n_shared_experts", 1))
         )
+        moe_norm_everywhere = _get_moe_norm_everywhere(config)
         self.shared_experts = OptMoESharedExperts(
             hidden_size=config.hidden_size,
             moe_intermediate_size=shared_hidden,
-            norm_everywhere=config.norm_everywhere,
+            norm_everywhere=moe_norm_everywhere,
             rms_norm_eps=config.rms_norm_eps,
             hidden_act=config.hidden_act,
         )
@@ -822,7 +858,7 @@ class OptMoEMoE(nn.Module):
                 OptMoESharedExperts(
                     hidden_size=config.hidden_size,
                     moe_intermediate_size=config.moe_intermediate_size,
-                    norm_everywhere=config.norm_everywhere,
+                    norm_everywhere=moe_norm_everywhere,
                     rms_norm_eps=config.rms_norm_eps,
                     hidden_act=config.hidden_act,
                 )
