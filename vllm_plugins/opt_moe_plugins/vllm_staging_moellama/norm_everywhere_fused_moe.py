@@ -14,8 +14,11 @@ This gives `activation + no-parameter RMSNorm` behavior without writing any
 new CUDA/Triton kernels and without patching vLLM core code.
 """
 
+import inspect
+import logging
 import os
 import shutil
+import types
 from pathlib import Path
 
 import torch
@@ -32,6 +35,20 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 )
 
 _H100_ALIAS_CONFIG_READY = False
+logger = logging.getLogger(__name__)
+
+
+def _kernel_fused_experts_replaceable() -> bool:
+    """Return whether this vLLM build still allows replacing kernel experts."""
+    try:
+        from vllm.model_executor.layers.fused_moe.fused_moe import FusedMoEKernel
+    except Exception:
+        return True
+
+    fused_experts_attr = inspect.getattr_static(FusedMoEKernel, "fused_experts", None)
+    if isinstance(fused_experts_attr, property):
+        return fused_experts_attr.fset is not None
+    return True
 
 
 def _maybe_enable_h100_tuned_moe_config_alias() -> None:
@@ -82,6 +99,25 @@ def _weightless_rms_norm_inplace(x: torch.Tensor, eps: float) -> None:
         variance = x.to(torch.float32).square().mean(dim=-1, keepdim=True)
     inv_rms = torch.rsqrt(variance + eps)
     x.mul_(inv_rms.to(dtype=x.dtype))
+
+
+def _patch_expert_activation_inplace(expert: object, rms_norm_eps: float) -> bool:
+    activation = getattr(expert, "activation", None)
+    if activation is None or getattr(
+        expert, "_norm_everywhere_activation_patched", False
+    ):
+        return False
+
+    def patched_activation(
+        self, activation_name: str, output: torch.Tensor, input: torch.Tensor
+    ) -> None:
+        activation(activation_name, output, input)
+        _weightless_rms_norm_inplace(output, float(rms_norm_eps))
+
+    expert.activation = types.MethodType(patched_activation, expert)
+    expert._norm_everywhere_activation_patched = True
+    expert.rms_norm_eps = float(rms_norm_eps)
+    return True
 
 
 class NormEverywhereTritonExperts(TritonExperts):
@@ -160,12 +196,13 @@ class NormEverywhereUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # Force Triton backend so we can inject RMSNorm in activation hook.
         if not bool(getattr(self, "is_monolithic", False)):
             self.unquantized_backend = UnquantizedMoeBackend.TRITON
+        self._kernel_fused_experts_replaceable = _kernel_fused_experts_replaceable()
 
     def select_gemm_impl(
         self,
         prepare_finalize: mk.FusedMoEPrepareAndFinalize,
         layer: torch.nn.Module,
-    ) -> mk.FusedMoEPermuteExpertsUnpermute:
+    ):
         assert self.moe_quant_config is not None
         if (
             prepare_finalize.activation_format
@@ -187,31 +224,39 @@ class NormEverywhereUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def _replace_kernel_experts_with_norm(self) -> None:
         if self.kernel is None:
             return
-        assert self.moe_quant_config is not None
 
         fused_experts = self.kernel.fused_experts
-        if isinstance(fused_experts, BatchedTritonExperts):
-            max_num_tokens = int(getattr(fused_experts, "max_num_tokens", 0))
-            if max_num_tokens <= 0:
-                max_num_tokens = int(self.moe.max_num_tokens)
-            num_dispatchers = int(getattr(fused_experts, "num_dispatchers", 1))
-            self.kernel.fused_experts = NormEverywhereBatchedTritonExperts(
-                moe_config=self.moe,
-                quant_config=self.moe_quant_config,
-                max_num_tokens=max_num_tokens,
-                num_dispatchers=max(1, num_dispatchers),
+        patched = False
+        if isinstance(fused_experts, (BatchedTritonExperts, TritonExperts)):
+            patched = _patch_expert_activation_inplace(
+                fused_experts,
                 rms_norm_eps=self.rms_norm_eps,
             )
-        elif isinstance(fused_experts, TritonExperts):
-            self.kernel.fused_experts = NormEverywhereTritonExperts(
-                moe_config=self.moe,
-                quant_config=self.moe_quant_config,
-                rms_norm_eps=self.rms_norm_eps,
+        if patched:
+            logger.info(
+                "Norm-everywhere fused MoE kernel active via in-place activation patch"
             )
-        else:
+
+    def _verify_norm_everywhere_kernel(self) -> None:
+        if self.kernel is None:
+            raise RuntimeError("norm-everywhere fused MoE kernel setup missing kernel")
+        if getattr(self, "unquantized_backend", None) != UnquantizedMoeBackend.TRITON:
+            raise RuntimeError(
+                "norm-everywhere fused MoE requires TRITON backend, "
+                f"got {getattr(self, 'unquantized_backend', None)!r}"
+            )
+
+        fused_experts = getattr(self.kernel, "fused_experts", None)
+        if getattr(fused_experts, "_norm_everywhere_activation_patched", False):
+            logger.info(
+                "Norm-everywhere fused MoE kernel verified via activation patch"
+            )
             return
 
-        self.kernel._post_init_setup()
+        raise RuntimeError(
+            "norm-everywhere fused MoE kernel verification failed: "
+            f"expected patched TritonExperts, got {type(fused_experts).__name__}"
+        )
 
     def _setup_kernel(
         self,
@@ -221,6 +266,7 @@ class NormEverywhereUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ) -> None:
         super()._setup_kernel(layer=layer, w13=w13, w2=w2)
         self._replace_kernel_experts_with_norm()
+        self._verify_norm_everywhere_kernel()
 
 
 class NormEverywhereSharedFusedMoE(SharedFusedMoE):
@@ -239,5 +285,6 @@ class NormEverywhereSharedFusedMoE(SharedFusedMoE):
             backend = getattr(norm_quant_method, "unquantized_backend", None)
             is_monolithic = bool(getattr(norm_quant_method, "is_monolithic", False))
             if (backend == UnquantizedMoeBackend.TRITON) and not is_monolithic:
-                self.quant_method = norm_quant_method
+                self._replace_quant_method(norm_quant_method)
+                self.base_quant_method = self.quant_method
                 self.supports_norm_everywhere = True
