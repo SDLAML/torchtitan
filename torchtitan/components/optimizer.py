@@ -7,9 +7,9 @@
 import functools
 import queue
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Callable, Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -405,36 +405,37 @@ def moe_metrics_worker(log_queue: queue.Queue):
             moe = info["module"]
             layer_id = info["layer_id"]
 
+            layer_usages = all_usages_cpu[usage_offset : usage_offset + num_experts]
+            layer_biases = all_biases_cpu[bias_offset : bias_offset + num_experts]
+            usage_tensor = torch.tensor(layer_usages, dtype=torch.float32)
+            bias_tensor = torch.tensor(layer_biases, dtype=torch.float32)
             metrics = {
                 f"moe_entropy/L-{layer_id}": all_entropies_cpu[i],
                 f"moe_maxvio_batch/L-{layer_id}": all_maxvio_batch_cpu[i],
                 f"moe_maxvio_ema/L-{layer_id}": all_maxvio_ema_cpu[i],
+                f"moe_load_balance_loss/L-{layer_id}": all_load_balance_losses_cpu[i],
+                f"moe_ep_usage_mean/L-{layer_id}": usage_tensor.mean().item(),
+                f"moe_ep_usage_std/L-{layer_id}": usage_tensor.std(
+                    unbiased=False
+                ).item(),
+                f"moe_bias_mean/L-{layer_id}": bias_tensor.mean().item(),
+                f"moe_bias_std/L-{layer_id}": bias_tensor.std(unbiased=False).item(),
             }
-            layer_usages = all_usages_cpu[usage_offset : usage_offset + num_experts]
-            layer_biases = all_biases_cpu[bias_offset : bias_offset + num_experts]
-
             pre_usage = f"moe_ep_usage/L-{layer_id}_EP-"
             pre_bias = f"moe_bias/L-{layer_id}_EP-"
             metrics.update({f"{pre_usage}{j}": v for j, v in enumerate(layer_usages)})
             metrics.update({f"{pre_bias}{j}": v for j, v in enumerate(layer_biases)})
-            metrics.update(
-                {
-                    f"moe_load_balance_loss/L-{layer_id}": v
-                    for v in all_load_balance_losses_cpu
-                }
-            )
             moe._log_expert_metrics = metrics
             usage_offset += num_experts
             bias_offset += num_experts
 
         # Aggregated scalars across all MoE layers — attached to first layer
         num_moe_layers = len(moe_layers_info)
-        metrics.update(
+        moe_layers_info[0]["module"]._log_expert_metrics.update(
             {
                 "moe_maxvio_batch/aggregate": sum(all_maxvio_batch_cpu)
                 / num_moe_layers,
-                "moe_maxvio_ema/aggregate": sum(all_maxvio_ema_cpu)
-                / num_moe_layers,
+                "moe_maxvio_ema/aggregate": sum(all_maxvio_ema_cpu) / num_moe_layers,
             }
         )
 
@@ -631,7 +632,9 @@ def register_moe_load_balancing_hook(
                 ema_buffers, step_counts_split, alpha=(1.0 - MAXVIO_EMA_BETA)
             )
         except Exception:
-            for ema_buf, step_counts in zip(ema_buffers, step_counts_split, strict=True):
+            for ema_buf, step_counts in zip(
+                ema_buffers, step_counts_split, strict=True
+            ):
                 ema_buf.mul_(MAXVIO_EMA_BETA).add_(
                     step_counts, alpha=(1.0 - MAXVIO_EMA_BETA)
                 )

@@ -65,9 +65,9 @@ def create_disco_optimizer_kwargs_from_optimizer_config(
         hasattr(optimizer_config, "extra_param_group_split_rules")
         and optimizer_config.extra_param_group_split_rules
     ):
-        optimizer_kwargs["extra_param_group_split_rules"] = (
-            optimizer_config.extra_param_group_split_rules
-        )
+        optimizer_kwargs[
+            "extra_param_group_split_rules"
+        ] = optimizer_config.extra_param_group_split_rules
 
     return optimizer_kwargs
 
@@ -172,6 +172,18 @@ def create_disco_param_groups(
             logger.info(
                 f"[DISCO][init], For {group_config['param_str_match']},"
                 f"Setting backend from {group_config['backend']} to identity"
+            )
+
+        # otherwise, if norm_factor is [spectral, image_spectral, conv_spectral],
+        # the backend should not be identity
+        if (
+            group_config["norm_factor"]
+            in ["spectral", "image_spectral", "conv_spectral"]
+            and group_config["backend"] == "identity"
+        ):
+            raise ValueError(
+                f"For {group_config['param_str_match']}, norm_factor is {group_config['norm_factor']}, "
+                f"but backend is identity, which is not allowed"
             )
 
         param_groups_config.append(group_config)

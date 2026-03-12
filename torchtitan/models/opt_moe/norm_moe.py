@@ -4,8 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Literal
 
 import torch
 from torch import nn
@@ -723,13 +724,18 @@ class MoE(Module):
             -1, self.router.top_k, dim
         )
         if not self.score_before_experts:
+            # out_experts = (
+            #     torch.bmm(
+            #         top_scores.reshape(-1, 1, self.router.top_k),
+            #         routed_output_unsorted.float(),
+            #     )
+            #     .to(x.dtype)
+            #     .squeeze(1)
+            # )
             out_experts = (
-                torch.bmm(
-                    top_scores.reshape(-1, 1, self.router.top_k),
-                    routed_output_unsorted.float(),
-                )
+                (top_scores.unsqueeze(-1) * routed_output_unsorted.float())
+                .sum(dim=1)
                 .to(x.dtype)
-                .squeeze(1)
             )
         else:
             out_experts = routed_output_unsorted.sum(dim=1)

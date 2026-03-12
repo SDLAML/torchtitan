@@ -51,15 +51,6 @@ class TrainingConfig:
     steps: int = 10000
     """How many train steps to run"""
 
-    data_mixing_scheduler_configs: str | None = None
-    """Path to the mixing scheduler configs file
-    The mixing scheduler configs file should be a JSON file with the following format:
-    {
-        "step": [weights_for_dataset_0, weights_for_dataset_1, ...],
-    }
-    and key "0" must exist.
-    """
-
     enable_cpu_offload: bool = False
     """
     Whether to apply CPU offloading of parameters, gradients, and optimizer states in FSDP

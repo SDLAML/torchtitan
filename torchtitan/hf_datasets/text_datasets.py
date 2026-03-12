@@ -569,9 +569,15 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         """Path to the mixing scheduler configs file
         The mixing scheduler configs file should be a JSON file with the following format:
         {
-            "step": [weights_for_dataset_0, weights_for_dataset_1, ...],
+            "0": [weights_for_dataset_0, weights_for_dataset_1, ...],
         }
-        and key "0" must exist.
+        or:
+        {
+            "@0%": [weights_for_dataset_0, weights_for_dataset_1, ...],
+            "@10%": [weights_for_dataset_0, weights_for_dataset_1, ...],
+        }
+        Milestone keys must all be step strings or all percentage strings, and the
+        initial milestone must be "0" or "@0%".
         """
 
         drop_long_samples: bool = False

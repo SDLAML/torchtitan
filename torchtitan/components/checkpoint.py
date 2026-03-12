@@ -233,7 +233,7 @@ class CheckpointManager(Configurable):
         "//pre_train/checkpoints/llama3/llama3_8b/step_10000".
         """
 
-        initial_load_model_only: bool = True
+        initial_load_model_only: bool = False
         """
         This option specifies if only the model should be loaded during the initial
         checkpoint load. The option is only used when `initial_load_path` is specified.

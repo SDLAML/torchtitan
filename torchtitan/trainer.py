@@ -293,11 +293,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             seed=config.debug.seed,
         )
 
-        mixing_scheduler_configs = config.training.data_mixing_scheduler_configs
+        mixing_scheduler_configs = config.dataloader.data_mixing_scheduler_configs
 
         self.data_mix_scheduler = build_data_mix_scheduler(
-            self.dataloader, mixing_scheduler_configs
+            self.dataloader, mixing_scheduler_configs, config.training.steps
         )
+        self.data_mix_scheduler.dump_mixing_configs(config.dump_folder)
         self.data_mix_scheduler.step(0)
         logger.info(
             f"mixing weights at step 0: {self.data_mix_scheduler.get_log_dict_at_step(0)}"
@@ -555,36 +556,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             f"total steps {config.training.steps} "
             f"(warmup {config.lr_scheduler.warmup_steps})"
         )
-
-    def save_model_args(self):
-        if torch.distributed.get_rank() == 0:
-            # Save model args to dump folder.
-            os.makedirs(self.config.dump_folder, exist_ok=True)
-            # model_args_save_path = os.path.join(
-            #     self.job_config.job.dump_folder,
-            #     "model_args_"
-            #     + datetime.datetime.now().strftime("%Y%m%d-%H%M")
-            #     + ".json",
-            # )
-
-            # model_args_dict = dataclasses.asdict(model_args)
-            # model_args_dict.pop("_enforced")
-            # with open(model_args_save_path, "w") as f:
-            #     json.dump(model_args_dict, f, indent=4)
-
-            data_mix_scheduler_save_path = os.path.join(
-                self.config.dump_folder,
-                "data_mix_scheduler_"
-                + datetime.datetime.now().strftime("%Y%m%d-%H%M")
-                + ".json",
-            )
-
-            with open(data_mix_scheduler_save_path, "w") as f:
-                json.dump(
-                    self.data_mix_scheduler.convert_mixing_configs_to_json(),
-                    f,
-                    indent=4,
-                )
 
     def init_distributed(self) -> ParallelDims:
         config = self.config

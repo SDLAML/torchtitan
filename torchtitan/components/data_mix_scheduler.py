@@ -4,8 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import datetime
 import json
 import os
+import re
 
 import torch
 
@@ -14,6 +16,9 @@ from torchtitan.components.dataloader import BaseDataLoader
 __all__ = [
     "DataMixScheduler",
 ]
+
+
+PERCENT_STEP_KEY_PATTERN = re.compile(r"^@([0-9]+(?:\.[0-9]+)?)%$")
 
 
 class DataMixScheduler:
@@ -76,6 +81,23 @@ class DataMixScheduler:
         current_weights = self.get_weights_at_step(current_step)
         self.dataloader.dataset.set_weights(current_weights)
 
+    def dump_mixing_configs(self, dump_folder: str):
+        if torch.distributed.get_rank() == 0:
+            # Save model args to dump folder.
+            os.makedirs(dump_folder, exist_ok=True)
+            data_mix_scheduler_save_path = os.path.join(
+                dump_folder,
+                "data_mix_scheduler_"
+                + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+                + ".json",
+            )
+            with open(data_mix_scheduler_save_path, "w") as f:
+                json.dump(
+                    self.convert_mixing_configs_to_json(),
+                    f,
+                    indent=4,
+                )
+
 
 class DummyDataMixScheduler:
     def __init__(self):
@@ -95,9 +117,72 @@ class DummyDataMixScheduler:
     def step(self, current_step: int):
         pass
 
+    def dump_mixing_configs(self, dump_folder: str):
+        pass
+
+
+def _parse_percentage_step_key(step_key: str) -> float | None:
+    match = PERCENT_STEP_KEY_PATTERN.fullmatch(step_key)
+    if match is None:
+        return None
+    return float(match.group(1))
+
+
+def _load_mixing_configs(mixing_scheduler_configs: str, training_steps: int):
+    with open(mixing_scheduler_configs) as config_file:
+        mixing_configs = json.load(config_file)
+    datasets_names = mixing_configs.pop("names", None)
+    if not mixing_configs:
+        raise ValueError("mixing_configs must contain at least one milestone entry")
+
+    if all(isinstance(key, str) and key.isdigit() for key in mixing_configs):
+        parsed_mixing_configs = {
+            int(key): value for key, value in mixing_configs.items()
+        }
+        return parsed_mixing_configs, datasets_names
+
+    if not all(
+        isinstance(key, str) and _parse_percentage_step_key(key) is not None
+        for key in mixing_configs
+    ):
+        raise ValueError(
+            "mixing_configs milestone keys must be either non-negative integer strings "
+            'like "500" or percentage strings like "@10%"'
+        )
+
+    if training_steps < 0:
+        raise ValueError(
+            "training_steps must be non-negative when using percentage milestones"
+        )
+
+    rendered_mixing_configs = {}
+    saw_zero_percent = False
+    for key, value in mixing_configs.items():
+        percent = _parse_percentage_step_key(key)
+        if percent > 100:
+            raise ValueError(
+                f"Percentage milestone {key!r} must be less than or equal to 100%"
+            )
+
+        rendered_step = int(training_steps * percent / 100)
+        if rendered_step in rendered_mixing_configs:
+            raise ValueError(
+                f"Percentage milestone {key!r} collides with an existing rendered step "
+                f"{rendered_step}"
+            )
+        rendered_mixing_configs[rendered_step] = value
+        saw_zero_percent = saw_zero_percent or percent == 0
+
+    if not saw_zero_percent:
+        raise ValueError("Percentage-based mixing_configs must contain an '@0%' entry")
+
+    return rendered_mixing_configs, datasets_names
+
 
 def build_data_mix_scheduler(
-    dataloader: BaseDataLoader, mixing_scheduler_configs: str | None
+    dataloader: BaseDataLoader,
+    mixing_scheduler_configs: str | None,
+    training_steps: int,
 ):
     if not hasattr(dataloader.dataset, "weights") or not hasattr(
         dataloader.dataset, "datasets"
@@ -106,12 +191,9 @@ def build_data_mix_scheduler(
     mixing_configs, datasets_names = None, None
     if mixing_scheduler_configs:
         if os.path.isfile(mixing_scheduler_configs):
-            try:
-                mixing_configs = json.load(open(mixing_scheduler_configs))
-                datasets_names = mixing_configs.pop("names", None)
-                mixing_configs = {int(k): v for k, v in mixing_configs.items()}
-            except Exception:
-                pass
+            mixing_configs, datasets_names = _load_mixing_configs(
+                mixing_scheduler_configs, training_steps
+            )
 
     """
     mixing_configs should be organized like:
@@ -119,6 +201,11 @@ def build_data_mix_scheduler(
         0: [weights_for_dataset_0, weights_for_dataset_1, ...],
         500: [weights_for_dataset_0, weights_for_dataset_1, ...],
         step: [weights_for_dataset_0, weights_for_dataset_1, ...],
+    }
+    or:
+    {
+        "@0%": [weights_for_dataset_0, weights_for_dataset_1, ...],
+        "@10%": [weights_for_dataset_0, weights_for_dataset_1, ...],
     }
     """
 
