@@ -122,38 +122,6 @@ class AbstractDiSCO(torch.optim.Optimizer):
         self.norms_to_log: list[str] = list(NORM_FUNCTIONS.keys())
         self.norms_at_current_step: dict[str, torch.Tensor] = {}
 
-    # ----- Light mode hooks -----
-    def setup_light_state_hooks(self):
-        if not self.is_light:
-            return
-        # Initialize state immediately to capture existing grads
-        self._store_grads_in_state()
-        # Register hooks so grads persist through state_dict save/load
-        self.register_state_dict_pre_hook(type(self)._store_grads_in_state)
-        self.register_load_state_dict_post_hook(type(self)._load_grads_from_state)
-
-    def __getstate__(self):
-        self._store_grads_in_state()
-        return super().__getstate__()
-
-    def __setstate__(self, state):
-        super().__setstate__(state)
-        self._load_grads_from_state()
-
-    def _store_grads_in_state(self, *args, **kwargs):
-        # args/kwargs present to allow hook-style invocation
-        for group in self.param_groups:
-            for param in group["params"]:
-                if isinstance(param, torch.Tensor) and param.grad is not None:
-                    self.state.setdefault(param, {})["grad_state"] = param.grad
-
-    def _load_grads_from_state(self, *args, **kwargs):
-        for param, state in self.state.items():
-            if "grad_state" in state:
-                param.grad = state["grad_state"]
-            elif isinstance(param, torch.Tensor):
-                param.grad = None
-
     # ----- Step norm tracking -----
     def calculate_norm_at_next_step(self, norms_to_log: list[str] = None):
         self.need_to_calculate_norm = True
@@ -213,6 +181,8 @@ class AbstractDiSCO(torch.optim.Optimizer):
 
         elif norm_factor == "sign":
             g = torch.sign(g)
+            if g.ndim in (2, 3):
+                g = g / g.size(-1)
 
         elif norm_factor == "bias_rms":
             g = fused_bias_rms(g, eps)

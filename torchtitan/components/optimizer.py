@@ -320,7 +320,18 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
     ) -> None:
         # We need to call Optimizer.__init__() to initialize some necessary optimizer
         # functionality such as hooks.
-        Optimizer.__init__(self, all_params, optimizer_kwargs)
+        wrapper_optimizer_kwargs = optimizer_kwargs.copy()
+        wrapper_optimizer_kwargs.pop("parallel_dims", None)
+        Optimizer.__init__(self, all_params, wrapper_optimizer_kwargs)
+        self._strip_wrapper_runtime_only_keys()
+
+    def _strip_wrapper_runtime_only_keys(self) -> None:
+        # `parallel_dims` is a runtime topology object containing DeviceMesh. The
+        # wrapper optimizer only needs standard Optimizer hook machinery, so keeping
+        # this key in wrapper defaults/param_groups only risks accidental serialization.
+        self.defaults.pop("parallel_dims", None)
+        for group in self.param_groups:
+            group.pop("parallel_dims", None)
 
     def init_cache_state_dict(self) -> None:
         """Initialize cached state dict for TorchFT. No-op for base class."""

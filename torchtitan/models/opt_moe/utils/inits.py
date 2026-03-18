@@ -184,14 +184,36 @@ def scion_normal_(
         tensor.mul_(scale)
 
 
+def sign_(tensor: torch.Tensor, generator: torch.Generator | None = None):
+    with torch.no_grad():
+        nn.init.normal_(tensor, generator=generator)
+        tensor.sign_()
+        return tensor
+
+
+def scion_sign_(
+    tensor: torch.Tensor,
+    norm_axis: int = 1,
+    generator: torch.Generator | None = None,
+):
+    assert tensor.ndim == 2, "Tensor for scion_sign_ init must have 2 dimensions"
+    with torch.no_grad():
+        nn.init.normal_(tensor, generator=generator)
+        tensor.sign_()
+        tensor.div_(tensor.shape[norm_axis])
+        return tensor
+
+
 INIT_FN_MAP = {
     "trunc_normal": nn.init.trunc_normal_,
     "normal": nn.init.normal_,
+    "sign": _wrap_ignore_mean_std(sign_),
     "zeros": _wrap_ignore_generator(_wrap_ignore_mean_std(nn.init.zeros_)),
     "orthogonal": _wrap_orthogonal(orthogonal_),
     "scaled_orthogonal": _wrap_orthogonal(scaled_orthogonal_),
     "image_orthogonal": _wrap_orthogonal(image_orthogonal_),
     "scion_normal": scion_normal_,
+    "scion_sign": _wrap_ignore_mean_std(scion_sign_),
     "scion_normal_input": functools.partial(
         scion_normal_,
         scale_type="input",
