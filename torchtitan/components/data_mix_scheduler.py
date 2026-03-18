@@ -75,7 +75,7 @@ class DataMixScheduler:
             ]
             data_sampled_log[
                 f"data_sampled/{self.datasets_names[data_i]}"
-            ] = self._mixed_dataset.num_sampled_per_dataset[data_i]
+            ] = self._mixed_dataset.num_tokens_per_dataset[data_i]
         return data_mix_log, data_sampled_log
 
     def step(self, current_step: int):

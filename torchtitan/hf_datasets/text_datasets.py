@@ -254,6 +254,9 @@ class MixedDataset(IterableDataset, Stateful):
         dp_rank: int,
         weights: list[float] | None,
         seed: int | None = 0,
+        normalize_by_length: bool = False,
+        seq_len: int | None = None,
+        drop_long_samples: bool = False,
     ):
         self.datasets = datasets
 
@@ -266,6 +269,10 @@ class MixedDataset(IterableDataset, Stateful):
             len(self.datasets), dtype=torch.int64
         ).share_memory_()
 
+        self.num_tokens_per_dataset = torch.zeros(
+            len(self.datasets), dtype=torch.int64
+        ).share_memory_()
+
         # Flags for  "exhausted"  datasets
         self.removed = torch.zeros(len(self.datasets), dtype=torch.bool).share_memory_()
 
@@ -274,6 +281,13 @@ class MixedDataset(IterableDataset, Stateful):
         self._data_iters = None
         self._rng = Random(seed + dp_rank)
         self._dp_rank = dp_rank
+
+        # When normalize_by_length=True, _sample_dataset rescales weights by per-dataset
+        # average doc length (= num_tokens_per_dataset / num_sampled_per_dataset) before
+        # sampling, converting document-count weights into token-fraction weights.
+        self.normalize_by_length = normalize_by_length
+        self.seq_len = seq_len
+        self.drop_long_samples = drop_long_samples
 
     @property
     def dataset_name(self):
@@ -294,10 +308,20 @@ class MixedDataset(IterableDataset, Stateful):
         self._data_iters = [iter(dataset) for dataset in self.datasets]
 
     def _sample_dataset(self, sample_idx: int):
-        dataset_index = self._rng.choices(
-            self._dataset_indices, weights=self.weights.tolist()
-        )[0]
-        return dataset_index
+        if self.normalize_by_length:
+            # avg_len[i] = num_tokens[i] / num_sampled[i]
+            # +1 in both numerator and denominator: cold start (0/0) → 1.0, negligible
+            # bias after sufficient data. Eliminates any division-by-zero check.
+            counts = self.num_sampled_per_dataset.to(torch.float64)
+            avg_len = (self.num_tokens_per_dataset.to(torch.float64) + 1) / (counts + 1)
+            rescaled = self.weights / avg_len
+            rescaled = rescaled / rescaled.sum()
+            return self._rng.choices(self._dataset_indices, weights=rescaled.tolist())[
+                0
+            ]
+        return self._rng.choices(self._dataset_indices, weights=self.weights.tolist())[
+            0
+        ]
 
     def set_weights(self, weights: list[float]):
         assert len(weights) == len(
@@ -332,8 +356,16 @@ class MixedDataset(IterableDataset, Stateful):
                     return
                 dataset_index = self._sample_dataset(self._sample_idx)
                 sample = self._get_next(dataset_index)
+                if (
+                    sample is not None
+                    and self.drop_long_samples
+                    and self.seq_len is not None
+                    and len(sample) > self.seq_len + 1
+                ):
+                    sample = None  # discard; loop picks next without updating counters
 
             self.num_sampled_per_dataset[dataset_index] += 1
+            self.num_tokens_per_dataset[dataset_index] += len(sample)
             self._sample_idx += 1
             yield sample
 
@@ -366,13 +398,21 @@ class MixedDataset(IterableDataset, Stateful):
 
         self.weights[self.removed] = 0.0
 
-        # NOTE: num_sampled_per_dataset is sticky.
+        # NOTE: num_sampled_per_dataset and num_tokens_per_dataset are sticky.
         loaded_counts = state_dict["num_sampled_per_dataset"]
         if isinstance(loaded_counts, torch.Tensor):
             self.num_sampled_per_dataset.copy_(loaded_counts.to(dtype=torch.int64))
         else:
             self.num_sampled_per_dataset.copy_(
                 torch.tensor(loaded_counts, dtype=torch.int64)
+            )
+
+        loaded_tokens = state_dict["num_tokens_per_dataset"]
+        if isinstance(loaded_tokens, torch.Tensor):
+            self.num_tokens_per_dataset.copy_(loaded_tokens.to(dtype=torch.int64))
+        else:
+            self.num_tokens_per_dataset.copy_(
+                torch.tensor(loaded_tokens, dtype=torch.int64)
             )
 
         state_dict["rng_state"] = list_tree_to_tuple(state_dict["rng_state"])
@@ -392,6 +432,7 @@ class MixedDataset(IterableDataset, Stateful):
             )
         for dataset, ds_state in zip(self.datasets, dataset_states):
             dataset.load_state_dict(ds_state)
+
         # Unset data iterators so they will be re-initialized.
         self._data_iters = None
 
@@ -401,6 +442,7 @@ class MixedDataset(IterableDataset, Stateful):
             "weights": self.weights.tolist(),
             "removed": self.removed.tolist(),
             "num_sampled_per_dataset": self.num_sampled_per_dataset.tolist(),
+            "num_tokens_per_dataset": self.num_tokens_per_dataset.tolist(),
             "datasets": [dataset.state_dict() for dataset in self.datasets],
             "rng_state": self._rng.getstate(),
         }
@@ -680,7 +722,15 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
 
         # First pack, then mix → data is only mixed in batch dimension.
         # First mix, then pack → data is also mixed inside packed sample.
-        hf_ds = MixedDataset(hf_datasets, dp_rank, dataset_weights, seed=seed)
+        hf_ds = MixedDataset(
+            hf_datasets,
+            dp_rank,
+            dataset_weights,
+            seed=seed,
+            normalize_by_length=dataset_mix_in_seq,
+            seq_len=seq_len,
+            drop_long_samples=drop_long_samples,
+        )
 
         if dataset_mix_in_seq:
             hf_ds = GreedyPackedDataset(
