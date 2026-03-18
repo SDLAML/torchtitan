@@ -34,6 +34,7 @@ class DataMixScheduler:
         datasets_names,
     ):
         self.dataloader = dataloader
+        self._mixed_dataset = _resolve_mixed_dataset(dataloader.dataset)
         self.mixing_configs = mixing_configs
         self.datasets_names = datasets_names
         self.step_milestones = sorted(mixing_configs.keys(), reverse=True)
@@ -74,12 +75,12 @@ class DataMixScheduler:
             ]
             data_sampled_log[
                 f"data_sampled/{self.datasets_names[data_i]}"
-            ] = self.dataloader.dataset.num_sampled_per_dataset[data_i]
+            ] = self._mixed_dataset.num_sampled_per_dataset[data_i]
         return data_mix_log, data_sampled_log
 
     def step(self, current_step: int):
         current_weights = self.get_weights_at_step(current_step)
-        self.dataloader.dataset.set_weights(current_weights)
+        self._mixed_dataset.set_weights(current_weights)
 
     def dump_mixing_configs(self, dump_folder: str):
         if torch.distributed.get_rank() == 0:
@@ -184,9 +185,8 @@ def build_data_mix_scheduler(
     mixing_scheduler_configs: str | None,
     training_steps: int,
 ):
-    if not hasattr(dataloader.dataset, "weights") or not hasattr(
-        dataloader.dataset, "datasets"
-    ):
+    mixed_dataset = _resolve_mixed_dataset(dataloader.dataset)
+    if mixed_dataset is None:
         return DummyDataMixScheduler()
     mixing_configs, datasets_names = None, None
     if mixing_scheduler_configs:
@@ -211,17 +211,17 @@ def build_data_mix_scheduler(
 
     if mixing_configs is None:
         mixing_configs = {
-            0: dataloader.dataset.weights.tolist(),
+            0: mixed_dataset.weights.tolist(),
         }
 
     if datasets_names is None:
-        datasets_names = [str(i) for i in range(len(dataloader.dataset.datasets))]
+        datasets_names = [str(i) for i in range(len(mixed_dataset.datasets))]
     elif isinstance(datasets_names, str):
         datasets_names = [datasets_names]
-    if len(datasets_names) != len(dataloader.dataset.datasets):
+    if len(datasets_names) != len(mixed_dataset.datasets):
         raise ValueError(
             f"datasets_names must have the same length as datasets get len(datasets) = "
-            f"{len(dataloader.dataset.datasets)} and len(datasets_names) = "
+            f"{len(mixed_dataset.datasets)} and len(datasets_names) = "
             f"{len(datasets_names)} but got datasets_names = {datasets_names}"
         )
     assert (
@@ -229,10 +229,23 @@ def build_data_mix_scheduler(
     ), "mixing_configs must contain at least one entry for step 0"
 
     for step, weights in mixing_configs.items():
-        assert len(weights) == len(dataloader.dataset.datasets), (
+        assert len(weights) == len(mixed_dataset.datasets), (
             f"weights must have the same length as datasets get len(datasets) = "
-            f"{len(dataloader.dataset.datasets)} and len(weights) = "
+            f"{len(mixed_dataset.datasets)} and len(weights) = "
             f"{len(weights)}"
         )
 
     return DataMixScheduler(dataloader, mixing_configs, datasets_names)
+
+
+def _resolve_mixed_dataset(dataset):
+    current = dataset
+    visited = set()
+
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if hasattr(current, "weights") and hasattr(current, "datasets"):
+            return current
+        current = getattr(current, "_data", None)
+
+    return None

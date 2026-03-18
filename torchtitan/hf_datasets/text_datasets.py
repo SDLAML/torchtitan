@@ -276,6 +276,16 @@ class MixedDataset(IterableDataset, Stateful):
         self._dp_rank = dp_rank
 
     @property
+    def dataset_name(self):
+        return "mixed"
+
+    @property
+    def dataset_path(self):
+        return ",".join(
+            str(getattr(dataset, "dataset_path", None)) for dataset in self.datasets
+        )
+
+    @property
     def normed_weights(self):
         weights_sum = sum(self.weights)
         return [w / weights_sum for w in self.weights]
