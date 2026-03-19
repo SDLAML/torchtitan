@@ -365,7 +365,14 @@ class MixedDataset(IterableDataset, Stateful):
                     sample = None  # discard; loop picks next without updating counters
 
             self.num_docs_sampled[dataset_index] += 1
-            self.num_tokens_sampled[dataset_index] += len(sample)
+            # For mix_in_seq=False, samples are (dict, tensor) tuples from inner
+            # GreedyPackedDataset — len() returns 2, not the token count. Use
+            # self.seq_len directly in that case.
+            self.num_tokens_sampled[dataset_index] += (
+                self.seq_len
+                if isinstance(sample, tuple) and self.seq_len is not None
+                else len(sample)
+            )
             self._sample_idx += 1
             yield sample
 
