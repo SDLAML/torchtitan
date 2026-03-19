@@ -265,11 +265,11 @@ class MixedDataset(IterableDataset, Stateful):
             _initial_weights, dtype=torch.float64
         ).share_memory_()
 
-        self.num_sampled_per_dataset = torch.zeros(
+        self.num_docs_sampled = torch.zeros(
             len(self.datasets), dtype=torch.int64
         ).share_memory_()
 
-        self.num_tokens_per_dataset = torch.zeros(
+        self.num_tokens_sampled = torch.zeros(
             len(self.datasets), dtype=torch.int64
         ).share_memory_()
 
@@ -283,7 +283,7 @@ class MixedDataset(IterableDataset, Stateful):
         self._dp_rank = dp_rank
 
         # When normalize_by_length=True, _sample_dataset rescales weights by per-dataset
-        # average doc length (= num_tokens_per_dataset / num_sampled_per_dataset) before
+        # average doc length (= num_tokens_sampled / num_docs_sampled) before
         # sampling, converting document-count weights into token-fraction weights.
         self.normalize_by_length = normalize_by_length
         self.seq_len = seq_len
@@ -312,8 +312,8 @@ class MixedDataset(IterableDataset, Stateful):
             # avg_len[i] = num_tokens[i] / num_sampled[i]
             # +1 in both numerator and denominator: cold start (0/0) → 1.0, negligible
             # bias after sufficient data. Eliminates any division-by-zero check.
-            counts = self.num_sampled_per_dataset.to(torch.float64)
-            avg_len = (self.num_tokens_per_dataset.to(torch.float64) + 1) / (counts + 1)
+            counts = self.num_docs_sampled.to(torch.float64)
+            avg_len = (self.num_tokens_sampled.to(torch.float64) + 1) / (counts + 1)
             rescaled = self.weights / avg_len
             rescaled = rescaled / rescaled.sum()
             return self._rng.choices(self._dataset_indices, weights=rescaled.tolist())[
@@ -364,8 +364,8 @@ class MixedDataset(IterableDataset, Stateful):
                 ):
                     sample = None  # discard; loop picks next without updating counters
 
-            self.num_sampled_per_dataset[dataset_index] += 1
-            self.num_tokens_per_dataset[dataset_index] += len(sample)
+            self.num_docs_sampled[dataset_index] += 1
+            self.num_tokens_sampled[dataset_index] += len(sample)
             self._sample_idx += 1
             yield sample
 
@@ -398,20 +398,18 @@ class MixedDataset(IterableDataset, Stateful):
 
         self.weights[self.removed] = 0.0
 
-        # NOTE: num_sampled_per_dataset and num_tokens_per_dataset are sticky.
-        loaded_counts = state_dict["num_sampled_per_dataset"]
+        # NOTE: num_docs_sampled and num_tokens_sampled are sticky.
+        loaded_counts = state_dict["num_docs_sampled"]
         if isinstance(loaded_counts, torch.Tensor):
-            self.num_sampled_per_dataset.copy_(loaded_counts.to(dtype=torch.int64))
+            self.num_docs_sampled.copy_(loaded_counts.to(dtype=torch.int64))
         else:
-            self.num_sampled_per_dataset.copy_(
-                torch.tensor(loaded_counts, dtype=torch.int64)
-            )
+            self.num_docs_sampled.copy_(torch.tensor(loaded_counts, dtype=torch.int64))
 
-        loaded_tokens = state_dict["num_tokens_per_dataset"]
+        loaded_tokens = state_dict["num_tokens_sampled"]
         if isinstance(loaded_tokens, torch.Tensor):
-            self.num_tokens_per_dataset.copy_(loaded_tokens.to(dtype=torch.int64))
+            self.num_tokens_sampled.copy_(loaded_tokens.to(dtype=torch.int64))
         else:
-            self.num_tokens_per_dataset.copy_(
+            self.num_tokens_sampled.copy_(
                 torch.tensor(loaded_tokens, dtype=torch.int64)
             )
 
@@ -441,8 +439,8 @@ class MixedDataset(IterableDataset, Stateful):
             "sample_idx": self._sample_idx,
             "weights": self.weights.tolist(),
             "removed": self.removed.tolist(),
-            "num_sampled_per_dataset": self.num_sampled_per_dataset.tolist(),
-            "num_tokens_per_dataset": self.num_tokens_per_dataset.tolist(),
+            "num_docs_sampled": self.num_docs_sampled.tolist(),
+            "num_tokens_sampled": self.num_tokens_sampled.tolist(),
             "datasets": [dataset.state_dict() for dataset in self.datasets],
             "rng_state": self._rng.getstate(),
         }

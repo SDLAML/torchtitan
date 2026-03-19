@@ -68,15 +68,17 @@ class DataMixScheduler:
 
     def get_log_dict_at_step(self, current_step: int):
         all_weights = self.get_weights_at_step(current_step)
-        data_mix_log, data_sampled_log = {}, {}
+        data_mix_log, data_docs_log, data_tokens_log = {}, {}, {}
         for data_i in range(len(self.datasets_names)):
-            data_mix_log[f"data_mixing/{self.datasets_names[data_i]}"] = all_weights[
+            name = self.datasets_names[data_i]
+            data_mix_log[f"data_mixing/{name}"] = all_weights[data_i]
+            data_docs_log[f"data_docs/{name}"] = self._mixed_dataset.num_docs_sampled[
                 data_i
             ]
-            data_sampled_log[
-                f"data_sampled/{self.datasets_names[data_i]}"
-            ] = self._mixed_dataset.num_tokens_per_dataset[data_i]
-        return data_mix_log, data_sampled_log
+            data_tokens_log[
+                f"data_tokens/{name}"
+            ] = self._mixed_dataset.num_tokens_sampled[data_i]
+        return data_mix_log, data_docs_log, data_tokens_log
 
     def step(self, current_step: int):
         current_weights = self.get_weights_at_step(current_step)
@@ -109,8 +111,9 @@ class DummyDataMixScheduler:
 
     def get_log_dict_at_step(self, current_step: int):
         data_mix_log = {"data_mixing/not_mixed_datasets": torch.tensor(1)}
-        data_sampled_log = {"data_sampled/not_mixed_datasets": torch.tensor(0)}
-        return data_mix_log, data_sampled_log
+        data_docs_log = {"data_docs/not_mixed_datasets": torch.tensor(0)}
+        data_tokens_log = {"data_tokens/not_mixed_datasets": torch.tensor(0)}
+        return data_mix_log, data_docs_log, data_tokens_log
 
     def convert_mixing_configs_to_json(self):
         return {"0": [1]}

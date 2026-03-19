@@ -832,7 +832,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         if not self.metrics_processor.should_log(self.step):
             return
 
-        data_mix, data_sampled = self.data_mix_scheduler.get_log_dict_at_step(self.step)
+        data_mix, data_docs, data_tokens = self.data_mix_scheduler.get_log_dict_at_step(
+            self.step
+        )
 
         if parallel_dims.dp_cp_enabled:
             loss = loss.detach()
@@ -859,39 +861,51 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 ),
             )
             ##############################################################
-            # to communicate the data sampled across ranks
-            keys = sorted(data_sampled.keys())
-            keys_actual_sample_ratio = [
-                k.replace("data_sampled/", "actual_sample_ratio/") for k in keys
-            ]
-            sum_data_sampled = torch.stack([data_sampled[k] for k in keys]).to(
-                self.device
-            )
+            # Fuse doc counts + token counts into one tensor → single dist_sum.
+            doc_keys = sorted(data_docs.keys())
+            token_keys = sorted(data_tokens.keys())
+            N = len(doc_keys)
+            fused = torch.stack(
+                [data_docs[k] for k in doc_keys] + [data_tokens[k] for k in token_keys]
+            ).to(self.device)
 
-            sum_data_sampled = dist_utils.dist_sum(
-                sum_data_sampled,
+            fused = dist_utils.dist_sum(
+                fused,
                 parallel_dims.get_optional_mesh("loss"),
                 keep_tensor=True,
             )
             if self.prev_data_sampled_tensor is None:
-                self.prev_data_sampled_tensor = torch.zeros_like(sum_data_sampled)
-            delta_data_sampled = sum_data_sampled - self.prev_data_sampled_tensor
-            self.prev_data_sampled_tensor = sum_data_sampled.clone()
+                self.prev_data_sampled_tensor = torch.zeros_like(fused)
+            delta = fused - self.prev_data_sampled_tensor
+            self.prev_data_sampled_tensor = fused.clone()
 
-            total_data_sampled = delta_data_sampled.sum() / 100 + 1e-20
+            delta_docs, delta_tokens = delta[:N], delta[N:]
 
-            data_sampled = {
-                k: int(sum_data_sampled[i].item()) for i, k in enumerate(keys)
+            # Cumulative counts (summed across ranks)
+            data_docs = {k: int(fused[i].item()) for i, k in enumerate(doc_keys)}
+            data_tokens = {
+                k: int(fused[N + i].item()) for i, k in enumerate(token_keys)
             }
-            actual_sample_ratio = delta_data_sampled / total_data_sampled
-            actual_sample_ratio_dict = {
-                k: actual_sample_ratio[i].item()
-                for i, k in enumerate(keys_actual_sample_ratio)
+
+            # Actual ratios (% of this logging interval)
+            eps = 1e-20
+            actual_doc_ratio = delta_docs / (delta_docs.sum() / 100 + eps)
+            actual_token_ratio = delta_tokens / (delta_tokens.sum() / 100 + eps)
+            actual_doc_ratio_dict = {
+                k.replace("data_docs/", "actual_doc_ratio/"): actual_doc_ratio[i].item()
+                for i, k in enumerate(doc_keys)
+            }
+            actual_token_ratio_dict = {
+                k.replace("data_tokens/", "actual_token_ratio/"): actual_token_ratio[
+                    i
+                ].item()
+                for i, k in enumerate(token_keys)
             }
         else:
             global_avg_loss = global_max_loss = loss.detach().item()
             global_ntokens_seen = self.ntokens_seen
-            actual_sample_ratio_dict = {}
+            actual_doc_ratio_dict = {}
+            actual_token_ratio_dict = {}
 
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
@@ -899,8 +913,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         }
         extra_metrics.update(self.optimizers.get_lrs())
         extra_metrics.update(data_mix)
-        extra_metrics.update(data_sampled)
-        extra_metrics.update(actual_sample_ratio_dict)
+        extra_metrics.update(data_docs)
+        extra_metrics.update(data_tokens)
+        extra_metrics.update(actual_doc_ratio_dict)
+        extra_metrics.update(actual_token_ratio_dict)
 
         if need_to_calculate_norm:
             param_norms = self.optimizers.get_parameter_norms()
