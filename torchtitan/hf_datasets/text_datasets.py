@@ -18,6 +18,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
@@ -461,12 +462,14 @@ class GreedyPackedDataset(IterableDataset, Stateful):
         infinite: bool = False,
         num_mtp_tokens: int = 0,
         drop_long_samples: bool = False,
+        eos_id: int | None = None,
     ) -> None:
         self._data = dataset
         self.seq_len = seq_len
         self.infinite = infinite
         self.num_mtp_tokens = num_mtp_tokens
         self.drop_long_samples = drop_long_samples
+        self.eos_id = eos_id
 
         # Variables for checkpointing
         self._sample_idx = 0
@@ -505,6 +508,13 @@ class GreedyPackedDataset(IterableDataset, Stateful):
                     self._token_buffer = self._token_buffer[max_buffer_token_len:]
                     input = x[:-1]
                     label = x[1:]
+                    if self.eos_id is not None:
+                        # Ignore the artificial EOS -> next-doc-start transition
+                        # introduced by concatenative packing.
+                        eos_mask = input == self.eos_id
+                        if eos_mask.any():
+                            label = label.clone()
+                            label[eos_mask] = IGNORE_INDEX
                     yield {"input": input}, label
 
             if not self.infinite:
@@ -722,6 +732,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
                     seq_len=seq_len,
                     infinite=infinite,
                     drop_long_samples=drop_long_samples,
+                    eos_id=tokenizer.eos_id,
                 )
             hf_datasets.append(hf_ds)
 
@@ -743,6 +754,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
                 seq_len=seq_len,
                 infinite=infinite,
                 drop_long_samples=drop_long_samples,
+                eos_id=tokenizer.eos_id,
             )
 
         if len(dataset_name) == 1:
