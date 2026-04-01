@@ -8,6 +8,8 @@ import json
 import os
 import shutil
 
+from ..utils.moe_utils import calc_gate_scaling_factor
+
 
 def _resolve_model_config(model, model_config=None):
     materialized_config = getattr(model, "config", None)
@@ -73,6 +75,145 @@ def _native_to_hf_rope_parameters(rope_cfg, *, partial_rotary_factor: float):
     return rope_parameters
 
 
+def _head_dim_from_model_config(model_config) -> int:
+    attn_cfg = model_config.layer.attention
+    return getattr(attn_cfg, "head_dim", None) or (model_config.dim // attn_cfg.n_heads)
+
+
+def _num_key_value_heads_from_model_config(model_config) -> int:
+    attn_cfg = model_config.layer.attention
+    return attn_cfg.n_kv_heads if attn_cfg.n_kv_heads is not None else attn_cfg.n_heads
+
+
+def _qk_rope_dim_from_model_config(model_config, *, head_dim: int) -> int:
+    attn_cfg = model_config.layer.attention
+    return getattr(attn_cfg, "qk_rope_dim", None) or head_dim
+
+
+def _hidden_act_from_layer_configs(
+    feed_forward_cfg,
+    moe_cfg,
+    *,
+    default_hidden_act: str | None = None,
+) -> str | None:
+    activation_types = {
+        cfg.activation_type
+        for cfg in (feed_forward_cfg, moe_cfg)
+        if cfg is not None and getattr(cfg, "activation_type", None) is not None
+    }
+    if len(activation_types) > 1:
+        raise ValueError(
+            "opt_moe HF export only supports a single hidden_act across dense and "
+            f"MoE blocks, got {sorted(activation_types)!r}."
+        )
+    if activation_types:
+        return activation_types.pop()
+    return default_hidden_act
+
+
+def _moe_scaling_factor_from_config(moe_cfg) -> float | None:
+    if moe_cfg is None:
+        return None
+    if moe_cfg.scaling_factor is not None:
+        return moe_cfg.scaling_factor
+    return calc_gate_scaling_factor(
+        moe_cfg.num_experts,
+        moe_cfg.top_k,
+    )
+
+
+def get_hf_config_overrides_from_model_config(model, model_config=None) -> dict:
+    """Build the HF config values derived from the runtime opt_moe config."""
+    model_config = _resolve_model_config(model, model_config)
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(current_dir, "config.json")) as f:
+        default_config = json.load(f)
+
+    attn_cfg = model_config.layer.attention
+    feed_forward_cfg = getattr(model_config.layer, "feed_forward", None)
+    moe_cfg = getattr(model_config.layer, "moe", None)
+    head_dim = _head_dim_from_model_config(model_config)
+    qk_rope_dim = _qk_rope_dim_from_model_config(model_config, head_dim=head_dim)
+    ffn_norm_everywhere = (
+        bool(feed_forward_cfg.norm_everywhere)
+        if feed_forward_cfg is not None
+        else False
+    )
+
+    overrides = {
+        "num_hidden_layers": model_config.n_layers,
+        "vocab_size": model_config.vocab_size,
+        "rms_norm_eps": model_config.norm_eps,
+        "qk_norm": attn_cfg.qk_norm,
+        "norm_everywhere": attn_cfg.norm_everywhere,
+        "attention_norm_everywhere": attn_cfg.norm_everywhere,
+        "ffn_norm_everywhere": ffn_norm_everywhere,
+        "moe_norm_everywhere": (
+            bool(moe_cfg.norm_everywhere)
+            if moe_cfg is not None
+            else ffn_norm_everywhere
+        ),
+        # HF router always runs its matmul in fp32 for deterministic routing behavior.
+        "force_router_on_fp32": True,
+        "max_position_embeddings": model_config.rope.max_seq_len,
+        "num_attention_heads": attn_cfg.n_heads,
+        "num_key_value_heads": _num_key_value_heads_from_model_config(model_config),
+        "head_dim": head_dim,
+        "rope_theta": model_config.rope.theta,
+        "hidden_size": model_config.dim,
+        "n_dense_layers": model_config.layer.n_dense_layers,
+        "gated_attention_type": getattr(attn_cfg, "gated_attention_type", None),
+        "gate_only": bool(getattr(attn_cfg, "gate_only", False)),
+        "mid_norm_position": getattr(attn_cfg, "mid_norm_position", "after"),
+        "use_rope": bool(getattr(attn_cfg, "use_rope", True)),
+        "sliding_window_size": getattr(attn_cfg, "sliding_window_size", -1),
+        "qk_rope_dim": qk_rope_dim,
+        "partial_rotary_factor": qk_rope_dim / head_dim,
+        "residual_scale": getattr(model_config.layer, "residual_scale", "identity"),
+        "rope_pattern": _normalize_layer_pattern_for_export(
+            getattr(model_config, "rope_pattern", None)
+        ),
+        "swa_pattern": _normalize_layer_pattern_for_export(
+            getattr(model_config, "swa_pattern", None)
+        ),
+    }
+
+    hidden_act = _hidden_act_from_layer_configs(
+        feed_forward_cfg,
+        moe_cfg,
+        default_hidden_act=default_config.get("hidden_act"),
+    )
+    if hidden_act is not None:
+        overrides["hidden_act"] = hidden_act
+
+    overrides["rope_parameters"] = _native_to_hf_rope_parameters(
+        model_config.rope,
+        partial_rotary_factor=overrides["partial_rotary_factor"],
+    )
+
+    rope_of_swa = getattr(model_config, "rope_of_swa", None)
+    overrides["rope_theta_swa"] = (
+        float(rope_of_swa.theta) if rope_of_swa is not None else None
+    )
+    overrides["rope_parameters_swa"] = _native_to_hf_rope_parameters(
+        rope_of_swa,
+        partial_rotary_factor=overrides["partial_rotary_factor"],
+    )
+
+    if feed_forward_cfg is not None:
+        overrides["intermediate_size"] = feed_forward_cfg.hidden_dim
+
+    if moe_cfg is not None:
+        overrides["moe_intermediate_size"] = moe_cfg.hidden_dim
+        overrides["n_active_experts"] = moe_cfg.top_k
+        overrides["n_total_experts"] = moe_cfg.num_experts
+        overrides["moe_scaling_factor"] = _moe_scaling_factor_from_config(moe_cfg)
+        overrides["n_shared_experts"] = moe_cfg.num_shared_experts
+
+    return overrides
+
+
 def copy_and_overwrite_model_config(model, model_config, dst_path: str):
     """Copy HF config/modeling files to dst_path and overwrite config.json
     with parameters extracted from the trained model and model_config.
@@ -120,98 +261,7 @@ def overwrite_config(model, model_config=None):
     current_dir = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(current_dir, "config.json")) as f:
         default_config = json.load(f)
-
-    attn_cfg = model_config.layer.attention
-    feed_forward_cfg = getattr(model_config.layer, "feed_forward", None)
-    moe_cfg = getattr(model_config.layer, "moe", None)
-
-    # Inspect the first layer's attention module for runtime sizes
-    attention = model.layers["0"].attention
-
-    default_config["num_hidden_layers"] = model_config.n_layers
-    default_config["vocab_size"] = model_config.vocab_size
-    default_config["rms_norm_eps"] = model_config.norm_eps
-    default_config["qk_norm"] = attn_cfg.qk_norm
-    # Keep legacy norm_everywhere for backward compatibility with older runtimes,
-    # but export split flags so attention/FFN/MoE can differ.
-    default_config["norm_everywhere"] = attn_cfg.norm_everywhere
-    default_config["attention_norm_everywhere"] = attn_cfg.norm_everywhere
-    default_config["ffn_norm_everywhere"] = (
-        bool(feed_forward_cfg.norm_everywhere)
-        if feed_forward_cfg is not None
-        else False
+    default_config.update(
+        get_hf_config_overrides_from_model_config(model, model_config)
     )
-    default_config["moe_norm_everywhere"] = (
-        bool(moe_cfg.norm_everywhere)
-        if moe_cfg is not None
-        else default_config["ffn_norm_everywhere"]
-    )
-    # HF router always runs its matmul in fp32 for deterministic routing behavior.
-    default_config["force_router_on_fp32"] = True
-    default_config["max_position_embeddings"] = model_config.rope.max_seq_len
-
-    default_config["num_attention_heads"] = attention.n_heads
-    default_config["num_key_value_heads"] = attention.n_kv_heads
-    default_config["head_dim"] = attention.head_dim
-    default_config["rope_theta"] = model_config.rope.theta
-
-    default_config["hidden_size"] = model.tok_embeddings.weight.shape[1]
-
-    default_config["n_dense_layers"] = model_config.layer.n_dense_layers
-
-    # Gated attention type and SWA config
-    default_config["gated_attention_type"] = getattr(
-        attn_cfg, "gated_attention_type", None
-    )
-    default_config["gate_only"] = bool(getattr(attn_cfg, "gate_only", False))
-    default_config["mid_norm_position"] = getattr(
-        attn_cfg, "mid_norm_position", "after"
-    )
-    default_config["use_rope"] = bool(getattr(attn_cfg, "use_rope", True))
-    default_config["sliding_window_size"] = getattr(attn_cfg, "sliding_window_size", -1)
-    default_config["qk_rope_dim"] = getattr(
-        attention, "qk_rope_dim", getattr(attn_cfg, "qk_rope_dim", attention.head_dim)
-    )
-    default_config["partial_rotary_factor"] = (
-        default_config["qk_rope_dim"] / default_config["head_dim"]
-    )
-    default_config["rope_parameters"] = _native_to_hf_rope_parameters(
-        model_config.rope,
-        partial_rotary_factor=default_config["partial_rotary_factor"],
-    )
-
-    default_config["residual_scale"] = getattr(
-        model_config.layer, "residual_scale", "identity"
-    )
-
-    # Per-layer patterns: normalize list-wrapped strings for HF/vLLM parsers.
-    default_config["rope_pattern"] = _normalize_layer_pattern_for_export(
-        getattr(model_config, "rope_pattern", None)
-    )
-    default_config["swa_pattern"] = _normalize_layer_pattern_for_export(
-        getattr(model_config, "swa_pattern", None)
-    )
-
-    # Separate RoPE config for SWA layers (native model's rope_of_swa).
-    # rope_theta_swa and rope_parameters_swa are fully independent from the primary rope.
-    rope_of_swa = getattr(model_config, "rope_of_swa", None)
-    default_config["rope_theta_swa"] = (
-        float(rope_of_swa.theta) if rope_of_swa is not None else None
-    )
-    default_config["rope_parameters_swa"] = _native_to_hf_rope_parameters(
-        rope_of_swa,
-        partial_rotary_factor=default_config["partial_rotary_factor"],
-    )
-
-    if model_config.layer.n_dense_layers > 0:
-        default_config["intermediate_size"] = model_config.layer.feed_forward.hidden_dim
-
-    if len(model.layers) > model_config.layer.n_dense_layers:
-        moe = model.layers[str(len(model.layers) - 1)].moe
-        default_config["moe_intermediate_size"] = model_config.layer.moe.hidden_dim
-        default_config["n_active_experts"] = model_config.layer.moe.top_k
-        default_config["n_total_experts"] = model_config.layer.moe.num_experts
-        default_config["moe_scaling_factor"] = moe.scaling_factor
-        default_config["n_shared_experts"] = model_config.layer.moe.num_shared_experts
-
     return default_config

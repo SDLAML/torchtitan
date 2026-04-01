@@ -46,10 +46,10 @@ def _process_simple_text(sample: dict[str, Any], key: str) -> str:
 
 def _load_simple_dataset(
     dataset_path: str,
-    dataset_name: str | None,
-    dataset_files: str | Sequence[str] | None,
-    dataset_split: str,
-    dataset_streaming: bool,
+    dataset_name: str | None = None,
+    dataset_files: str | Sequence[str] | None = None,
+    dataset_split: str = "train",
+    dataset_streaming: bool = False,
 ):
     """Load a simple custom dataset with its configuration."""
     return load_dataset(
@@ -258,8 +258,20 @@ class MixedDataset(IterableDataset, Stateful):
         normalize_by_length: bool = False,
         seq_len: int | None = None,
         drop_long_samples: bool = False,
+        dataset_aliases: list[str] | None = None,
     ):
         self.datasets = datasets
+        self.dataset_aliases = (
+            [str(i) for i in range(len(self.datasets))]
+            if dataset_aliases is None
+            else dataset_aliases
+        )
+        if len(self.dataset_aliases) != len(self.datasets):
+            raise ValueError(
+                "dataset_aliases must have the same length as datasets "
+                f"get len(datasets) = {len(self.datasets)} and "
+                f"len(dataset_aliases) = {len(self.dataset_aliases)}"
+            )
 
         _initial_weights = [1.0] * len(self.datasets) if weights is None else weights
         self.weights = torch.tensor(
@@ -280,7 +292,8 @@ class MixedDataset(IterableDataset, Stateful):
         self._dataset_indices = list(range(len(self.datasets)))
         self._sample_idx = 0
         self._data_iters = None
-        self._rng = Random(seed + dp_rank)
+        base_seed = 0 if seed is None else seed
+        self._rng = Random(base_seed + dp_rank)
         self._dp_rank = dp_rank
 
         # When normalize_by_length=True, _sample_dataset rescales weights by per-dataset
@@ -563,12 +576,32 @@ def _normalize_list(
     return xs
 
 
-def _replace_none_with_literal(xs: list[str] | None) -> list[str | None] | None:
+def _coerce_to_list(
+    xs: str | Sequence[str] | None,
+) -> list[str] | None:
+    if xs is None:
+        return None
+    if isinstance(xs, str):
+        return [xs]
+    return list(xs)
+
+
+def _replace_none_with_literal(
+    xs: str | Sequence[str] | None,
+) -> list[str | None] | None:
+    xs = _coerce_to_list(xs)
     if xs is None:
         xs = None
     else:
         xs = [None if x == "None" else x for x in xs]
     return xs
+
+
+def _resolve_dataset_aliases(dataset_aliases: list[str | None]) -> list[str]:
+    return [
+        alias if alias is not None else str(i)
+        for i, alias in enumerate(dataset_aliases)
+    ]
 
 
 class HuggingFaceTextDataLoader(ParallelAwareDataloader):
@@ -585,6 +618,12 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
 
         dataset: list[str] = field(default_factory=lambda: ["c4_test"])
         """Dataset to use"""
+
+        dataset_alias: list[str | None] | None = None
+        """
+        Optional aliases used for data-mix logging.
+        Entries with string "None" will be replaced with the Python literal `None`.
+        """
 
         dataset_path: list[str] | None = None
         """
@@ -667,28 +706,37 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         if seed is not None:
             rng.manual_seed(seed)
 
-        dataset_name = config.dataset
+        dataset_name = _coerce_to_list(config.dataset)
+        if dataset_name is None:
+            raise ValueError("dataset config must contain at least one dataset")
+        dataset_alias = _replace_none_with_literal(config.dataset_alias)
         dataset_path = _replace_none_with_literal(config.dataset_path)
         dataset_streaming = config.dataset_streaming
         dataset_weights = config.dataset_weights
         dataset_mix_in_seq = config.dataset_mix_in_seq
         dataset_inner_name = _replace_none_with_literal(config.dataset_inner_name)
-        dataset_files = config.dataset_files
-        dataset_split = config.dataset_split
+        dataset_files = _coerce_to_list(config.dataset_files)
+        dataset_split = _coerce_to_list(config.dataset_split)
         dataset_key = config.dataset_key
         infinite = config.infinite
 
         normed_list_length = len(dataset_name)
+        dataset_alias = _normalize_list(dataset_alias, normed_list_length)
         dataset_path = _normalize_list(dataset_path, normed_list_length)
         dataset_inner_name = _normalize_list(dataset_inner_name, normed_list_length)
-        dataset_split = _normalize_list(dataset_split, normed_list_length)
-        dataset_key = _normalize_list(dataset_key, normed_list_length)
+        dataset_split = _normalize_list(
+            dataset_split, normed_list_length, duplicate=True
+        )
+        dataset_key = _normalize_list(
+            _coerce_to_list(dataset_key), normed_list_length, duplicate=True
+        )
         dataset_weights = (
             [1.0] * normed_list_length
             if dataset_weights is None
             # Convert to floats.
             else list(map(float, dataset_weights))
         )
+        resolved_dataset_aliases = _resolve_dataset_aliases(dataset_alias)
         drop_long_samples = config.drop_long_samples
 
         if len(dataset_name) > 1:
@@ -696,6 +744,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
                 dataset_files is None
             ), "cannot supply dataset files when using multiple datasets"
         for d in [
+            dataset_alias,
             dataset_path,
             dataset_inner_name,
             dataset_split,
@@ -746,6 +795,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             normalize_by_length=dataset_mix_in_seq,
             seq_len=seq_len,
             drop_long_samples=drop_long_samples,
+            dataset_aliases=resolved_dataset_aliases,
         )
 
         if dataset_mix_in_seq:

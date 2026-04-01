@@ -800,8 +800,15 @@ class DiSCO(AbstractDiSCO):
             send_shapes = self._fsdp_send_shapes[b]
             tp_infos = self._fsdp_tp_gather_info[b]
             group_indices = self._fsdp_bucket_group_indices[b]
-            for i in range(end_idx - start_idx):
-                param_idx = start_idx + i
+            for i in range(world_size):
+                # For phantom slots (i >= end_idx - start_idx), clamp to the last
+                # real param so the A2A send buffer is filled with actual gradient
+                # data rather than zeros. This ensures all ranks run LMO on real
+                # tensors and keeps timing symmetric across the fsdp group.
+                # _fsdp_upd_recv_param_plan still uses range(end_idx - start_idx)
+                # so phantom slot outputs from the reverse A2A are discarded and
+                # the last real param is updated exactly once.
+                param_idx = min(start_idx + i, end_idx - 1)
                 self._fsdp_pack_copy_plan.append(
                     (
                         param_idx,
@@ -2984,6 +2991,8 @@ class DiSCO(AbstractDiSCO):
         use_global_fast_path = self.fsdp_a2a_mode == "once"
         bucket_workspace = None
 
+        dist.barrier(fsdp_group)
+
         if use_global_fast_path:
             # Use persistent workspace cache; _workspace override for external callers.
             global_grad_send = workspace["global_grad_send"]
@@ -3124,17 +3133,18 @@ class DiSCO(AbstractDiSCO):
                 for i in range(world_size):
                     base = send_chunk_offsets[i]
                     numel = send_numels[i]
-                    if start_idx + i < end_idx:
-                        p = bucket_params[i]
-                        group_idx = bucket_group_indices[i]
-                        param_idx = start_idx + i
-                        g = self._get_effective_grad_by_group(p, group_idx, param_idx)
-                        g_local = self._maybe_unpack_dtensor(g, tp_infos[i])
-                        if g_local.dtype != cast_dtype:
-                            g_local = g_local.to(cast_dtype)
-                        grad_send_flat[base : base + numel].copy_(g_local.reshape(-1))
-                    else:
-                        grad_send_flat[base : base + numel].zero_()
+                    # Mirror once-mode behavior: phantom slots reuse the last
+                    # real param's gradient so every rank runs LMO on a real
+                    # tensor, while reverse A2A still materializes only real
+                    # params via range(end_idx - start_idx) below.
+                    p = bucket_params[i]
+                    group_idx = bucket_group_indices[i]
+                    param_idx = min(start_idx + i, end_idx - 1)
+                    g = self._get_effective_grad_by_group(p, group_idx, param_idx)
+                    g_local = self._maybe_unpack_dtensor(g, tp_infos[i])
+                    if g_local.dtype != cast_dtype:
+                        g_local = g_local.to(cast_dtype)
+                    grad_send_flat[base : base + numel].copy_(g_local.reshape(-1))
 
                 dist.all_to_all_single(
                     grad_recv_flat,
@@ -3279,6 +3289,9 @@ class DiSCO(AbstractDiSCO):
                 total_buckets,
                 apply_on_weight,
             )
+
+        if dp_replicate_mesh is not None:
+            dist.barrier(group=dp_replicate_mesh.get_group())
 
     @record_function("disco._prepare_gradients_and_momentum")
     @torch.no_grad()

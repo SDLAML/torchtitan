@@ -4,13 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
+import os
+import tempfile
 import unittest
+from types import SimpleNamespace
 
 from torch.utils.data import IterableDataset
 
+from torchtitan.components.data_mix_scheduler import build_data_mix_scheduler
+
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader, MixedDataset
 
 
 class DummyDataset(IterableDataset):
@@ -45,6 +51,15 @@ class DummyTokenizer(BaseTokenizer):
 
     def get_vocab_size(self) -> int:
         return 256  # ASCII range
+
+
+class DummyMixedComponent(IterableDataset):
+    def __init__(self, name: str):
+        self.dataset_name = name
+        self.dataset_path = f"/tmp/{name}"
+
+    def __iter__(self):
+        yield [1, 2, 3]
 
 
 class TestParallelAwareDataloader(unittest.TestCase):
@@ -138,6 +153,125 @@ class TestParallelAwareDataloader(unittest.TestCase):
 
         self.assertEqual(dataloader.batch_size, 8)
         self.assertEqual(dataloader.num_workers, 2)
+
+    def test_single_dataset_scalar_alias_is_normalized(self):
+        tokenizer = DummyTokenizer()
+
+        dl_config = HuggingFaceTextDataLoader.Config(
+            dataset="c4_test",
+            dataset_alias="wiki",
+            num_workers=0,
+        )
+
+        dataloader = HuggingFaceTextDataLoader(
+            dl_config,
+            dp_world_size=1,
+            dp_rank=0,
+            tokenizer=tokenizer,
+            seq_len=32,
+            local_batch_size=1,
+        )
+
+        self.assertEqual(dataloader.dataset.dataset_aliases, ["wiki"])
+
+    def test_dataset_alias_none_entries_fall_back_to_index(self):
+        tokenizer = DummyTokenizer()
+
+        dl_config = HuggingFaceTextDataLoader.Config(
+            dataset=["c4_test", "c4_test"],
+            dataset_alias=["wiki", None],
+            num_workers=0,
+        )
+
+        dataloader = HuggingFaceTextDataLoader(
+            dl_config,
+            dp_world_size=1,
+            dp_rank=0,
+            tokenizer=tokenizer,
+            seq_len=32,
+            local_batch_size=1,
+        )
+
+        self.assertEqual(dataloader.dataset.dataset_aliases, ["wiki", "1"])
+
+    def test_dataset_alias_length_mismatch_raises(self):
+        tokenizer = DummyTokenizer()
+
+        dl_config = HuggingFaceTextDataLoader.Config(
+            dataset=["c4_test", "c4_test"],
+            dataset_alias=["wiki"],
+            num_workers=0,
+        )
+
+        with self.assertRaises(AssertionError):
+            HuggingFaceTextDataLoader(
+                dl_config,
+                dp_world_size=1,
+                dp_rank=0,
+                tokenizer=tokenizer,
+                seq_len=32,
+                local_batch_size=1,
+            )
+
+
+class TestDataMixSchedulerDatasetNames(unittest.TestCase):
+    def _build_scheduler(self, *, dataset_aliases=None, scheduler_names=None):
+        mixed_dataset = MixedDataset(
+            datasets=[DummyMixedComponent("a"), DummyMixedComponent("b")],
+            dp_rank=0,
+            weights=[0.7, 0.3],
+            dataset_aliases=dataset_aliases,
+        )
+        dataloader = SimpleNamespace(dataset=mixed_dataset)
+
+        if scheduler_names is None:
+            return build_data_mix_scheduler(dataloader, None, training_steps=100)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tmp:
+            json.dump(
+                {
+                    "names": scheduler_names,
+                    "@0%": [0.7, 0.3],
+                },
+                tmp,
+            )
+            tmp_path = tmp.name
+
+        self.addCleanup(lambda: os.unlink(tmp_path))
+        return build_data_mix_scheduler(dataloader, tmp_path, training_steps=100)
+
+    def test_default_scheduler_names_use_indices(self):
+        scheduler = self._build_scheduler()
+
+        self.assertEqual(scheduler.datasets_names, ["0", "1"])
+
+    def test_dataset_aliases_are_used_when_scheduler_names_absent(self):
+        scheduler = self._build_scheduler(dataset_aliases=["wiki", "code"])
+
+        self.assertEqual(scheduler.datasets_names, ["wiki", "code"])
+
+    def test_scheduler_names_override_dataset_aliases(self):
+        scheduler = self._build_scheduler(
+            dataset_aliases=["wiki", "code"],
+            scheduler_names=["sched_wiki", "sched_code"],
+        )
+
+        self.assertEqual(scheduler.datasets_names, ["sched_wiki", "sched_code"])
+
+    def test_scheduler_name_none_falls_back_per_index(self):
+        scheduler = self._build_scheduler(
+            dataset_aliases=["wiki", "code"],
+            scheduler_names=["sched_wiki", None],
+        )
+
+        self.assertEqual(scheduler.datasets_names, ["sched_wiki", "code"])
+
+    def test_scheduler_names_length_mismatch_raises(self):
+        with self.assertRaises(ValueError):
+            self._build_scheduler(
+                dataset_aliases=["wiki", "code"],
+                scheduler_names=["sched_only"],
+            )
 
 
 if __name__ == "__main__":

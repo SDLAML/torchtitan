@@ -7,9 +7,11 @@
 import argparse
 import importlib
 import json
-
-import os, shutil
+import os
+import shutil
+from dataclasses import fields, is_dataclass
 from pathlib import Path
+from typing import get_args
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -32,6 +34,139 @@ def _normalize_layer_pattern_for_validation(pattern):
     return pattern
 
 
+def _resolve_dataclass_type(annotation):
+    if isinstance(annotation, type) and is_dataclass(annotation):
+        return annotation
+    for candidate in get_args(annotation):
+        if isinstance(candidate, type) and is_dataclass(candidate):
+            return candidate
+    return None
+
+
+def _build_dataclass_from_dict(dataclass_type, values: dict, *, field_path: str):
+    if not isinstance(values, dict):
+        raise ValueError(f"Expected {field_path} to be a JSON object.")
+
+    kwargs = {}
+    field_map = {f.name: f for f in fields(dataclass_type)}
+    for key, value in values.items():
+        if key not in field_map:
+            raise ValueError(f"Unknown key '{field_path}.{key}' in job_config.")
+        field_info = field_map[key]
+        nested_type = _resolve_dataclass_type(field_info.type)
+        if isinstance(value, dict):
+            if nested_type is None:
+                raise ValueError(f"Expected '{field_path}.{key}' to be a scalar value.")
+            kwargs[key] = _build_dataclass_from_dict(
+                nested_type,
+                value,
+                field_path=f"{field_path}.{key}",
+            )
+        else:
+            kwargs[key] = value
+    return dataclass_type(**kwargs)
+
+
+def _apply_dataclass_overrides(target_obj, overrides: dict, *, field_path: str):
+    if not is_dataclass(target_obj):
+        raise ValueError(f"Expected {field_path} to be a dataclass instance.")
+    if not isinstance(overrides, dict):
+        raise ValueError(f"Expected {field_path} to be a JSON object.")
+
+    field_map = {f.name: f for f in fields(type(target_obj))}
+    for key, value in overrides.items():
+        if key not in field_map:
+            raise ValueError(f"Unknown key '{field_path}.{key}' in job_config.")
+        current_value = getattr(target_obj, key)
+        field_info = field_map[key]
+        nested_type = _resolve_dataclass_type(field_info.type)
+        if isinstance(value, dict):
+            if is_dataclass(current_value):
+                _apply_dataclass_overrides(
+                    current_value,
+                    value,
+                    field_path=f"{field_path}.{key}",
+                )
+            elif nested_type is not None:
+                setattr(
+                    target_obj,
+                    key,
+                    _build_dataclass_from_dict(
+                        nested_type,
+                        value,
+                        field_path=f"{field_path}.{key}",
+                    ),
+                )
+            else:
+                raise ValueError(f"Expected '{field_path}.{key}' to be a scalar value.")
+        else:
+            setattr(target_obj, key, value)
+
+
+def _load_job_config(job_config_path: Path) -> dict:
+    if not job_config_path.exists():
+        raise FileNotFoundError(f"job_config file does not exist: {job_config_path}")
+    try:
+        return json.loads(job_config_path.read_text())
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Malformed job_config JSON at {job_config_path}: {e}") from e
+
+
+def _resolve_model_spec_for_conversion(
+    *,
+    model_name: str,
+    model_flavor: str | None,
+    job_config_path: "Path | None",
+):
+    model_module = importlib.import_module(f"torchtitan.models.{model_name}")
+    default_flavor = "bsc-1B-7B-opt-g"
+
+    if model_name != "opt_moe":
+        resolved_flavor = model_flavor or default_flavor
+        return model_module.model_registry(resolved_flavor)
+
+    if job_config_path is None:
+        raise ValueError(
+            "--job_config is required when converting opt_moe checkpoints to HF."
+        )
+
+    job_config = _load_job_config(job_config_path)
+    model_spec_data = job_config.get("model_spec")
+    if not isinstance(model_spec_data, dict):
+        raise ValueError(
+            f"Malformed job_config at {job_config_path}: missing object 'model_spec'."
+        )
+
+    job_config_flavor = model_spec_data.get("flavor")
+    if not isinstance(job_config_flavor, str) or not job_config_flavor:
+        raise ValueError(
+            f"Malformed job_config at {job_config_path}: missing string "
+            "'model_spec.flavor'."
+        )
+
+    if model_flavor is not None and model_flavor != job_config_flavor:
+        raise ValueError(
+            "opt_moe conversion flavor mismatch: "
+            f"--model_flavor={model_flavor!r} but "
+            f"job_config.model_spec.flavor={job_config_flavor!r}."
+        )
+
+    model_overrides = model_spec_data.get("model")
+    if not isinstance(model_overrides, dict):
+        raise ValueError(
+            f"Malformed job_config at {job_config_path}: missing object "
+            "'model_spec.model'."
+        )
+
+    model_spec = model_module.model_registry(job_config_flavor)
+    _apply_dataclass_overrides(
+        model_spec.model,
+        model_overrides,
+        field_path="model_spec.model",
+    )
+    return model_spec
+
+
 def _validate_exported_hf_config(
     *,
     model_name: str,
@@ -41,6 +176,10 @@ def _validate_exported_hf_config(
     if model_name != "opt_moe":
         return
 
+    from torchtitan.models.opt_moe.hf_assests.setup_hf import (
+        get_hf_config_overrides_from_model_config,
+    )
+
     config_path = output_dir / "config.json"
     if not config_path.exists():
         raise FileNotFoundError(
@@ -48,26 +187,13 @@ def _validate_exported_hf_config(
         )
 
     exported_config = json.loads(config_path.read_text())
-    attention_config = model_config.layer.attention
-    expected_qk_rope_dim = getattr(attention_config, "qk_rope_dim", None)
-    if expected_qk_rope_dim is None:
-        expected_qk_rope_dim = (
-            getattr(attention_config, "head_dim", None)
-            or model_config.dim // attention_config.n_heads
-        )
-    expected_fields = {
-        "gate_only": bool(getattr(attention_config, "gate_only", False)),
-        "mid_norm_position": getattr(attention_config, "mid_norm_position", "after"),
-        "qk_rope_dim": expected_qk_rope_dim,
-        # HF router is always fp32 by design.
-        "force_router_on_fp32": True,
-        "rope_pattern": _normalize_layer_pattern_for_validation(
-            getattr(model_config, "rope_pattern", None)
-        ),
-        "swa_pattern": _normalize_layer_pattern_for_validation(
-            getattr(model_config, "swa_pattern", None)
-        ),
-    }
+    expected_fields = get_hf_config_overrides_from_model_config(None, model_config)
+    expected_fields["rope_pattern"] = _normalize_layer_pattern_for_validation(
+        expected_fields.get("rope_pattern")
+    )
+    expected_fields["swa_pattern"] = _normalize_layer_pattern_for_validation(
+        expected_fields.get("swa_pattern")
+    )
 
     mismatches = {
         field: (expected_value, exported_config.get(field))
@@ -80,7 +206,7 @@ def _validate_exported_hf_config(
             for field, (expected, actual) in mismatches.items()
         )
         raise ValueError(
-            f"HF config export lost opt_moe attention settings: {mismatch_text}."
+            f"HF config export lost opt_moe runtime config settings: {mismatch_text}."
         )
 
 
@@ -110,9 +236,10 @@ def convert_to_hf(
     input_dir: Path,
     output_dir: Path,
     model_name: str,
-    model_flavor: str,
+    model_flavor: "str | None",
     hf_assets_path: "Path | None",
     export_dtype: str,
+    job_config: "Path | None" = None,
 ):
     """Convert a DCP checkpoint to HuggingFace safetensors format.
 
@@ -127,8 +254,12 @@ def convert_to_hf(
       8. Copy HF config/modeling files and generate config.json.
     """
     # 1. Get ModelSpec from the model registry
-    model_module = importlib.import_module(f"torchtitan.models.{model_name}")
-    model_spec = model_module.model_registry(model_flavor)
+    model_spec = _resolve_model_spec_for_conversion(
+        model_name=model_name,
+        model_flavor=model_flavor,
+        job_config_path=job_config,
+    )
+    model_flavor = model_spec.flavor
 
     # 2. Build empty model on CPU
     model_config = model_spec.model
@@ -211,8 +342,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_flavor",
         type=str,
-        default="bsc-1B-7B-opt-g",
-        help="Model flavor / config key (default: bsc-1B-7B-opt-g).",
+        default=None,
+        help="Model flavor / config key. For opt_moe this must match job_config.",
+    )
+    parser.add_argument(
+        "--job_config",
+        type=Path,
+        default=None,
+        help="Path to the saved job_config_*.json. Required for opt_moe.",
     )
     parser.add_argument(
         "--hf_assets_path",
@@ -237,4 +374,5 @@ if __name__ == "__main__":
         args.model_flavor,
         args.hf_assets_path,
         args.export_dtype,
+        args.job_config,
     )

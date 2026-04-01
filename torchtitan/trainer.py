@@ -154,23 +154,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     f"Running with configs: {json.dumps(self.to_dict(), indent=2, ensure_ascii=False)}"
                 )
 
-            if self.debug.save_config_file:
-                config_file = os.path.join(
-                    self.dump_folder,
-                    "job_config_"
-                    + datetime.datetime.now().strftime("%Y%m%d-%H%M")
-                    + ".json",
+            # if self.debug.save_config_file:
+            config_file = os.path.join(
+                self.dump_folder,
+                "job_config_"
+                + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+                + ".json",
+            )
+            if torch.distributed.is_initialized():
+                if torch.distributed.get_rank() == 0:
+                    os.makedirs(os.path.dirname(config_file), exist_ok=True)
+                    with open(config_file, "w") as f:
+                        json.dump(self.to_dict(), f, indent=2)
+                logger.info(f"Saved job configs to {config_file}")
+            else:
+                logger.warning(
+                    "Job configs logging is disabled due to torch.distributed not initialized."
                 )
-                if torch.distributed.is_initialized():
-                    if torch.distributed.get_rank() == 0:
-                        os.makedirs(os.path.dirname(config_file), exist_ok=True)
-                        with open(config_file, "w") as f:
-                            json.dump(self.to_dict(), f, indent=2)
-                    logger.info(f"Saved job configs to {config_file}")
-                else:
-                    logger.warning(
-                        "Job configs logging is disabled due to torch.distributed not initialized."
-                    )
 
     # core configs
     config: Config

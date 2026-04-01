@@ -183,6 +183,40 @@ def _load_mixing_configs(mixing_scheduler_configs: str, training_steps: int):
     return rendered_mixing_configs, datasets_names
 
 
+def _default_dataset_names(mixed_dataset) -> list[str]:
+    dataset_aliases = getattr(mixed_dataset, "dataset_aliases", None)
+    if dataset_aliases is None:
+        return [str(i) for i in range(len(mixed_dataset.datasets))]
+    if len(dataset_aliases) != len(mixed_dataset.datasets):
+        raise ValueError(
+            "dataset_aliases must have the same length as datasets get "
+            f"len(datasets) = {len(mixed_dataset.datasets)} and "
+            f"len(dataset_aliases) = {len(dataset_aliases)}"
+        )
+    return [
+        alias if alias is not None else str(i)
+        for i, alias in enumerate(dataset_aliases)
+    ]
+
+
+def _resolve_dataset_names(mixed_dataset, datasets_names):
+    default_names = _default_dataset_names(mixed_dataset)
+    if datasets_names is None:
+        return default_names
+    if isinstance(datasets_names, str):
+        datasets_names = [datasets_names]
+    if len(datasets_names) != len(mixed_dataset.datasets):
+        raise ValueError(
+            f"datasets_names must have the same length as datasets get len(datasets) = "
+            f"{len(mixed_dataset.datasets)} and len(datasets_names) = "
+            f"{len(datasets_names)} but got datasets_names = {datasets_names}"
+        )
+    return [
+        default_name if name is None else str(name)
+        for default_name, name in zip(default_names, datasets_names, strict=True)
+    ]
+
+
 def build_data_mix_scheduler(
     dataloader: BaseDataLoader,
     mixing_scheduler_configs: str | None,
@@ -217,16 +251,7 @@ def build_data_mix_scheduler(
             0: mixed_dataset.weights.tolist(),
         }
 
-    if datasets_names is None:
-        datasets_names = [str(i) for i in range(len(mixed_dataset.datasets))]
-    elif isinstance(datasets_names, str):
-        datasets_names = [datasets_names]
-    if len(datasets_names) != len(mixed_dataset.datasets):
-        raise ValueError(
-            f"datasets_names must have the same length as datasets get len(datasets) = "
-            f"{len(mixed_dataset.datasets)} and len(datasets_names) = "
-            f"{len(datasets_names)} but got datasets_names = {datasets_names}"
-        )
+    datasets_names = _resolve_dataset_names(mixed_dataset, datasets_names)
     assert (
         0 in mixing_configs
     ), "mixing_configs must contain at least one entry for step 0"

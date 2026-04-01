@@ -15,6 +15,7 @@ from torchtitan.models.opt_moe.hf_assests.modeling_opt_moe import OptMoEAttentio
 from torchtitan.models.opt_moe.hf_assests.setup_hf import overwrite_config
 from torchtitan.models.opt_moe.model import OPTMoEModel, OPTMoETransformerBlock
 from torchtitan.models.opt_moe.norm_ffn import FeedForward
+from torchtitan.models.opt_moe.norm_moe import MoE
 from torchtitan.models.opt_moe.state_dict_adapter import OPTMoEStateDictAdapter
 
 
@@ -88,6 +89,69 @@ def _build_hf_attention(
     return attention
 
 
+def _build_native_moe_model_config() -> OPTMoEModel.Config:
+    return OPTMoEModel.Config(
+        dim=12,
+        n_layers=4,
+        vocab_size=64,
+        norm_eps=1e-5,
+        rope_pattern="RRNR",
+        swa_pattern="SSFS",
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=0,
+            norm_eps=1e-5,
+            residual_scale="depth_scale",
+            attention=GatedNormSWAttention.Config(
+                n_heads=3,
+                n_kv_heads=1,
+                head_dim=4,
+                qk_norm=True,
+                norm_everywhere=True,
+                gated_attention_type="head-wise",
+                gate_only=True,
+                mid_norm_position="before",
+                use_rope=True,
+                qk_rope_dim=2,
+                sliding_window_size=16,
+                attn_backend="flex",
+            ),
+            feed_forward=FeedForward.Config(
+                hidden_dim=18,
+                norm_everywhere=False,
+                activation_type="silu",
+            ),
+            moe=MoE.Config(
+                hidden_dim=24,
+                num_experts=16,
+                num_shared_experts=2,
+                top_k=4,
+                scaling_factor=1.0,
+                norm_everywhere=True,
+                activation_type="silu",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=2,
+            max_seq_len=32,
+            theta=10000.0,
+            backend="cos_sin",
+        ),
+        rope_of_swa=RoPE.Config(
+            dim=2,
+            max_seq_len=32,
+            theta=5000.0,
+            backend="cos_sin",
+        ),
+    )
+
+
+class _ConfigOnlyModel:
+    __slots__ = ("config",)
+
+    def __init__(self, config):
+        self.config = config
+
+
 def _copy_attention_weights(
     native_attention: GatedNormSWAttention,
     hf_attention: OptMoEAttention,
@@ -154,3 +218,27 @@ class TestOptMoEHFAssets(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "learned norm tensors"):
             adapter.to_hf({"layers.0.attention.mid_norm.weight": torch.ones(4)})
+
+    def test_overwrite_config_uses_runtime_model_config_without_module_inspection(self):
+        model_config = _build_native_moe_model_config()
+
+        exported = overwrite_config(_ConfigOnlyModel(model_config))
+
+        self.assertEqual(exported["hidden_size"], 12)
+        self.assertEqual(exported["num_hidden_layers"], 4)
+        self.assertEqual(exported["num_attention_heads"], 3)
+        self.assertEqual(exported["num_key_value_heads"], 1)
+        self.assertEqual(exported["head_dim"], 4)
+        self.assertEqual(exported["qk_rope_dim"], 2)
+        self.assertEqual(exported["partial_rotary_factor"], 0.5)
+        self.assertEqual(exported["intermediate_size"], 18)
+        self.assertEqual(exported["moe_intermediate_size"], 24)
+        self.assertEqual(exported["moe_scaling_factor"], 1.0)
+        self.assertEqual(exported["n_active_experts"], 4)
+        self.assertEqual(exported["n_total_experts"], 16)
+        self.assertEqual(exported["n_shared_experts"], 2)
+        self.assertEqual(exported["rope_pattern"], "RRNR")
+        self.assertEqual(exported["swa_pattern"], "SSFS")
+        self.assertEqual(exported["rope_theta_swa"], 5000.0)
+        self.assertEqual(exported["hidden_act"], "silu")
+        self.assertEqual(exported["residual_scale"], "depth_scale")
