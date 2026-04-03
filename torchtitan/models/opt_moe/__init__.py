@@ -248,6 +248,48 @@ moe_opt_moe_configs = {
     ),
     #
     #
+    #
+    "macaron-8b": OPTMoEModel.Config(
+        n_layers=24,
+        dim=2048,
+        swa_pattern="SSSF" * 6,
+        rope_pattern="RRRN" * 6,
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=0,
+            feed_forward=FeedForward.Config(
+                hidden_dim=5120,
+                norm_everywhere=True,
+                norm_eps=1e-30,
+            ),
+            moe=MoE.Config(
+                hidden_dim=640,
+                num_experts=64,
+                num_shared_experts=1,
+                top_k=8,
+                norm_everywhere=True,
+                scaling_factor=2.8232,
+            ),
+            attention=GatedNormSWAttention.Config(
+                n_heads=32,
+                n_kv_heads=4,
+                head_dim=128,
+                qk_norm=True,
+                norm_everywhere=True,
+                norm_eps=1e-30,
+                sliding_window_size=128,
+                attn_mask_type="block_causal",
+                attn_backend="flex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=10000.0,
+            backend="cos_sin",
+        ),
+    ),
+    #
+    #
     # ==== 0.4.0-model-architecture-ablation ====
     "M1-dense-600M-full_rope-proxy": OPTMoEModel.Config(
         n_layers=14,
