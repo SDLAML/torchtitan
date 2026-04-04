@@ -18,7 +18,6 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
-from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
@@ -521,13 +520,13 @@ class GreedyPackedDataset(IterableDataset, Stateful):
                     self._token_buffer = self._token_buffer[max_buffer_token_len:]
                     input = x[:-1]
                     label = x[1:]
-                    if self.eos_id is not None:
-                        # Ignore the artificial EOS -> next-doc-start transition
-                        # introduced by concatenative packing.
-                        eos_mask = input == self.eos_id
-                        if eos_mask.any():
-                            label = label.clone()
-                            label[eos_mask] = IGNORE_INDEX
+                    # if self.eos_id is not None:
+                    #     # Ignore the artificial EOS -> next-doc-start transition
+                    #     # introduced by concatenative packing.
+                    #     eos_mask = input == self.eos_id
+                    #     if eos_mask.any():
+                    #         label = label.clone()
+                    #         label[eos_mask] = IGNORE_INDEX
                     yield {"input": input}, label
 
             if not self.infinite:

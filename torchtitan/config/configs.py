@@ -45,6 +45,11 @@ class TrainingConfig:
     enable_token_mask_for_moe: bool = False
     """Whether to enable token mask for MoE, mainly for SFT"""
 
+    all_tokens_valid: bool = False
+    """Set True only when every label contributes to loss (no IGNORE_INDEX anywhere).
+    Skips per-token counting and the all-reduce before each forward pass.
+    Must stay False for any masked or padded training setup such as SFT."""
+
     max_norm: float | int = 1.0
     """Max norm for gradient clipping"""
 

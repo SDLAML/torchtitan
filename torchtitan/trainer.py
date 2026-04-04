@@ -758,22 +758,44 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # the major variables that are used in the training loop.
         parallel_dims = self.parallel_dims
 
-        # Collect all microbatches on CPU and count total valid tokens
+        # Collect all microbatches on CPU and compute global valid token count.
         microbatches = []
-        local_valid_tokens = torch.tensor(0, dtype=torch.int64)
-        for _microbatch in range(self.gradient_accumulation_steps):
-            input_dict, labels = next(data_iterator)
-            local_valid_tokens += (labels != IGNORE_INDEX).sum()
-            microbatches.append((input_dict, labels))
 
-        # All-reduce to get global token count across DP ranks
-        # Move to GPU for distributed communication
-        local_valid_tokens = local_valid_tokens.to(self.device)
-        if parallel_dims.dp_enabled:
-            batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(local_valid_tokens, batch_mesh)
+        if self.config.training.all_tokens_valid:
+            # Fast path: every label is valid and every rank has the same fixed
+            # token count. Count from the actual CPU microbatches to avoid any
+            # communication while staying robust to shape drift.
+            local_valid_tokens = 0
+            for _microbatch in range(self.gradient_accumulation_steps):
+                input_dict, labels = next(data_iterator)
+                local_valid_tokens += labels.numel()
+                microbatches.append((input_dict, labels))
+            batch_degree = (
+                parallel_dims.get_mesh("batch").size()
+                if parallel_dims.dp_enabled
+                else 1
+            )
+            local_valid_tokens = torch.tensor(
+                float(local_valid_tokens), device=self.device
+            )
+            global_valid_tokens = local_valid_tokens * batch_degree
         else:
-            global_valid_tokens = local_valid_tokens.float()
+            local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+            for _microbatch in range(self.gradient_accumulation_steps):
+                input_dict, labels = next(data_iterator)
+                local_valid_tokens += (labels != IGNORE_INDEX).sum()
+                microbatches.append((input_dict, labels))
+
+            # All-reduce to get global token count across DP ranks
+            # Move to GPU for distributed communication
+            local_valid_tokens = local_valid_tokens.to(self.device)
+            if parallel_dims.dp_enabled:
+                batch_mesh = parallel_dims.get_mesh("batch")
+                global_valid_tokens = dist_utils.dist_sum(
+                    local_valid_tokens, batch_mesh
+                )
+            else:
+                global_valid_tokens = local_valid_tokens.float()
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
