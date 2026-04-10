@@ -303,7 +303,7 @@ class CheckpointManager(Configurable):
         "disabled" is the default mode.
         """
 
-        keep_latest_k: int = 10
+        keep_latest_k: int = 0
         """
         Keeps only the latest k checkpoints, and purging older ones. If 0, keep all checkpoints.
         K cannot be 1 as the last one may be in the process of being saved. As a result,
