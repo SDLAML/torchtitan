@@ -7,12 +7,15 @@
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
+from os import PathLike
+from pathlib import Path
 from random import Random
 from typing import Any
 
 import torch
 
 from datasets import Dataset, load_dataset
+from datasets.data_files import DataFilesDict, DataFilesList
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
@@ -43,14 +46,58 @@ def _process_simple_text(sample: dict[str, Any], key: str) -> str:
     return sample[key]
 
 
+def _prepared_data_files(
+    dataset_path: str,
+    dataset_files: str | Sequence[str] | None,
+    dataset_split: str,
+    dataset_streaming: bool,
+) -> DataFilesDict | None:
+    base_path = Path(dataset_path)
+    if dataset_files is None:
+        manifest_name = (
+            "manifest.parquet.txt" if dataset_streaming else "manifest.json.txt"
+        )
+        manifest_path = base_path / manifest_name
+        if not manifest_path.is_file():
+            return None
+        files = [
+            line.strip()
+            for line in manifest_path.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if not files:
+            raise ValueError(f"Manifest file {manifest_path} is empty")
+    elif isinstance(dataset_files, (str, PathLike)):
+        files = [str(dataset_files)]
+    else:
+        files = [str(path) for path in dataset_files]
+
+    files = [
+        str(path if Path(path).is_absolute() else base_path / path) for path in files
+    ]
+    # DataFilesList requires one origin-metadata entry per file. Using empty
+    # tuples keeps the manifest lightweight and avoids HF's per-file fs.info()
+    # pass during startup.
+    origin_metadata = [()] * len(files)
+    return DataFilesDict({dataset_split: DataFilesList(files, origin_metadata)})
+
+
 def _load_simple_dataset(
     dataset_path: str,
     dataset_name: str | None = None,
-    dataset_files: str | Sequence[str] | None = None,
+    dataset_files: str | Sequence[str] | DataFilesDict | None = None,
     dataset_split: str = "train",
     dataset_streaming: bool = False,
 ):
     """Load a simple custom dataset with its configuration."""
+    if dataset_files is not None and isinstance(dataset_files, DataFilesDict):
+        return load_dataset(
+            "parquet" if dataset_streaming else "json",
+            data_files=dataset_files,
+            split=dataset_split,
+            streaming=dataset_streaming,
+        )
+
     return load_dataset(
         dataset_path,
         name=dataset_name,
@@ -742,6 +789,16 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             assert (
                 dataset_files is None
             ), "cannot supply dataset files when using multiple datasets"
+        prepared_dataset_files = [
+            (
+                None
+                if d_path is None
+                else _prepared_data_files(
+                    d_path, dataset_files, d_split, dataset_streaming
+                )
+            )
+            for d_path, d_split in zip(dataset_path, dataset_split)
+        ]
         for d in [
             dataset_alias,
             dataset_path,
@@ -749,17 +806,19 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             dataset_split,
             dataset_key,
             dataset_weights,
+            prepared_dataset_files,
         ]:
             assert (
                 len(d) == normed_list_length
             ), f"list {d} does not match length of list of datasets (length = {normed_list_length})"
         hf_datasets = []
-        for d_name, d_path, d_inner_name, d_split, d_key in zip(
+        for d_name, d_path, d_inner_name, d_split, d_key, d_files in zip(
             dataset_name,
             dataset_path,
             dataset_inner_name,
             dataset_split,
             dataset_key,
+            prepared_dataset_files,
         ):
             hf_ds = HuggingFaceDataset(
                 dataset_name=d_name,
@@ -769,7 +828,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
                 dp_world_size=dp_world_size,
                 infinite=infinite,
                 dataset_inner_name=d_inner_name,
-                dataset_files=dataset_files,
+                dataset_files=d_files,
                 dataset_split=d_split,
                 dataset_streaming=dataset_streaming,
                 dataset_key=d_key,
@@ -784,6 +843,9 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
                 )
             hf_datasets.append(hf_ds)
 
+        if torch.distributed.is_initialized():
+            # do a final barrier to ensure all datasets are loaded before mixing
+            torch.distributed.barrier()
         # First pack, then mix → data is only mixed in batch dimension.
         # First mix, then pack → data is also mixed inside packed sample.
         hf_ds = MixedDataset(

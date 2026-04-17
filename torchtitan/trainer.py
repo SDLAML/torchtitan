@@ -546,7 +546,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 pp_has_first_stage=pp_has_first_stage,
                 pp_has_last_stage=pp_has_last_stage,
             )
-
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         logger.info(
             "Trainer is initialized with "
             f"local batch size {config.training.local_batch_size}, "
