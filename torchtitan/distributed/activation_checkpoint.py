@@ -73,6 +73,13 @@ def _apply_op_sac(
         create_selective_checkpoint_contexts,
     )
 
+    mm_save_every = int(os.environ.get("TORCHTITAN_SAC_SAVE_MM_FREQUENCY", "2"))
+    if mm_save_every < 0:
+        raise ValueError(
+            "TORCHTITAN_SAC_SAVE_MM_FREQUENCY must be >= 0, "
+            f"got {mm_save_every}"
+        )
+
     mm_recompute_shapes = set()
     if len(ac_config.per_op_sac_force_recompute_mm_shapes_by_fqns) > 0:
         for module_fqn, submod in module.named_modules():
@@ -111,9 +118,17 @@ def _apply_op_sac(
                 if args[1].shape in mm_recompute_shapes:
                     return CheckpointPolicy.PREFER_RECOMPUTE
                 meta[mm_count_key] += 1
-            # Saves output of all compute ops, except every second mm
-            to_save = func in op_sac_save_list and not (
-                func == torch.ops.aten.mm.default and meta[mm_count_key] % 2 == 0
+
+            save_mm = (
+                func == torch.ops.aten.mm.default
+                and mm_save_every != 0
+                and meta[mm_count_key] % mm_save_every == 1
+            )
+            # Saves output of all compute ops, except mm ops not selected by the
+            # configurable save frequency. With the default frequency of 2, this
+            # preserves the current "save every other mm" behavior.
+            to_save = func in op_sac_save_list and (
+                func != torch.ops.aten.mm.default or save_mm
             )
             return (
                 CheckpointPolicy.MUST_SAVE
