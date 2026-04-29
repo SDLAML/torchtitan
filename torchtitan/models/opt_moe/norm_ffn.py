@@ -63,6 +63,8 @@ class FeedForward(Module):
         init_gate_as_residual: bool,
         skip_init: bool = False,
     ):
+        if not isinstance(self.mid_norm, nn.Identity):
+            self.mid_norm.reset_parameters()
         if skip_init:
             return
 
@@ -79,6 +81,3 @@ class FeedForward(Module):
             else self.config.w3_init_std
         )
         w3_init_fn(self.w3.weight, mean=0.0, std=w3_init_std)
-
-        if not isinstance(self.mid_norm, nn.Identity):
-            self.mid_norm.reset_parameters()

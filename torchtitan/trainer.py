@@ -420,7 +420,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 m.to_empty(device=init_device)
                 with torch.no_grad():
                     cast(Decoder, m).init_weights(
-                        buffer_device=buffer_device, skip_weight_init=skip_weight_init
+                        buffer_device=buffer_device, skip_init=skip_weight_init
                     )
                 m.train()
 
@@ -446,7 +446,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             model.to_empty(device=init_device)
             with torch.no_grad():
                 cast(BaseModel, model).init_weights(
-                    buffer_device=buffer_device, skip_weight_init=skip_weight_init
+                    buffer_device=buffer_device, skip_init=skip_weight_init
                 )
             model.train()
 

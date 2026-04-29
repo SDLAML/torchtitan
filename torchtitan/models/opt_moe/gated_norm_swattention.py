@@ -269,7 +269,13 @@ class GatedNormSWAttention(BaseAttention):
             output = self.mid_norm(output)
         return self.wo(output)
 
-    def init_weights(self, residual_div: float):
+    def init_weights(self, residual_div: float, skip_init: bool = False):
+        for norm in (self.q_norm, self.k_norm, self.v_norm, self.mid_norm):
+            if not isinstance(norm, nn.Identity):
+                norm.reset_parameters()
+
+        if skip_init:
+            return
 
         wq_init_fn = build_init_fn(self.config.wq_init_fn_type)
         wk_init_fn = build_init_fn(self.config.wk_init_fn_type)
@@ -281,10 +287,6 @@ class GatedNormSWAttention(BaseAttention):
 
         wo_init_fn = build_init_fn(self.config.wo_init_fn_type)
         wo_init_fn(self.wo.weight, mean=0.0, std=self.config.wo_init_std / residual_div)
-
-        for norm in (self.q_norm, self.k_norm, self.v_norm, self.mid_norm):
-            if not isinstance(norm, nn.Identity):
-                norm.reset_parameters()
 
         if self.gated_attention_type is not None:
             w_gate_init_fn = build_init_fn(self.config.w_gate_init_fn_type)

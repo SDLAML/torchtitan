@@ -196,6 +196,8 @@ class GroupedExperts(nn.Module):
         init_fn_types: tuple[str, str, str],
         skip_init: bool = False,
     ):
+        if not isinstance(self.mid_norm, nn.Identity):
+            self.mid_norm.reset_parameters()
         if skip_init:
             return
 
@@ -226,9 +228,6 @@ class GroupedExperts(nn.Module):
             slot=1,
             layer_id=self.layer_id,
         )
-
-        if not isinstance(self.mid_norm, nn.Identity):
-            self.mid_norm.reset_parameters()
 
 
 def make_seed_from_global(
@@ -294,7 +293,10 @@ class TokenChoiceTopKRouter(nn.Module):
             f"FORCE_ROUTER_FP32_MATMUL: {self.force_router_fp32_matmul}"
         )
 
-    def init_weights(self, init_std: float, init_fn_type: str):
+    def init_weights(self, init_std: float, init_fn_type: str, skip_init: bool = False):
+        if skip_init:
+            return
+
         # nn.init.xavier_uniform_(self.expert_embeddings)
         init_fn = build_init_fn(init_fn_type)
         init_fn(self.gate.weight, mean=0.0, std=init_std)
@@ -740,9 +742,6 @@ class MoE(Module):
         init_gate_as_residual: bool,
         skip_init: bool = False,
     ):
-        if skip_init:
-            return
-
         self.experts.init_weights(
             residual_div=residual_div,
             init_gate_as_residual=init_gate_as_residual,
@@ -756,14 +755,18 @@ class MoE(Module):
                 self.config.w2_init_fn_type,
                 self.config.w3_init_fn_type,
             ),
+            skip_init=skip_init,
         )
         if self.shared_experts is not None:
             self.shared_experts.init_weights(
                 residual_div=residual_div,
                 init_gate_as_residual=init_gate_as_residual,
+                skip_init=skip_init,
             )
         self.router.init_weights(
-            self.config.router_init_std, self.config.router_init_fn_type
+            self.config.router_init_std,
+            self.config.router_init_fn_type,
+            skip_init=skip_init,
         )
 
         self.expert_bias.zero_()

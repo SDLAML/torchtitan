@@ -199,21 +199,24 @@ class OPTMoETransformerBlock(TransformerBlock):
 
         return self.identity_scale * h + self.block_scale * mlp_output, lbl_loss
 
-    def init_weights(self):
+    def init_weights(self, skip_init: bool = False):
         for norm in (self.attention_norm, self.ffn_norm):
             norm.reset_parameters()
         self.attention.init_weights(
             residual_div=self.residual_div_attn,
+            skip_init=skip_init,
         )
         if self.moe_enabled:
             self.moe.init_weights(
                 residual_div=self.residual_div_ffn,
                 init_gate_as_residual=self.init_gate_as_residual,
+                skip_init=skip_init,
             )
         else:
             self.feed_forward.init_weights(
                 residual_div=self.residual_div_ffn,
                 init_gate_as_residual=self.init_gate_as_residual,
+                skip_init=skip_init,
             )
 
 
@@ -486,9 +489,14 @@ class OPTMoEModel(Decoder):
             rope_of_swa.init_weights(buffer_device=buffer_device)
             self.freqs_cis_local = rope_of_swa.cache
 
+        """
+        We always init/reset the norm parameters, because its cheap.
+        Then we pass the skip_init flag to the layer init_weights to skip the weight initialization.
+        """
+        if self.norm is not None:
+            self.norm.reset_parameters()
+
         skip_init = kwargs.get("skip_init", False)
-        if skip_init:
-            return
 
         first_in_init_fn = build_init_fn(self.config.first_in_init_fn_type)
         if self.tok_embeddings is not None:
@@ -500,9 +508,8 @@ class OPTMoEModel(Decoder):
 
         for layer in self.layers.values():
             # pyrefly: ignore [not-callable]
-            layer.init_weights()
-        if self.norm is not None:
-            self.norm.reset_parameters()
+            layer.init_weights(skip_init=skip_init)
+
         final_out_init_fn = build_init_fn(self.config.final_out_init_fn_type)
         if self.output is not None:
             final_out_init_fn(
