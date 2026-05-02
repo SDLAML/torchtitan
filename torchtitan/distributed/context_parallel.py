@@ -8,8 +8,11 @@ from collections.abc import Sequence
 from typing import Any, cast
 
 import torch
+import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.experimental._attention import (
     _context_parallel_shard,
     _ContextParallel,
@@ -17,10 +20,18 @@ from torch.distributed.tensor.experimental._attention import (
     _HeadTailLoadBalancer,
     _PTRRLoadBalancer,
 )
+from torch.distributed.tensor.experimental._context_parallel._attention import (
+    flex_cp_allgather,
+)
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.models.common.attention import (
+    AttentionMasksType,
+    FlexAttentionWrapper,
+    ScaledDotProductAttentionWrapper,
+    VarlenAttentionWrapper,
+)
 from torchtitan.tools.logging import logger
 
 
@@ -86,6 +97,142 @@ def apply_cp_to_attention_module(
     logger.info("Applied Context Parallel to the model")
 
 
+def apply_cp_to_forward(
+    attention_modules: Sequence[nn.Module],
+    cp_mesh: DeviceMesh,
+) -> None:
+    """Wrap inner_attention.forward with CP logic.
+
+    For FlexAttention: allgathers K/V from all CP ranks so each device computes
+    attention with local Q and global K/V. Naturally handles SWA — the block_mask
+    is Q-sharded/KV-full after cp_shard, which matches local Q vs global K/V.
+
+    For SDPA: wraps Q/K/V as CP-sharded DTensors before calling forward.
+
+    Must be called BEFORE parallelize() / apply_moe_ep_tp() so the CP wrapper
+    runs inside any local_map boundary on local tensors.
+    """
+    first = attention_modules[0]
+    if isinstance(first, FlexAttentionWrapper):
+        for mod in attention_modules:
+            original_forward = mod.forward
+
+            def _make_cp_forward(orig_fn, mesh):
+                pg_name = dist._get_process_group_name(mesh.get_group())
+
+                def cp_forward(q, k, v, **kwargs):
+                    k = k.contiguous()
+                    v = v.contiguous()
+                    global_k, global_v = flex_cp_allgather(k, v, 2, pg_name)
+                    return orig_fn(q, global_k, global_v, **kwargs)
+
+                return cp_forward
+
+            mod.forward = _make_cp_forward(original_forward, cp_mesh)
+
+    elif isinstance(first, ScaledDotProductAttentionWrapper):
+        _enable_context_parallel_dispatcher()
+
+        for mod in attention_modules:
+            original_forward = mod.forward
+
+            def _make_cp_forward(orig_fn, mesh):
+                placement = [Shard(2)]
+
+                def cp_forward(q, k, v, **kwargs):
+                    if not isinstance(q, DTensor):
+                        q = DTensor.from_local(q, mesh, placement, run_check=False)
+                    if not isinstance(k, DTensor):
+                        k = DTensor.from_local(k, mesh, placement, run_check=False)
+                    if not isinstance(v, DTensor):
+                        v = DTensor.from_local(v, mesh, placement, run_check=False)
+                    output = orig_fn(q, k, v, **kwargs)
+                    return output.to_local() if isinstance(output, DTensor) else output
+
+                return cp_forward
+
+            mod.forward = _make_cp_forward(original_forward, cp_mesh)
+
+    elif isinstance(first, VarlenAttentionWrapper):
+        raise NotImplementedError("Variable-length attention CP is not yet supported")
+    else:
+        raise NotImplementedError(
+            f"CP forward wrapping not supported for {type(first).__name__}"
+        )
+
+    logger.info("Applied Context Parallel (forward wrapping) to the model")
+
+
+def apply_cp_to_forward_fused_kv_gather(
+    attention_modules: Sequence[nn.Module],
+    cp_mesh: DeviceMesh,
+) -> None:
+    """Same as apply_cp_to_forward, but with fused KV allgather.
+
+    For FlexAttention: concatenates K and V along the head dimension, does a
+    single allgather, then splits back. This halves NCCL kernel launches per
+    attention layer (2 allgathers + 2 reduce_scatters → 1 + 1).
+    """
+    first = attention_modules[0]
+    if isinstance(first, FlexAttentionWrapper):
+        for mod in attention_modules:
+            original_forward = mod.forward
+
+            def _make_cp_forward(orig_fn, mesh):
+                pg_name = dist._get_process_group_name(mesh.get_group())
+                cp_size = mesh.size()
+
+                def cp_forward(q, k, v, **kwargs):
+                    kv = torch.cat([k, v], dim=1).contiguous()
+                    # gather_dim=0 avoids _maybe_view_chunk_cat, which is on
+                    # Dynamo's MOD_SKIPLIST and breaks compile + AC.
+                    kv_gathered = funcol.all_gather_tensor(kv, 0, pg_name)
+                    if isinstance(kv_gathered, funcol.AsyncCollectiveTensor):
+                        kv_gathered = kv_gathered.wait()
+                    # [B*CP, H_kv*2, S/CP, D] -> [B, H_kv*2, S, D]
+                    kv_full = torch.cat(kv_gathered.chunk(cp_size, dim=0), dim=2)
+                    global_k, global_v = kv_full.chunk(2, dim=1)
+                    return orig_fn(q, global_k, global_v, **kwargs)
+
+                return cp_forward
+
+            mod.forward = _make_cp_forward(original_forward, cp_mesh)
+
+    elif isinstance(first, ScaledDotProductAttentionWrapper):
+        _enable_context_parallel_dispatcher()
+
+        for mod in attention_modules:
+            original_forward = mod.forward
+
+            def _make_cp_forward(orig_fn, mesh):
+                placement = [Shard(2)]
+
+                def cp_forward(q, k, v, **kwargs):
+                    if not isinstance(q, DTensor):
+                        q = DTensor.from_local(q, mesh, placement, run_check=False)
+                    if not isinstance(k, DTensor):
+                        k = DTensor.from_local(k, mesh, placement, run_check=False)
+                    if not isinstance(v, DTensor):
+                        v = DTensor.from_local(v, mesh, placement, run_check=False)
+                    output = orig_fn(q, k, v, **kwargs)
+                    return output.to_local() if isinstance(output, DTensor) else output
+
+                return cp_forward
+
+            mod.forward = _make_cp_forward(original_forward, cp_mesh)
+
+    elif isinstance(first, VarlenAttentionWrapper):
+        raise NotImplementedError("Variable-length attention CP is not yet supported")
+    else:
+        raise NotImplementedError(
+            f"CP forward wrapping not supported for {type(first).__name__}"
+        )
+
+    logger.info(
+        "Applied Context Parallel (forward wrapping, fused KV gather) to the model"
+    )
+
+
 def prepare_context_parallel_input(
     inputs: torch.Tensor,
     labels: torch.Tensor,
@@ -133,6 +280,161 @@ def prepare_context_parallel_input(
         extra_kwargs["attention_masks"] = attention_masks
 
     return inputs, labels, extra_kwargs
+
+
+def _shard_block_mask_cp(mask: BlockMask, cp_mesh: DeviceMesh) -> BlockMask:
+    """Shard BlockMask for allgather CP by slicing Q-block rows.
+
+    Slices existing block-level metadata rather than materializing a dense
+    [B, H, Q_SHARD, KV_LEN] tensor, which OOMs at large sequence lengths.
+    BlockMask.from_kv_blocks() auto-computes q_num_blocks/q_indices (backward)
+    via _transpose_ordered().
+    """
+    cp_rank = cp_mesh.get_local_rank()
+    cp_size = cp_mesh.size()
+    Q_LEN, KV_LEN = mask.seq_lengths
+    Q_SHARD_LEN = Q_LEN // cp_size
+    BS_Q = mask.BLOCK_SIZE[0] if isinstance(mask.BLOCK_SIZE, tuple) else mask.BLOCK_SIZE
+    q_block_start = cp_rank * (Q_SHARD_LEN // BS_Q)
+    q_block_end = q_block_start + Q_SHARD_LEN // BS_Q
+    q_offset = cp_rank * Q_SHARD_LEN
+
+    kv_num = mask.kv_num_blocks[:, :, q_block_start:q_block_end].clone()
+    # Keep full last dimension — _ordered_to_dense uses shape[-1] as the dense
+    # matrix width; trimming it below the max KV index value causes OOB crashes.
+    kv_idx = mask.kv_indices[:, :, q_block_start:q_block_end, :].clone()
+
+    full_kv_num = None
+    full_kv_idx = None
+    if mask.full_kv_num_blocks is not None:
+        full_kv_num = mask.full_kv_num_blocks[:, :, q_block_start:q_block_end].clone()
+        full_kv_idx = mask.full_kv_indices[:, :, q_block_start:q_block_end, :].clone()
+
+    orig_mod = mask.mask_mod
+
+    def local_mask_mod(b, h, q_idx, kv_idx_arg):
+        return orig_mod(b, h, q_idx + q_offset, kv_idx_arg)
+
+    return BlockMask.from_kv_blocks(
+        kv_num,
+        kv_idx,
+        full_kv_num,
+        full_kv_idx,
+        BLOCK_SIZE=mask.BLOCK_SIZE,
+        mask_mod=local_mask_mod,
+        seq_lengths=(Q_SHARD_LEN, KV_LEN),
+    )
+
+
+def _shard_block_mask_cp_headtail(mask: BlockMask, cp_mesh: DeviceMesh) -> BlockMask:
+    """Shard BlockMask for allgather CP with headtail load balancing.
+
+    Rank r gets Q blocks from head chunk r and tail chunk (2*CP-1-r), matching
+    _HeadTailLoadBalancer. KV indices are remapped from original order to
+    headtail-allgathered order. Pads kv_idx to KV_BLOCKS width when needed
+    (e.g. SWA masks where the original width < KV_BLOCKS) so that
+    _ordered_to_dense stays in-bounds after remapping.
+    """
+    cp_rank = cp_mesh.get_local_rank()
+    cp_size = cp_mesh.size()
+    Q_LEN, KV_LEN = mask.seq_lengths
+    BS_Q = mask.BLOCK_SIZE[0] if isinstance(mask.BLOCK_SIZE, tuple) else mask.BLOCK_SIZE
+    BS_KV = (
+        mask.BLOCK_SIZE[1] if isinstance(mask.BLOCK_SIZE, tuple) else mask.BLOCK_SIZE
+    )
+
+    Q_BLOCKS = Q_LEN // BS_Q
+    KV_BLOCKS = KV_LEN // BS_KV
+    q_chunk = Q_BLOCKS // (2 * cp_size)
+    kv_chunk = KV_BLOCKS // (2 * cp_size)
+
+    q_head_start = cp_rank * q_chunk
+    q_tail_start = (2 * cp_size - 1 - cp_rank) * q_chunk
+    Q_SHARD_LEN = 2 * q_chunk * BS_Q
+
+    # orig_to_ht[b] = headtail position of original KV block b.
+    # Headtail order: [rank0_head_chunk, rank0_tail_chunk, rank1_head_chunk, ...]
+    # Rank r head: orig [r*kv_chunk .. (r+1)*kv_chunk) → ht [r*2*kv_chunk .. r*2*kv_chunk+kv_chunk)
+    # Rank r tail: orig [(2CP-1-r)*kv_chunk .. (2CP-r)*kv_chunk) → ht [r*2*kv_chunk+kv_chunk .. (r+1)*2*kv_chunk)
+    device = mask.kv_indices.device
+    orig_to_ht = torch.empty(KV_BLOCKS, dtype=mask.kv_indices.dtype, device=device)
+    for r in range(cp_size):
+        orig_to_ht[r * kv_chunk : (r + 1) * kv_chunk] = torch.arange(
+            r * 2 * kv_chunk, r * 2 * kv_chunk + kv_chunk, device=device
+        )
+        tail_orig = (2 * cp_size - 1 - r) * kv_chunk
+        orig_to_ht[tail_orig : tail_orig + kv_chunk] = torch.arange(
+            r * 2 * kv_chunk + kv_chunk, (r + 1) * 2 * kv_chunk, device=device
+        )
+
+    def _select_and_remap(
+        blk_num: torch.Tensor, blk_idx: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num = torch.cat(
+            [
+                blk_num[:, :, q_head_start : q_head_start + q_chunk],
+                blk_num[:, :, q_tail_start : q_tail_start + q_chunk],
+            ],
+            dim=2,
+        ).clone()
+        idx_orig = torch.cat(
+            [
+                blk_idx[:, :, q_head_start : q_head_start + q_chunk, :],
+                blk_idx[:, :, q_tail_start : q_tail_start + q_chunk, :],
+            ],
+            dim=2,
+        ).clone()
+        idx = orig_to_ht[idx_orig]
+        # After remap, values span [0, KV_BLOCKS); _ordered_to_dense uses
+        # shape[-1] as the dense width, so it must be >= KV_BLOCKS.
+        if idx.shape[-1] < KV_BLOCKS:
+            idx = torch.nn.functional.pad(idx, (0, KV_BLOCKS - idx.shape[-1]))
+        return num, idx
+
+    kv_num, kv_idx = _select_and_remap(mask.kv_num_blocks, mask.kv_indices)
+
+    full_kv_num = full_kv_idx = None
+    if mask.full_kv_num_blocks is not None:
+        full_kv_num, full_kv_idx = _select_and_remap(
+            mask.full_kv_num_blocks, mask.full_kv_indices
+        )
+
+    orig_mod = mask.mask_mod
+    q_head_tok = q_head_start * BS_Q
+    q_tail_tok = q_tail_start * BS_Q
+    half_q_tok = q_chunk * BS_Q
+
+    def local_mask_mod(b, h, q_local, kv_ht):
+        # Q: map local headtail token index to original token index
+        q_orig = torch.where(
+            q_local < half_q_tok,
+            q_local + q_head_tok,
+            q_local - half_q_tok + q_tail_tok,
+        )
+        # KV: map headtail token index to original token index (analytical inverse)
+        # rank_r = ht_block // (2*kv_chunk); is_tail = (ht_block // kv_chunk) % 2
+        kv_blk_ht = kv_ht // BS_KV
+        kv_off = kv_ht % BS_KV
+        rank_r = kv_blk_ht // (2 * kv_chunk)
+        is_tail = (kv_blk_ht // kv_chunk) % 2 == 1
+        pos = kv_blk_ht % kv_chunk
+        kv_blk_orig = torch.where(
+            is_tail,
+            (2 * cp_size - 1 - rank_r) * kv_chunk + pos,
+            rank_r * kv_chunk + pos,
+        )
+        kv_orig = kv_blk_orig * BS_KV + kv_off
+        return orig_mod(b, h, q_orig, kv_orig)
+
+    return BlockMask.from_kv_blocks(
+        kv_num,
+        kv_idx,
+        full_kv_num,
+        full_kv_idx,
+        BLOCK_SIZE=mask.BLOCK_SIZE,
+        mask_mod=local_mask_mod,
+        seq_lengths=(Q_SHARD_LEN, KV_LEN),
+    )
 
 
 def cp_shard(
@@ -220,27 +522,18 @@ def cp_shard(
         ),
     )
 
-    # BlockMask, has shape, [B, H, Q, KV], and we can only shard
-    # on the Q seq dimension, not KV.
-    MASK_Q_SEQ_DIM = 2
+    # BlockMask: shard Q dimension only; KV stays global for allgather CP.
+    # Use our slicing-based functions to avoid torch.compile subprocess crashes
+    # and OOM from materialising dense [B, H, Q_SHARD, KV_LEN] tensors.
     if attention_masks is not None:
-        assert isinstance(attention_masks, (BlockMask, dict[str, BlockMask]))
-        masks = (
-            [attention_masks]
-            if isinstance(attention_masks, BlockMask)
-            else list(attention_masks.values())
-        )
-        masks = _context_parallel_shard(
-            mesh=cp_mesh,
-            buffers=masks,
-            seq_dims=(MASK_Q_SEQ_DIM,) * len(masks),
-            load_balancer=load_balancer,
-        )
-        attention_masks = cast(
-            (BlockMask | dict[str, BlockMask]),
-            masks[0]
-            if isinstance(attention_masks, BlockMask)
-            else {k: v for k, v in zip(attention_masks.keys(), masks)},
-        )
+        assert isinstance(attention_masks, (BlockMask, dict))
+        if load_balancer_type == "headtail":
+            shard_mask = lambda m: _shard_block_mask_cp_headtail(m, cp_mesh)
+        else:
+            shard_mask = lambda m: _shard_block_mask_cp(m, cp_mesh)
+        if isinstance(attention_masks, BlockMask):
+            attention_masks = shard_mask(attention_masks)
+        else:
+            attention_masks = {k: shard_mask(v) for k, v in attention_masks.items()}
 
     return inputs, attention_masks

@@ -7,7 +7,7 @@
 # This file applies the PT-D parallelisms (except pipeline parallelism) and various
 # training techniques (e.g. activation checkpointing and compile) to the Llama model.
 
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -34,7 +34,10 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
-from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
+from torchtitan.distributed.context_parallel import (
+    apply_cp_to_forward,
+    # apply_cp_to_forward_fused_kv_gather,
+)
 from torchtitan.distributed.dual_pipe_v import (
     DualPipeExpertParallel,
     get_dual_pipe_v_flag,
@@ -83,7 +86,9 @@ def parallelize_opt_moe(
     ac_config: ActivationCheckpointConfig,
     dump_folder: str,
 ):
-    assert training.seq_len % parallel_dims.seq_len_divisor == 0, f"""
+    assert (
+        training.seq_len % parallel_dims.seq_len_divisor == 0
+    ), f"""
         Sequence length {training.seq_len} must be divisible by the product of TP degree
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
@@ -184,28 +189,15 @@ def parallelize_opt_moe(
         )
 
     if parallel_dims.cp_enabled:
-        cp_mesh = parallel_dims.get_mesh("cp")
-        sdpa_inner_attns: list[nn.Module] = []
-        flex_inner_attns: list[nn.Module] = []
-        for block in model.layers.values():
-            if block.use_swa:
-                raise NotImplementedError(
-                    "Context Parallel is not supported with Sliding Window Attention "
-                    "(SWA). Disable SWA layers or Context Parallel."
-                )
-            backend = block.attn_backend
-            if backend == "sdpa":
-                # pyrefly: ignore [missing-attribute]
-                sdpa_inner_attns.append(block.attention.inner_attention)
-            elif backend == "flex":
-                # pyrefly: ignore [missing-attribute]
-                flex_inner_attns.append(block.attention.inner_attention)
-            # varlen is already rejected by model config validation
-
-        if sdpa_inner_attns:
-            apply_cp_to_attention_module(sdpa_inner_attns, cp_mesh, "sdpa")
-        if flex_inner_attns:
-            apply_cp_to_attention_module(flex_inner_attns, cp_mesh, "flex")
+        # pyrefly: ignore [missing-attribute]
+        apply_cp_to_forward(
+            [block.attention.inner_attention for block in model.layers.values()],
+            parallel_dims.get_mesh("cp"),
+        )
+        # apply_cp_to_forward_fused_kv_gather(
+        #     [block.attention.inner_attention for block in model.layers.values()],
+        #     parallel_dims.get_mesh("cp"),
+        # )
 
     if ac_config.mode != "none":
         apply_ac(
