@@ -9,7 +9,7 @@ import importlib
 import json
 import os
 import shutil
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace as dc_replace
 from pathlib import Path
 from typing import get_args
 
@@ -164,6 +164,19 @@ def _resolve_model_spec_for_conversion(
         model_overrides,
         field_path="model_spec.model",
     )
+    # Sync training.seq_len → rope.max_seq_len so max_position_embeddings in the
+    # exported HF config reflects the actual training context length, not the default.
+    # Mirrors OPTMoEModel.Config.update_from_config (model.py:283-285).
+    training_seq_len = job_config.get("training", {}).get("seq_len")
+    if isinstance(training_seq_len, int) and training_seq_len > 0:
+        if getattr(model_spec.model, "rope", None) is not None:
+            model_spec.model.rope = dc_replace(
+                model_spec.model.rope, max_seq_len=training_seq_len
+            )
+        if getattr(model_spec.model, "rope_of_swa", None) is not None:
+            model_spec.model.rope_of_swa = dc_replace(
+                model_spec.model.rope_of_swa, max_seq_len=training_seq_len
+            )
     return model_spec
 
 

@@ -126,7 +126,7 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
                             expert_new_key = new_key.format(layer_num, expert_num)
                             hf_state_dict[expert_new_key] = split_values[
                                 expert_num
-                            ].squeeze()
+                            ].squeeze(0)
                 else:
                     if new_key is None:
                         continue

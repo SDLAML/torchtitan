@@ -820,7 +820,7 @@ class OptMoEMoE(nn.Module):
                     rms_norm_eps=rms_norm_eps,
                 )
                 supports_norm_everywhere = bool(
-                    getattr(maybe_norm_fused, "supports_norm_everywhere", True)
+                    getattr(maybe_norm_fused, "supports_norm_everywhere", False)
                 )
                 if supports_norm_everywhere:
                     self.experts = maybe_norm_fused

@@ -41,30 +41,43 @@ except ImportError:
 
 
 try:
-    from transformers.masking_utils import create_causal_mask
+    from transformers.masking_utils import (
+        create_causal_mask,
+        create_sliding_window_causal_mask,
+    )
 except ImportError:
 
-    def create_causal_mask(
-        config,
-        inputs_embeds=None,
-        attention_mask=None,
-        cache_position=None,
-        past_key_values=None,
-        position_ids=None,
-        input_embeds=None,
-        **kwargs,
-    ):
-        del config, kwargs, position_ids
-        if inputs_embeds is None:
-            inputs_embeds = input_embeds
-        if inputs_embeds is None:
-            raise ValueError("`inputs_embeds` must be provided to build a causal mask.")
+    def _legacy_get_mask_sizes(
+        cache_position: torch.Tensor,
+        past_key_values: Optional[Cache],
+        query_length: int,
+    ) -> tuple[int, int]:
+        if past_key_values is not None and hasattr(past_key_values, "get_mask_sizes"):
+            try:
+                return past_key_values.get_mask_sizes(cache_position, 0)
+            except TypeError:
+                return past_key_values.get_mask_sizes(cache_position)
+        if cache_position.numel() == 0:
+            return query_length, 0
+        kv_offset = int(cache_position[0].item())
+        kv_length = int(cache_position[-1].item()) - kv_offset + 1
+        return kv_length, kv_offset
+
+    def _legacy_create_additive_causal_mask(
+        input_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        cache_position: Optional[torch.Tensor],
+        past_key_values: Optional[Cache],
+        sliding_window: Optional[int] = None,
+    ) -> torch.Tensor:
+        if input_embeds is None:
+            raise ValueError("`input_embeds` must be provided to build a causal mask.")
         if attention_mask is not None and attention_mask.dim() == 4:
             return attention_mask
 
-        batch_size, query_length = inputs_embeds.shape[:2]
-        dtype = inputs_embeds.dtype
-        device = inputs_embeds.device
+        batch_size, query_length = input_embeds.shape[:2]
+        dtype = input_embeds.dtype
+        device = input_embeds.device
         min_dtype = torch.finfo(dtype).min
 
         if cache_position is None:
@@ -82,40 +95,82 @@ except ImportError:
                 device=device,
             )
 
-        key_length = (
-            int(cache_position[-1].item()) + 1
-            if cache_position.numel() > 0
-            else query_length
+        kv_length, kv_offset = _legacy_get_mask_sizes(
+            cache_position, past_key_values, query_length
         )
-        if attention_mask is not None and attention_mask.dim() == 2:
-            key_length = max(key_length, attention_mask.shape[-1])
-
-        key_positions = torch.arange(key_length, device=device)
-        causal_mask = key_positions.view(1, 1, key_length) > cache_position.view(
-            1, query_length, 1
+        key_positions = torch.arange(kv_length, device=device) + kv_offset
+        allowed = key_positions.view(1, kv_length) <= cache_position.view(
+            query_length, 1
         )
-        causal_mask = causal_mask.to(dtype=dtype) * min_dtype
-        causal_mask = causal_mask.unsqueeze(1).expand(
-            batch_size, 1, query_length, key_length
-        )
-
-        if attention_mask is None:
-            return causal_mask
-        if attention_mask.dim() != 2:
-            return attention_mask
-
-        if attention_mask.shape[-1] < key_length:
-            attention_mask = nn.functional.pad(
-                attention_mask,
-                (0, key_length - attention_mask.shape[-1]),
-                value=1,
+        if sliding_window is not None and sliding_window > 0:
+            allowed = allowed & (
+                key_positions.view(1, kv_length)
+                > (cache_position.view(query_length, 1) - sliding_window)
             )
-        padding_mask = attention_mask[:, None, None, :key_length] > 0
-        padding_bias = torch.zeros(
-            (batch_size, 1, 1, key_length), dtype=dtype, device=device
+        allowed = allowed.unsqueeze(0).expand(batch_size, -1, -1)
+
+        if attention_mask is not None and attention_mask.dim() == 2:
+            if attention_mask.shape[-1] < kv_length + kv_offset:
+                attention_mask = nn.functional.pad(
+                    attention_mask,
+                    (0, kv_length + kv_offset - attention_mask.shape[-1]),
+                    value=0,
+                )
+            mask_indices = torch.arange(kv_length, device=device) + kv_offset
+            allowed = (
+                allowed
+                & attention_mask.to(device=device)[:, mask_indices].to(torch.bool)[
+                    :, None, :
+                ]
+            )
+
+        return torch.where(
+            allowed.unsqueeze(1),
+            torch.zeros((), dtype=dtype, device=device),
+            torch.full((), min_dtype, dtype=dtype, device=device),
         )
-        padding_bias = padding_bias.masked_fill(~padding_mask, min_dtype)
-        return causal_mask + padding_bias
+
+    def create_causal_mask(
+        config,
+        input_embeds=None,
+        attention_mask=None,
+        cache_position=None,
+        past_key_values=None,
+        position_ids=None,
+        **kwargs,
+    ):
+        del config, position_ids, kwargs
+        return _legacy_create_additive_causal_mask(
+            input_embeds=input_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+        )
+
+    def create_sliding_window_causal_mask(
+        config,
+        input_embeds=None,
+        attention_mask=None,
+        cache_position=None,
+        past_key_values=None,
+        position_ids=None,
+        **kwargs,
+    ):
+        del position_ids, kwargs
+        sliding_window = getattr(config, "sliding_window", None)
+        if sliding_window is None:
+            sliding_window = getattr(config, "sliding_window_size", None)
+        if sliding_window is None or sliding_window <= 0:
+            raise ValueError(
+                "Could not find a positive `sliding_window` in the config."
+            )
+        return _legacy_create_additive_causal_mask(
+            input_embeds=input_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            sliding_window=sliding_window,
+        )
 
 
 try:
@@ -641,6 +696,7 @@ class OptMoEAttention(nn.Module):
 
         # Per-layer flags — set by OptMoEModel after layer creation
         self.use_rope: bool = True
+        self.sliding_window: Optional[int] = None
         # True when this layer is a SWA layer that should use rotary_emb_swa
         # (i.e. rope_theta_swa is configured and this layer uses SWA + RoPE)
         self.use_swa_rope: bool = False
@@ -696,7 +752,16 @@ class OptMoEAttention(nn.Module):
             )
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        use_backend_attention = self.config._attn_implementation != "eager"
+        if (
+            use_backend_attention
+            and isinstance(attention_mask, torch.Tensor)
+            and attention_mask.dim() == 4
+            and self.config._attn_implementation
+            in {"flash_attention_2", "flash_attention_3", "flex_attention"}
+        ):
+            use_backend_attention = False
+        if use_backend_attention:
             attention_interface = _get_attention_interface(
                 self.config._attn_implementation
             )
@@ -709,6 +774,7 @@ class OptMoEAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
+            sliding_window=self.sliding_window,
             **kwargs,
         )
 
@@ -877,7 +943,6 @@ class OptMoEMoE(nn.Module):
             "expert_bias", torch.zeros(config.n_total_experts, dtype=torch.float32)
         )
 
-    @torch.no_grad()
     def moe_infer(
         self,
         x: torch.Tensor,  # [T, D]
@@ -975,6 +1040,7 @@ class OptMoEDecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+        self.attention_type = "full_attention"
 
         residual_scale = getattr(config, "residual_scale", "identity")
         self.block_scale, self.identity_scale = _compute_residual_scales(
@@ -1014,39 +1080,10 @@ class OptMoEDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Apply sliding window mask for SWA layers
-        layer_attention_mask = attention_mask
-        if self.sliding_window > 0 and attention_mask is not None:
-            # Mask out positions that fall outside the sliding window.
-            # attention_mask is [bs, 1, q_len, k_len] with 0 for attended, large-neg for masked.
-            seq_len = hidden_states.shape[1]
-            if attention_mask.dim() == 4:
-                k_len = attention_mask.shape[-1]
-                # Build a sliding-window boolean mask: True where |q_pos - k_pos| >= window
-                q_pos = (
-                    cache_position.unsqueeze(-1)
-                    if cache_position is not None
-                    else torch.arange(seq_len, device=hidden_states.device).unsqueeze(
-                        -1
-                    )
-                )
-                k_pos = torch.arange(k_len, device=hidden_states.device).unsqueeze(0)
-                swa_mask = (q_pos - k_pos) >= self.sliding_window  # [q, k]
-                swa_bias = torch.zeros_like(attention_mask)
-                swa_bias[:, :, :seq_len, :] = torch.where(
-                    swa_mask.unsqueeze(0).unsqueeze(0),
-                    torch.full_like(
-                        swa_bias[:, :, :seq_len, :],
-                        torch.finfo(hidden_states.dtype).min,
-                    ),
-                    torch.zeros_like(swa_bias[:, :, :seq_len, :]),
-                )
-                layer_attention_mask = attention_mask + swa_bias
-
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=layer_attention_mask,
+            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -1093,6 +1130,33 @@ class OptMoEModel(OptMoEPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
+        base_use_rope = bool(getattr(config, "use_rope", True))
+        base_use_swa = int(getattr(config, "sliding_window_size", -1)) > 0
+        self.use_rope_list = _parse_pattern(
+            getattr(config, "rope_pattern", None),
+            config.num_hidden_layers,
+            true_char="R",
+            false_char="N",
+            default=base_use_rope,
+        )
+        self.use_swa_list = _parse_pattern(
+            getattr(config, "swa_pattern", None),
+            config.num_hidden_layers,
+            true_char="S",
+            false_char="F",
+            default=base_use_swa,
+        )
+        sliding_window_size = getattr(config, "sliding_window_size", -1)
+        config.layer_types = [
+            "sliding_attention" if use_swa else "full_attention"
+            for use_swa in self.use_swa_list
+        ]
+        config.sliding_window = (
+            sliding_window_size
+            if sliding_window_size > 0 and any(self.use_swa_list)
+            else None
+        )
+
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
@@ -1122,31 +1186,18 @@ class OptMoEModel(OptMoEPreTrainedModel):
 
         self.gradient_checkpointing = False
 
-        # Apply per-layer rope_pattern and swa_pattern
-        base_use_rope = bool(getattr(config, "use_rope", True))
-        base_use_swa = int(getattr(config, "sliding_window_size", -1)) > 0
-
-        use_rope_list = _parse_pattern(
-            getattr(config, "rope_pattern", None),
-            config.num_hidden_layers,
-            true_char="R",
-            false_char="N",
-            default=base_use_rope,
-        )
-        use_swa_list = _parse_pattern(
-            getattr(config, "swa_pattern", None),
-            config.num_hidden_layers,
-            true_char="S",
-            false_char="F",
-            default=base_use_swa,
-        )
-        sliding_window_size = getattr(config, "sliding_window_size", -1)
         for i, layer in enumerate(self.layers):
-            layer.self_attn.use_rope = use_rope_list[i]
-            layer.sliding_window = sliding_window_size if use_swa_list[i] else -1
+            layer.attention_type = config.layer_types[i]
+            layer.self_attn.use_rope = self.use_rope_list[i]
+            layer.sliding_window = sliding_window_size if self.use_swa_list[i] else -1
+            layer.self_attn.sliding_window = (
+                sliding_window_size if self.use_swa_list[i] else None
+            )
             # SWA+RoPE layers use rotary_emb_swa when rope_theta_swa is configured
             layer.self_attn.use_swa_rope = (
-                use_swa_list[i] and use_rope_list[i] and rope_theta_swa is not None
+                self.use_swa_list[i]
+                and self.use_rope_list[i]
+                and rope_theta_swa is not None
             )
 
         # Initialize weights and apply final processing
@@ -1193,14 +1244,26 @@ class OptMoEModel(OptMoEPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+            }
+            if self.config.sliding_window is not None:
+                causal_mask_mapping[
+                    "sliding_attention"
+                ] = create_sliding_window_causal_mask(**mask_kwargs)
+            else:
+                causal_mask_mapping["sliding_attention"] = causal_mask_mapping[
+                    "full_attention"
+                ]
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
@@ -1221,7 +1284,7 @@ class OptMoEModel(OptMoEPreTrainedModel):
             )
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask,
+                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_embeddings=pe,
                 position_ids=position_ids,
                 past_key_values=past_key_values,

@@ -121,6 +121,8 @@ def _patch_expert_activation_inplace(expert: object, rms_norm_eps: float) -> boo
 
 
 class NormEverywhereTritonExperts(TritonExperts):
+    _norm_everywhere_activation_patched = True  # guard: don't patch a second time
+
     def __init__(
         self,
         moe_config: mk.FusedMoEConfig | None,
@@ -147,6 +149,8 @@ class NormEverywhereTritonExperts(TritonExperts):
 
 
 class NormEverywhereBatchedTritonExperts(BatchedTritonExperts):
+    _norm_everywhere_activation_patched = True  # guard: don't patch a second time
+
     def __init__(
         self,
         moe_config: mk.FusedMoEConfig | None,
