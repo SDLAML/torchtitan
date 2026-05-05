@@ -10,9 +10,9 @@
 # [3] https://github.com/volcengine/verl/blob/main/verl/utils/dataset/sft_dataset.py#L33
 import json
 from collections.abc import Callable
-from dataclasses import field
+from dataclasses import dataclass, field
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -82,6 +82,51 @@ def _build_dolci_instruct_sft_messages_from_row_dict(
     return messages, tools, False
 
 
+def _build_berliner_sft_messages_from_row_dict(
+    row_dict: dict,
+    messages_key: str = "messages",
+    tools_key: str = "tools",
+    enable_thinking_key: str = "enable_thinking",
+):
+    """Build messages from Berliner-SFT Parquet row format.
+
+    All columns are stored as JSON strings that must be parsed.
+    ``enable_thinking`` is pre-computed: True if any <think> block
+    in the messages contains >= 10 chars of non-whitespace text.
+    """
+    messages = json.loads(row_dict[messages_key])
+    # Normalize tool_call arguments so the template's |items filter always gets a dict.
+    # Arguments may arrive as: JSON string, already-parsed dict, list, or None.
+    for msg in messages:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                func = tc.get("function") or tc
+                if "arguments" not in func:
+                    continue
+                args = func["arguments"]
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            f"Failed to parse tool_call arguments: "
+                            f"{str(args)[:80]}..."
+                        )
+                        args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                func["arguments"] = args
+    tools_str = row_dict.get(tools_key, "[]")
+    try:
+        tools = json.loads(tools_str) if tools_str else []
+    except json.JSONDecodeError:
+        logger.warning(f"Failed to parse tools JSON: {str(tools_str)[:80]}...")
+        tools = []
+    enable_thinking = bool(row_dict.get(enable_thinking_key, False))
+    # the thinking trace is already rendered in the message
+    return messages, tools, False
+
+
 DATASET_MESSAGE_BUILDERS = {
     "multi_turn": _build_multi_turn_messages_from_row_dict,
     "prompt_response": _build_prompt_response_messages_from_row_dict,
@@ -91,106 +136,8 @@ DATASET_MESSAGE_BUILDERS = {
         response_key="answer",
     ),
     "Dolci-Instruct-SFT": _build_dolci_instruct_sft_messages_from_row_dict,
+    "berliner_sft": _build_berliner_sft_messages_from_row_dict,
 }
-
-
-"""
-From DataFrame rows to a "sequence"
-
-1) [Get row data]
-   Iterate over the DataFrame to obtain a per-row dictionary (row_dict).
-
-2) [Build messages]
-   Given row_dict, call `_build_messages` to convert the original data into `messages`.
-
-   Here, `messages` is a list of dicts with at least the keys "role" and "content", e.g.
-   [
-       {"role": "user", "content": "Hello, how are you?"},
-       {"role": "assistant", "content": "I am good, thank you!"}
-   ]
-
-   We currently support two ways to parse the original data into `messages`:
-
-   2.1) [QA mode]
-        If this is NOT multi-turn mode, we build messages by explicitly assigning "user"
-        and "assistant" roles, reading from `prompt_key` and `response_key`:
-        [
-            {"role": "user", "content": row_dict[prompt_key]},
-            {"role": "assistant", "content": row_dict[response_key]},
-        ]
-
-   2.2) [Multi-turn mode]
-        If this IS multi-turn mode (even if there is only one turn), we read the full
-        message list from the column `messages_key`. The expected input format is:
-        {
-            messages_key: [
-                {"role": "user", "content": "Hello, how are you?"},
-                {"role": "assistant", "content": "I am good, thank you!"},
-                {"role": "user", "content": "What is your name?"},
-            ]
-        }
-
-   2.3) [Not landed yet]
-        If your data format is completely different, you can implement your own
-        `_build_messages` function. It must return a `messages` list in the same format.
-
-3) [Convert messages to tokens]
-   After we have `messages`, we tokenize them by calling `_process_one_row`.
-
-   3.1) If there is only ONE message, we tokenize it via `_process_single_message`:
-        - Either tokenize the message["content"] directly, OR
-        - Apply the tokenizer's chat template (requires the chat template to be configured).
-
-   3.2) If there are MULTIPLE messages, we call `_process_single_message` for each message.
-        There is one special case:
-        When `apply_chat_template=True`, each call to `_process_single_message` may add a
-        [system prompt]. That can produce:
-        [System] [User] [System] [Assistant] [System] [User] [System] [Assistant] ...
-        which is not what we want for a single conversation. Therefore, we include special
-        handling to remove the unexpected [system prompt] and [generation prompt] added
-        from the second message onward.
-"""
-
-"""
-From one or more "sequences" to a "batch"
-
-We offer two modes to handle padding and truncation when forming a batch.
-Padding is needed because sequences may have different lengths, and PyTorch
-cannot stack variable-length sequences into a single tensor directly.
-
-Example:
-    batch = [
-        sequence_1,
-        sequence_2,
-        sequence_3,
-    ]
-
-### Right padding
-The simplest approach is to right-pad each sequence to a target length using
-a special `<pad_token>`. The batch then looks like:
-    batch = [
-        [sequence_1 + several <pad_token>],
-        [sequence_2 + several <pad_token>],
-        [sequence_3 + several <pad_token>],
-    ]
-
-After right padding, all sequences have the same length. We set the
-`attention_mask` for `<pad_token>` positions to 0 so that attention
-implementations such as `varlen_attn` or `flex_attn` can ignore them.
-
-### Greedy packing
-Alternatively, we can use greedy packing to reduce padding waste by packing
-multiple sequences into a single fixed-length row:
-    batch = [
-        [sequence_1, sequence_2, sequence_3],
-        [sequence_4, sequence_5, <pad_token>],
-    ]
-    **We need strictly compact padding without no gap between sequences.**
-
-We still right-pad each packed row to the target length with `<pad_token>`.
-To prevent cross-document attention, we must also infer (or track) the
-boundaries between sequences within each packed row.
-"""
 
 
 def extract_system_prompt_and_generation(tokenizer):
@@ -251,7 +198,11 @@ class SFTDataset(IterableDataset, Stateful):
         self.max_length = seq_len
         self.apply_chat_template_kwargs = sft_config.chat_template_kwargs
 
-        self.openai_harmony_eos = sft_config.openai_harmony_eos
+        # logging chat template kwargs if is not empty
+        if self.apply_chat_template_kwargs:
+            logger.info(
+                f"[sft_text_datasets.py] Chat template kwargs: {self.apply_chat_template_kwargs}"
+            )
 
         self.apply_chat_template = sft_config.apply_chat_template
         if self.apply_chat_template:
@@ -338,6 +289,7 @@ class SFTDataset(IterableDataset, Stateful):
         if enable_thinking is not None:
             apply_chat_template_kwargs["enable_thinking"] = enable_thinking
         if self.apply_chat_template:
+            # logger.info(f"[sft_text_datasets.py] Applying chat template to message: {message}")
             inputs = self.tokenizer.apply_chat_template(
                 [message],
                 tools=tools,
@@ -380,6 +332,53 @@ class SFTDataset(IterableDataset, Stateful):
 
         return input_ids, loss_mask
 
+    def _process_with_single_shot(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None,
+        enable_thinking: bool | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-shot tokenization with per-assistant-turn span detection for loss masking.
+
+        Makes 1 + 2k template calls (k = number of assistant turns) instead of n+1 for
+        per-turn or O(n²) for prefix-diff. input_ids matches the single-shot output
+        exactly so sanity_check is always satisfied.
+        """
+        apply_chat_template_kwargs = {**self.apply_chat_template_kwargs}
+        if enable_thinking is not None:
+            apply_chat_template_kwargs["enable_thinking"] = enable_thinking
+
+        def _tok(msgs):
+            out = self.tokenizer.apply_chat_template(
+                msgs,
+                tools=tools,
+                add_generation_prompt=False,
+                tokenize=True,
+                return_dict=True,
+                return_attention_mask=False,
+                return_tensors="pt",
+                **apply_chat_template_kwargs,
+            )
+            return dict(out)["input_ids"][0]
+
+        # 1 call: correct input_ids guaranteed to match single-shot output
+        input_ids = _tok(messages)
+        loss_mask = torch.zeros_like(input_ids)
+
+        gen_len = len(self.generation_prompt)
+
+        # 2 calls per assistant turn to locate its token span in input_ids.
+        # Requires chat_template_kwargs to include truncate_history_thinking=False so that
+        # prefix calls (_tok(messages[:i])) render identically to the full conversation call.
+        for i, message in enumerate(messages):
+            if message["role"] == "assistant":
+                prefix_len = len(_tok(messages[:i])) if i > 0 else 0
+                turn_end = len(_tok(messages[: i + 1]))
+                # mask generation-prompt header; train on the rest of the assistant turn
+                loss_mask[prefix_len + gen_len : turn_end] = 1
+
+        return input_ids, loss_mask
+
     def sanity_check(
         self,
         input_ids: torch.Tensor,
@@ -413,6 +412,26 @@ class SFTDataset(IterableDataset, Stateful):
         )
 
         if not torch.equal(input_ids, inputs["input_ids"].squeeze(0)):
+            chat_template_decode = self.tokenizer.decode(
+                input_ids, skip_special_tokens=False
+            )
+            manual_decode = self.tokenizer.decode(
+                inputs["input_ids"].squeeze(0), skip_special_tokens=False
+            )
+            GREEN = "\033[92m"
+            CYAN = "\033[96m"
+            YELLOW = "\033[93m"
+            RESET = "\033[0m"
+
+            def one_line(x):
+                return str(x).replace("\n", "\\n").replace("\r", "\\r")
+
+            logger.info(f"{YELLOW}raw: {one_line(messages)}{RESET}")
+            logger.info(
+                f"{GREEN}chat_template_decode: {one_line(chat_template_decode)}{RESET}"
+            )
+            logger.info(f"{CYAN}manual_decode: {one_line(manual_decode)}{RESET}")
+
             if self.ignore_input_ids_mismatch:
                 logger.warning_once(error_message)
             else:
@@ -423,39 +442,37 @@ class SFTDataset(IterableDataset, Stateful):
         messages, tools, enable_thinking = self.message_builder(row_dict)
 
         # tokenize each message
-        input_ids, loss_mask = [], []
-        for i, message in enumerate(messages):
-            _input_ids, _loss_mask = self._process_single_message(
-                index=i,
-                message=message,
-                # here we assume the definition of tools is given only in system message.
-                tools=tools if i == 0 else None,
-                enable_thinking=enable_thinking,
+        if self.apply_chat_template:
+            # Single-shot: input_ids IS the template output, sanity_check trivially passes.
+            input_ids, loss_mask = self._process_with_single_shot(
+                messages, tools, enable_thinking
             )
-            input_ids.append(_input_ids)
-            loss_mask.append(_loss_mask)
-
-        input_ids = torch.cat(input_ids, dim=0)
-        loss_mask = torch.cat(loss_mask, dim=0)
-
-        self.sanity_check(input_ids, messages, tools, enable_thinking)
+        else:
+            input_ids, loss_mask = [], []
+            for i, message in enumerate(messages):
+                _input_ids, _loss_mask = self._process_single_message(
+                    index=i,
+                    message=message,
+                    # here we assume the definition of tools is given only in system message.
+                    tools=tools if i == 0 else None,
+                    enable_thinking=enable_thinking,
+                )
+                input_ids.append(_input_ids)
+                loss_mask.append(_loss_mask)
+            input_ids = torch.cat(input_ids, dim=0)
+            loss_mask = torch.cat(loss_mask, dim=0)
 
         # when chat template is applied, append the EOS token to the input_ids and loss_mask
         # but only append EOS if the last token is not EOS
-        if self.apply_chat_template:
-            if self.openai_harmony_eos:
-                # for openai harmony, we replace last <|end|> token to EOS token
-                input_ids[-1] = self.eos_id
-
-            elif input_ids[-1].item() != self.eos_id:
-                # otherwise, we append a [no-gradient] EOS token to make FlexAttn/VarlenAttn work
-                # if the last token is already EOS, we do nothing
-                # this path potentially needs add <im_end> to Stop Criteria for inference
-                # and needs <im_end> to be different from EOS token
-                input_ids = torch.cat(
-                    [input_ids, input_ids.new_tensor([self.eos_id])], dim=0
-                )
-                loss_mask = torch.cat([loss_mask, loss_mask.new_tensor([0])], dim=0)
+        if self.apply_chat_template and input_ids[-1].item() != self.eos_id:
+            # otherwise, we append a [no-gradient] EOS token to make FlexAttn/VarlenAttn work
+            # if the last token is already EOS, we do nothing
+            # this path potentially needs add <im_end> to Stop Criteria for inference
+            # and needs <im_end> to be different from EOS token
+            input_ids = torch.cat(
+                [input_ids, input_ids.new_tensor([self.eos_id])], dim=0
+            )
+            loss_mask = torch.cat([loss_mask, loss_mask.new_tensor([0])], dim=0)
 
         position_ids = torch.arange(input_ids.shape[0], dtype=torch.long)  # (seq_len,)
         # comment out these two lines to log the actual text for debugging purpose
@@ -619,9 +636,6 @@ class SFTDataLoader(ParallelAwareDataloader):
 
         ignore_input_ids_mismatch: bool = False
         """Ignore input_ids mismatch when applying chat template per-turn."""
-
-        openai_harmony_eos: bool = False
-        """Replace last <|end|> with EOS instead of appending a no-grad EOS."""
 
     def __init__(
         self,

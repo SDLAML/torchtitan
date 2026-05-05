@@ -8,7 +8,11 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.config import ActivationCheckpointConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config.configs import (
+    ActivationCheckpointConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 
 from torchtitan.experiments.sft.auto_tokenizer import HuggingFaceAutoTokenizer
 from torchtitan.experiments.sft.configs import SFTTrainerConfig
@@ -23,7 +27,7 @@ def sft_opt_moe_proxy_multiturn() -> SFTTrainerConfig:
         metrics=MetricsProcessor.Config(log_freq=10),
         model_spec=model_registry("bsc-1B-7B-opt-g-proxy"),
         tokenizer=HuggingFaceAutoTokenizer.Config(
-            eos_token="<|end_of_text|>",
+            eos_token="<|endoftext|>",
             pad_token_id=128014,
             pad_token="<|i_am_pad|>",
         ),

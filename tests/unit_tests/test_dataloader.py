@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from random import Random
 from types import SimpleNamespace
 
 from torch.utils.data import IterableDataset
@@ -16,7 +17,12 @@ from torchtitan.components.data_mix_scheduler import build_data_mix_scheduler
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader, MixedDataset
+from torchtitan.hf_datasets.text_datasets import (
+    HuggingFaceTextDataLoader,
+    MixedDataset,
+    TORCHTITAN_MIX_SKIP_CKPT_WEIGHTS_ENV,
+    TORCHTITAN_MIX_STATE_MAPPING_ENV,
+)
 
 
 class DummyDataset(IterableDataset):
@@ -60,6 +66,18 @@ class DummyMixedComponent(IterableDataset):
 
     def __iter__(self):
         yield [1, 2, 3]
+
+
+class StatefulDummyMixedComponent(DummyMixedComponent):
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.loaded_state = None
+
+    def load_state_dict(self, state_dict):
+        self.loaded_state = state_dict
+
+    def state_dict(self):
+        return {"name": self.dataset_name}
 
 
 class TestParallelAwareDataloader(unittest.TestCase):
@@ -212,6 +230,89 @@ class TestParallelAwareDataloader(unittest.TestCase):
                 seq_len=32,
                 local_batch_size=1,
             )
+
+
+class TestMixedDatasetResumeOverrides(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop(TORCHTITAN_MIX_SKIP_CKPT_WEIGHTS_ENV, None)
+        os.environ.pop(TORCHTITAN_MIX_STATE_MAPPING_ENV, None)
+
+    def _build_checkpoint_state(self, num_datasets=3):
+        return {
+            "sample_idx": 7,
+            "weights": [float(i + 1) for i in range(num_datasets)],
+            "removed": [i == 1 for i in range(num_datasets)],
+            "num_docs_sampled": [10 * (i + 1) for i in range(num_datasets)],
+            "num_tokens_sampled": [100 * (i + 1) for i in range(num_datasets)],
+            "datasets": [{"checkpoint_dataset": i} for i in range(num_datasets)],
+            "rng_state": Random(123).getstate(),
+        }
+
+    def _build_mixed_dataset(self, names, weights=None):
+        if weights is None:
+            weights = [1.0 for _ in names]
+        return MixedDataset(
+            datasets=[StatefulDummyMixedComponent(name) for name in names],
+            dp_rank=0,
+            weights=weights,
+        )
+
+    def test_load_state_dict_defaults_to_checkpoint_order(self):
+        mixed_dataset = self._build_mixed_dataset(["a", "b"], weights=[0.5, 0.5])
+
+        mixed_dataset.load_state_dict(self._build_checkpoint_state(num_datasets=2))
+
+        self.assertEqual(mixed_dataset._sample_idx, 7)
+        self.assertEqual(mixed_dataset.weights.tolist(), [1.0, 0.0])
+        self.assertEqual(mixed_dataset.removed.tolist(), [False, True])
+        self.assertEqual(mixed_dataset.num_docs_sampled.tolist(), [10, 20])
+        self.assertEqual(mixed_dataset.num_tokens_sampled.tolist(), [100, 200])
+        self.assertEqual(
+            [dataset.loaded_state for dataset in mixed_dataset.datasets],
+            [{"checkpoint_dataset": 0}, {"checkpoint_dataset": 1}],
+        )
+
+    def test_skip_checkpoint_weights_preserves_configured_weights(self):
+        os.environ[TORCHTITAN_MIX_SKIP_CKPT_WEIGHTS_ENV] = "1"
+        mixed_dataset = self._build_mixed_dataset(["a", "b"], weights=[0.8, 0.2])
+
+        mixed_dataset.load_state_dict(self._build_checkpoint_state(num_datasets=2))
+
+        self.assertEqual(mixed_dataset.weights.tolist(), [0.8, 0.0])
+        self.assertEqual(mixed_dataset.removed.tolist(), [False, True])
+
+    def test_state_mapping_loads_only_mapped_dataset_states(self):
+        os.environ[TORCHTITAN_MIX_STATE_MAPPING_ENV] = "0-0|1-2"
+        mixed_dataset = self._build_mixed_dataset(
+            ["a", "c", "d"], weights=[0.4, 0.5, 0.6]
+        )
+
+        mixed_dataset.load_state_dict(self._build_checkpoint_state(num_datasets=3))
+
+        self.assertEqual(mixed_dataset.weights.tolist(), [1.0, 3.0, 0.6])
+        self.assertEqual(mixed_dataset.removed.tolist(), [False, False, False])
+        self.assertEqual(mixed_dataset.num_docs_sampled.tolist(), [10, 30, 0])
+        self.assertEqual(mixed_dataset.num_tokens_sampled.tolist(), [100, 300, 0])
+        self.assertEqual(
+            [dataset.loaded_state for dataset in mixed_dataset.datasets],
+            [{"checkpoint_dataset": 0}, {"checkpoint_dataset": 2}, None],
+        )
+
+    def test_state_mapping_rejects_invalid_rules(self):
+        invalid_mappings = [
+            "not-a-rule",
+            "0-0|0-1",
+            "0-1|1-1",
+            "0-5",
+        ]
+        for mapping in invalid_mappings:
+            with self.subTest(mapping=mapping):
+                os.environ[TORCHTITAN_MIX_STATE_MAPPING_ENV] = mapping
+                mixed_dataset = self._build_mixed_dataset(["a", "b"])
+                with self.assertRaises(ValueError):
+                    mixed_dataset.load_state_dict(
+                        self._build_checkpoint_state(num_datasets=2)
+                    )
 
 
 class TestDataMixSchedulerDatasetNames(unittest.TestCase):

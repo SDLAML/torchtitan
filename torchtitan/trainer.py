@@ -293,7 +293,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             seed=config.debug.seed,
         )
 
-        mixing_scheduler_configs = config.dataloader.data_mixing_scheduler_configs
+        mixing_scheduler_configs = getattr(
+            config.dataloader, "data_mixing_scheduler_configs", None
+        )
 
         self.data_mix_scheduler = build_data_mix_scheduler(
             self.dataloader, mixing_scheduler_configs, config.training.steps

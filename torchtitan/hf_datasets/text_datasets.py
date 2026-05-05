@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
@@ -26,6 +28,11 @@ from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 
 
+TORCHTITAN_MIX_SKIP_CKPT_WEIGHTS_ENV = "TORCHTITAN_MIX_SKIP_CKPT_WEIGHTS"
+TORCHTITAN_MIX_STATE_MAPPING_ENV = "TORCHTITAN_MIX_STATE_MAPPING"
+_MIX_STATE_MAPPING_RULE = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
+
+
 def infer_dataloader_snapshot_every_n_steps(
     checkpoint_enabled: bool, checkpoint_interval: int, gradient_accumulation_steps: int
 ) -> int:
@@ -39,6 +46,91 @@ def list_tree_to_tuple(obj):
     if isinstance(obj, list):
         return tuple(list_tree_to_tuple(x) for x in obj)
     return obj
+
+
+def _env_is_set(name: str) -> bool:
+    value = os.environ.get(name)
+    return value is not None and value != ""
+
+
+def _state_value_to_tensor(value, dtype: torch.dtype, name: str) -> torch.Tensor:
+    tensor = value if isinstance(value, torch.Tensor) else torch.tensor(value)
+    if tensor.ndim != 1:
+        raise ValueError(f"Checkpoint field {name!r} must be 1-D, got {tensor.ndim}-D")
+    return tensor.to(dtype=dtype)
+
+
+def _copy_checkpoint_vector(
+    target: torch.Tensor,
+    value,
+    name: str,
+    mapping: dict[int, int] | None = None,
+    *,
+    zero_unmapped: bool = False,
+) -> None:
+    loaded = _state_value_to_tensor(value, target.dtype, name)
+    if mapping is None:
+        target.copy_(loaded)
+        return
+
+    restored = torch.zeros_like(target) if zero_unmapped else target.clone()
+    for current_idx, checkpoint_idx in mapping.items():
+        restored[current_idx] = loaded[checkpoint_idx]
+    target.copy_(restored)
+
+
+def _parse_mix_state_mapping(
+    mapping_spec: str,
+    *,
+    num_current_datasets: int,
+    num_checkpoint_datasets: int,
+) -> dict[int, int]:
+    """Parse CURRENT_INDEX-CKPT_INDEX mapping rules from an env var."""
+    rules = [rule.strip() for rule in re.split(r"[|,]", mapping_spec) if rule.strip()]
+    if not rules:
+        raise ValueError(
+            f"{TORCHTITAN_MIX_STATE_MAPPING_ENV} must contain at least one mapping rule"
+        )
+
+    mapping: dict[int, int] = {}
+    used_checkpoint_indices: set[int] = set()
+    for rule in rules:
+        match = _MIX_STATE_MAPPING_RULE.fullmatch(rule)
+        if match is None:
+            raise ValueError(
+                f"Invalid {TORCHTITAN_MIX_STATE_MAPPING_ENV} rule {rule!r}; "
+                "expected CURRENT_INDEX-CKPT_INDEX"
+            )
+
+        current_idx, checkpoint_idx = (int(index) for index in match.groups())
+
+        if current_idx < 0 or current_idx >= num_current_datasets:
+            raise ValueError(
+                f"Invalid {TORCHTITAN_MIX_STATE_MAPPING_ENV} rule {rule!r}; "
+                f"current dataset index {current_idx} is out of range "
+                f"[0, {num_current_datasets})"
+            )
+        if checkpoint_idx < 0 or checkpoint_idx >= num_checkpoint_datasets:
+            raise ValueError(
+                f"Invalid {TORCHTITAN_MIX_STATE_MAPPING_ENV} rule {rule!r}; "
+                f"checkpoint dataset index {checkpoint_idx} is out of range "
+                f"[0, {num_checkpoint_datasets})"
+            )
+        if current_idx in mapping:
+            raise ValueError(
+                f"Invalid {TORCHTITAN_MIX_STATE_MAPPING_ENV}; "
+                f"current dataset index {current_idx} is mapped more than once"
+            )
+        if checkpoint_idx in used_checkpoint_indices:
+            raise ValueError(
+                f"Invalid {TORCHTITAN_MIX_STATE_MAPPING_ENV}; "
+                f"checkpoint dataset index {checkpoint_idx} is mapped more than once"
+            )
+
+        mapping[current_idx] = checkpoint_idx
+        used_checkpoint_indices.add(checkpoint_idx)
+
+    return mapping
 
 
 def _process_simple_text(sample: dict[str, Any], key: str) -> str:
@@ -446,43 +538,19 @@ class MixedDataset(IterableDataset, Stateful):
         self._data_iters = None
 
     def load_state_dict(self, state_dict):
+        """Restore mixed-dataset progress, optionally adapting checkpoint order.
+
+        By default, the checkpoint must contain the same number of datasets as
+        the current config and sub-dataset states are restored by position.
+
+        Two env vars are intentionally supported for resume-time mix changes:
+        - TORCHTITAN_MIX_SKIP_CKPT_WEIGHTS: keep the current/config weights
+          instead of restoring checkpoint weights.
+        - TORCHTITAN_MIX_STATE_MAPPING: remap sub-dataset state by index using
+          CURRENT_INDEX-CKPT_INDEX rules, e.g. "0-0|1-2". Current datasets not
+          mentioned in the mapping are treated as new and keep fresh state.
+        """
         self._sample_idx = state_dict["sample_idx"]
-        loaded_weights = state_dict["weights"]
-        if isinstance(loaded_weights, torch.Tensor):
-            self.weights.copy_(loaded_weights)
-        else:
-            self.weights.copy_(torch.tensor(loaded_weights, dtype=torch.float64))
-
-        loaded_removed = state_dict.get("removed", None)
-        if loaded_removed is None:
-            # Old checkpoints: nothing was sticky; start with "nothing removed".
-            self.removed.zero_()
-        else:
-            if isinstance(loaded_removed, torch.Tensor):
-                self.removed.copy_(loaded_removed.to(dtype=torch.bool))
-            else:
-                self.removed.copy_(torch.tensor(loaded_removed, dtype=torch.bool))
-
-        self.weights[self.removed] = 0.0
-
-        # NOTE: num_docs_sampled and num_tokens_sampled are sticky.
-        loaded_counts = state_dict["num_docs_sampled"]
-        if isinstance(loaded_counts, torch.Tensor):
-            self.num_docs_sampled.copy_(loaded_counts.to(dtype=torch.int64))
-        else:
-            self.num_docs_sampled.copy_(torch.tensor(loaded_counts, dtype=torch.int64))
-
-        loaded_tokens = state_dict["num_tokens_sampled"]
-        if isinstance(loaded_tokens, torch.Tensor):
-            self.num_tokens_sampled.copy_(loaded_tokens.to(dtype=torch.int64))
-        else:
-            self.num_tokens_sampled.copy_(
-                torch.tensor(loaded_tokens, dtype=torch.int64)
-            )
-
-        state_dict["rng_state"] = list_tree_to_tuple(state_dict["rng_state"])
-        self._rng.setstate(state_dict["rng_state"])
-        # Restore sub-datasets.
         dataset_states = state_dict["datasets"]
 
         if not isinstance(dataset_states, list):
@@ -491,12 +559,77 @@ class MixedDataset(IterableDataset, Stateful):
                 "This checkpoint was likely produced by an older version; please restart from scratch."
             )
 
-        if len(dataset_states) != len(self.datasets):
+        mapping_spec = os.environ.get(TORCHTITAN_MIX_STATE_MAPPING_ENV)
+        dataset_state_mapping = None
+        if mapping_spec is not None and mapping_spec.strip():
+            dataset_state_mapping = _parse_mix_state_mapping(
+                mapping_spec,
+                num_current_datasets=len(self.datasets),
+                num_checkpoint_datasets=len(dataset_states),
+            )
+            logger.info(
+                f"Loading mixed dataset checkpoint state with "
+                f"{TORCHTITAN_MIX_STATE_MAPPING_ENV}={mapping_spec!r}"
+            )
+        elif len(dataset_states) != len(self.datasets):
             raise ValueError(
                 f"Checkpoint has {len(dataset_states)} dataset states, but current config has {len(self.datasets)}."
             )
-        for dataset, ds_state in zip(self.datasets, dataset_states):
-            dataset.load_state_dict(ds_state)
+
+        # Weights are the only checkpoint field that can be fully ignored. This
+        # lets a resumed run intentionally use newly configured mix weights.
+        if _env_is_set(TORCHTITAN_MIX_SKIP_CKPT_WEIGHTS_ENV):
+            logger.info(
+                f"Keeping configured mixed dataset weights because "
+                f"{TORCHTITAN_MIX_SKIP_CKPT_WEIGHTS_ENV} is set"
+            )
+        else:
+            _copy_checkpoint_vector(
+                self.weights, state_dict["weights"], "weights", dataset_state_mapping
+            )
+
+        # Removed flags and sampling counters follow the mapping. Unmapped
+        # current datasets start fresh instead of inheriting unrelated state.
+        loaded_removed = state_dict.get("removed", None)
+        if loaded_removed is None:
+            # Old checkpoints: nothing was sticky; start with "nothing removed".
+            self.removed.zero_()
+        else:
+            _copy_checkpoint_vector(
+                self.removed,
+                loaded_removed,
+                "removed",
+                dataset_state_mapping,
+                zero_unmapped=dataset_state_mapping is not None,
+            )
+
+        self.weights[self.removed] = 0.0
+
+        # NOTE: num_docs_sampled and num_tokens_sampled are sticky.
+        _copy_checkpoint_vector(
+            self.num_docs_sampled,
+            state_dict["num_docs_sampled"],
+            "num_docs_sampled",
+            dataset_state_mapping,
+            zero_unmapped=dataset_state_mapping is not None,
+        )
+        _copy_checkpoint_vector(
+            self.num_tokens_sampled,
+            state_dict["num_tokens_sampled"],
+            "num_tokens_sampled",
+            dataset_state_mapping,
+            zero_unmapped=dataset_state_mapping is not None,
+        )
+
+        state_dict["rng_state"] = list_tree_to_tuple(state_dict["rng_state"])
+        self._rng.setstate(state_dict["rng_state"])
+        # Restore only mapped sub-datasets. Without an explicit mapping, this is
+        # the original by-order restore path.
+        restore_mapping = dataset_state_mapping or {
+            index: index for index in range(len(self.datasets))
+        }
+        for current_idx, checkpoint_idx in sorted(restore_mapping.items()):
+            self.datasets[current_idx].load_state_dict(dataset_states[checkpoint_idx])
 
         # Unset data iterators so they will be re-initialized.
         self._data_iters = None

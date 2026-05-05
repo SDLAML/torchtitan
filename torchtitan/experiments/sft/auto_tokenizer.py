@@ -6,9 +6,10 @@
 
 from dataclasses import dataclass
 
+from transformers import AutoTokenizer as HF_AutoTokenizer
+
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.tools.logging import logger
-from transformers import AutoTokenizer as HF_AutoTokenizer
 
 
 class HuggingFaceAutoTokenizer(BaseTokenizer):
@@ -40,12 +41,18 @@ class HuggingFaceAutoTokenizer(BaseTokenizer):
 
         self.vocab_size = len(self.tokenizer)
 
-        assert (
-            pad_token_id < self.vocab_size
-        ), f"PAD token ID is out of range: {pad_token_id} >= {self.vocab_size}"
-        assert (
-            pad_token_id != self.tokenizer.eos_token_id
-        ), "PAD token ID is the same as EOS token ID, this can cause problems with varlen/flex attention in dynamic packing."
+        if pad_token_id >= self.vocab_size:
+            logger.warning(
+                f"PAD token ID {pad_token_id} is beyond tokenizer vocab size "
+                f"({self.vocab_size}). It will only work if the model's "
+                f"embedding table has capacity for it."
+            )
+        if pad_token_id == self.tokenizer.eos_token_id:
+            logger.warning(
+                "PAD token ID equals EOS token ID. "
+                "This is safe with flex attention + block_causal mask "
+                "but will break varlen attention's EOS-based boundary detection."
+            )
 
         self.eos_id = self.tokenizer.eos_token_id
         self.bos_id = self.tokenizer.bos_token_id
@@ -54,13 +61,19 @@ class HuggingFaceAutoTokenizer(BaseTokenizer):
 
         self.pad_id = pad_token_id
 
-        self.maybe_original_token_at_pad_id = self.tokenizer._convert_id_to_token(
-            pad_token_id
-        )
+        try:
+            self.maybe_original_token_at_pad_id = self.tokenizer._convert_id_to_token(
+                pad_token_id
+            )
+        except Exception:
+            self.maybe_original_token_at_pad_id = None
+
         if pad_token is not None:
             self.pad_token = pad_token
-        else:
+        elif self.maybe_original_token_at_pad_id is not None:
             self.pad_token = self.maybe_original_token_at_pad_id
+        else:
+            self.pad_token = f"<|pad_{pad_token_id}|>"
 
         logger.info(
             f"[SFT AutoTokenizer] Using EOS token: {self.eos_token} - EOS ID: {self.eos_id} "
@@ -76,7 +89,7 @@ class HuggingFaceAutoTokenizer(BaseTokenizer):
     def decode(self, tokens: list[int], *args, **kwargs):
         decoded = self.tokenizer.decode(tokens, *args, **kwargs)
         # this is an ad-hoc for debugging purpose
-        if self.pad_id in tokens:
+        if self.pad_id in tokens and self.maybe_original_token_at_pad_id is not None:
             decoded = decoded.replace(
                 self.maybe_original_token_at_pad_id, self.pad_token
             )
