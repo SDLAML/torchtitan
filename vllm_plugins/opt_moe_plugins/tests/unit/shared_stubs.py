@@ -41,7 +41,7 @@ class DummyFusedMoE(nn.Module):
 
 
 class DummyNormEverywhereFusedMoE(DummyFusedMoE):
-    pass
+    supports_norm_everywhere = True
 
 
 class DummyRaisingNormEverywhereFusedMoE(DummyFusedMoE):

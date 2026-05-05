@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import inspect
 import logging
 import math
 from numbers import Real
@@ -270,7 +271,23 @@ class OptMoEConfig(PretrainedConfig):
     def validate_rope(self, ignore_keys=None):
         parent_impl = getattr(PretrainedConfig, "validate_rope", None)
         if parent_impl is not None:
-            return parent_impl(self, ignore_keys=ignore_keys)
+            if "ignore_keys" in inspect.signature(parent_impl).parameters:
+                return parent_impl(self, ignore_keys=ignore_keys)
+
+            if ignore_keys is None:
+                return parent_impl(self)
+
+            previous_ignore_keys = getattr(self, "ignore_keys_at_rope_validation", None)
+            self.ignore_keys_at_rope_validation = set(previous_ignore_keys or ()) | set(
+                ignore_keys
+            )
+            try:
+                return parent_impl(self)
+            finally:
+                if previous_ignore_keys is None:
+                    self.ignore_keys_at_rope_validation = set()
+                else:
+                    self.ignore_keys_at_rope_validation = previous_ignore_keys
 
         rope_parameters_dict = getattr(self, "rope_parameters", None)
         if rope_parameters_dict is None:

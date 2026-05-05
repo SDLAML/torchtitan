@@ -36,7 +36,21 @@ except ImportError:
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, get_current_vllm_config, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+
+try:
+    from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+
+    _FUSED_MOE_RETURNS_FINAL_OUTPUT = False
+except ImportError:
+    from vllm.model_executor.layers.fused_moe import FusedMoE as _VllmFusedMoE
+
+    class SharedFusedMoE(_VllmFusedMoE):
+        """Compatibility wrapper for vLLM versions that folded SharedFusedMoE into FusedMoE."""
+
+        def __init__(self, *args, reduce_results: bool | None = None, **kwargs):
+            super().__init__(*args, **kwargs)
+
+    _FUSED_MOE_RETURNS_FINAL_OUTPUT = True
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
@@ -929,11 +943,15 @@ class OptMoEMoE(nn.Module):
         if self.use_fused_moe:
             router_logits = self.router(x).to(torch.float32)
             fused_experts = cast(SharedFusedMoE, self.experts)
-            shared_output, routed_output = fused_experts(
+            fused_output = fused_experts(
                 hidden_states=x,
                 router_logits=router_logits,
             )
 
+            if _FUSED_MOE_RETURNS_FINAL_OUTPUT:
+                return fused_output.reshape(orig_shape)
+
+            shared_output, routed_output = fused_output
             final_hidden_states = routed_output
             if shared_output is not None:
                 final_hidden_states = final_hidden_states + shared_output

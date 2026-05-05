@@ -24,7 +24,19 @@ from pathlib import Path
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+
+try:
+    from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+except ImportError:
+    from vllm.model_executor.layers.fused_moe import FusedMoE as _VllmFusedMoE
+
+    class SharedFusedMoE(_VllmFusedMoE):
+        """Compatibility wrapper for vLLM versions that folded SharedFusedMoE into FusedMoE."""
+
+        def __init__(self, *args, reduce_results: bool | None = None, **kwargs):
+            super().__init__(*args, **kwargs)
+
+
 from vllm.model_executor.layers.fused_moe.fused_batched_moe import BatchedTritonExperts
 from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
@@ -200,6 +212,34 @@ class NormEverywhereUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # Force Triton backend so we can inject RMSNorm in activation hook.
         if not bool(getattr(self, "is_monolithic", False)):
             self.unquantized_backend = UnquantizedMoeBackend.TRITON
+            experts_cls = getattr(self, "experts_cls", None)
+            self._uses_modular_experts_cls = experts_cls is not None
+            if self._uses_modular_experts_cls:
+                try:
+                    is_batched = issubclass(experts_cls, BatchedTritonExperts)
+                except TypeError:
+                    is_batched = False
+                _eps = self.rms_norm_eps
+
+                class _BoundNormEverywhereTritonExperts(NormEverywhereTritonExperts):
+                    def __init__(self_, *args, **kwargs):
+                        kwargs.setdefault("rms_norm_eps", _eps)
+                        super().__init__(*args, **kwargs)
+
+                class _BoundNormEverywhereBatchedTritonExperts(
+                    NormEverywhereBatchedTritonExperts
+                ):
+                    def __init__(self_, *args, **kwargs):
+                        kwargs.setdefault("rms_norm_eps", _eps)
+                        super().__init__(*args, **kwargs)
+
+                self.experts_cls = (
+                    _BoundNormEverywhereBatchedTritonExperts
+                    if is_batched
+                    else _BoundNormEverywhereTritonExperts
+                )
+        else:
+            self._uses_modular_experts_cls = False
         self._kernel_fused_experts_replaceable = _kernel_fused_experts_replaceable()
 
     def select_gemm_impl(
@@ -226,7 +266,7 @@ class NormEverywhereUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         )
 
     def _replace_kernel_experts_with_norm(self) -> None:
-        if self.kernel is None:
+        if not hasattr(self, "kernel") or self.kernel is None:
             return
 
         fused_experts = self.kernel.fused_experts
@@ -242,13 +282,28 @@ class NormEverywhereUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             )
 
     def _verify_norm_everywhere_kernel(self) -> None:
-        if self.kernel is None:
-            raise RuntimeError("norm-everywhere fused MoE kernel setup missing kernel")
         if getattr(self, "unquantized_backend", None) != UnquantizedMoeBackend.TRITON:
             raise RuntimeError(
                 "norm-everywhere fused MoE requires TRITON backend, "
                 f"got {getattr(self, 'unquantized_backend', None)!r}"
             )
+
+        experts_cls = getattr(self, "experts_cls", None)
+        if (
+            self._uses_modular_experts_cls
+            and inspect.isclass(experts_cls)
+            and issubclass(
+                experts_cls,
+                (NormEverywhereTritonExperts, NormEverywhereBatchedTritonExperts),
+            )
+        ):
+            logger.info(
+                "Norm-everywhere fused MoE kernel verified via norm-aware experts class"
+            )
+            return
+
+        if not hasattr(self, "kernel") or self.kernel is None:
+            raise RuntimeError("norm-everywhere fused MoE kernel setup missing kernel")
 
         fused_experts = getattr(self.kernel, "fused_experts", None)
         if getattr(fused_experts, "_norm_everywhere_activation_patched", False):
