@@ -750,7 +750,8 @@ class StagingMoEllamaModel(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
-        self.force_fp32_embed_lm_head = _env_bool("VLLM_TEST_FP32_EMBED_LM_HEAD", False)
+        # self.force_fp32_embed_lm_head = _env_bool("VLLM_TEST_FP32_EMBED_LM_HEAD", False)
+        self.force_fp32_embed_lm_head = True
 
         self.enable_eplb = bool(getattr(parallel_config, "enable_eplb", False))
         eplb_config = getattr(parallel_config, "eplb_config", None)
