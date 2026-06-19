@@ -9,11 +9,14 @@
 # [2] https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/datasets/sft_dataset.py#L35
 # [3] https://github.com/volcengine/verl/blob/main/verl/utils/dataset/sft_dataset.py#L33
 import json
+import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Literal
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -109,8 +112,7 @@ def _build_berliner_sft_messages_from_row_dict(
                         args = json.loads(args)
                     except json.JSONDecodeError:
                         logger.warning(
-                            f"Failed to parse tool_call arguments: "
-                            f"{str(args)[:80]}..."
+                            f"Failed to parse tool_call arguments: {str(args)[:80]}..."
                         )
                         args = {}
                 if not isinstance(args, dict):
@@ -194,6 +196,19 @@ class SFTDataset(IterableDataset, Stateful):
 
         self.pad_mode = sft_config.pad_mode
         self.ignore_input_ids_mismatch = sft_config.ignore_input_ids_mismatch
+        self.drop_long_samples = getattr(sft_config, "drop_long_samples", False)
+        self.packing_pool_size = getattr(sft_config, "packing_pool_size", 4096)
+        self.chat_template_prefix_workers = max(
+            1, int(getattr(sft_config, "chat_template_prefix_workers", 4))
+        )
+        self._chat_template_prefix_executor: ThreadPoolExecutor | None = None
+
+        if self.pad_mode == "best_fit_packing" and not self.drop_long_samples:
+            raise ValueError(
+                "pad_mode='best_fit_packing' requires drop_long_samples=True. "
+                "Best-fit packing cannot truncate or split conversations, so "
+                "conversations longer than seq_len+1 must be dropped."
+            )
 
         self.max_length = seq_len
         self.apply_chat_template_kwargs = sft_config.chat_template_kwargs
@@ -234,6 +249,32 @@ class SFTDataset(IterableDataset, Stateful):
         self._sample_idx = 0
         self._buffer = self._reset_buffer()
 
+        # State for best_fit_packing mode
+        self._pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self._n_dropped_oversized: int = 0
+        # Per-rank deterministic RNG for shuffling BFD output. Different ranks
+        # get different shuffles; reproducible across resumes via rng_state.
+        _seed = getattr(sft_config, "dataset_seed", None) or 0
+        self._rng = np.random.default_rng(seed=_seed * 1_000_003 + dp_rank)
+
+        # Per-dataset sampling counters (1-element shared-memory tensors so
+        # worker-process increments are visible to the main process when
+        # DataMixScheduler/SingleDatasetMixScheduler reads them at log time).
+        self.num_docs_sampled = torch.zeros(1, dtype=torch.int64).share_memory_()
+        self.num_tokens_sampled = torch.zeros(1, dtype=torch.int64).share_memory_()
+        # Pick a dataset_alias for wandb keys. Priority: explicit config →
+        # last component of dataset_path → message-builder name → "sft".
+        # Using basename avoids ugly "data_docs//abs/path/to/data" keys.
+        _explicit_alias = getattr(sft_config, "dataset_alias", None)
+        _path = getattr(sft_config, "dataset_path", None)
+        _path_basename = os.path.basename(_path.rstrip("/")) if _path else None
+        self.dataset_alias = (
+            _explicit_alias
+            or _path_basename
+            or getattr(sft_config, "dataset", None)
+            or "sft"
+        )
+
     def _reset_buffer(self):
         """Reset the greedy packing buffer to empty tensors."""
         return {
@@ -265,6 +306,22 @@ class SFTDataset(IterableDataset, Stateful):
             assert "dataset" in state_dict
             self._data.load_state_dict(state_dict["dataset"])
 
+        # Restore best_fit_packing state if present (backward compatible:
+        # checkpoints written before this field is absent simply leave the
+        # in-memory defaults set by __init__).
+        if "pool" in state_dict:
+            self._pool = list(state_dict["pool"])
+        if "n_dropped_oversized" in state_dict:
+            self._n_dropped_oversized = int(state_dict["n_dropped_oversized"])
+        if "rng_state" in state_dict:
+            self._rng.bit_generator.state = state_dict["rng_state"]
+        # Sampling counters: copy_ into the existing shared-memory tensors so
+        # forked worker processes still see the same storage.
+        if "num_docs_sampled" in state_dict:
+            self.num_docs_sampled.copy_(state_dict["num_docs_sampled"])
+        if "num_tokens_sampled" in state_dict:
+            self.num_tokens_sampled.copy_(state_dict["num_tokens_sampled"])
+
     def state_dict(self):
         _state_dict = {"buffer": self._buffer}
 
@@ -274,6 +331,17 @@ class SFTDataset(IterableDataset, Stateful):
             # Save the iterable dataset's state to later efficiently resume from it
             # https://huggingface.co/docs/datasets/v3.5.0/en/stream#save-a-dataset-checkpoint-and-resume-iteration
             _state_dict["dataset"] = self._data.state_dict()
+
+        # best_fit_packing state. Always persisted (cheap when empty); only
+        # used by the best_fit_packing branch on load.
+        _state_dict["pool"] = self._pool
+        _state_dict["n_dropped_oversized"] = self._n_dropped_oversized
+        _state_dict["rng_state"] = self._rng.bit_generator.state
+
+        # Sampling counters (clone to detach from shared memory for the
+        # serialized snapshot).
+        _state_dict["num_docs_sampled"] = self.num_docs_sampled.clone()
+        _state_dict["num_tokens_sampled"] = self.num_tokens_sampled.clone()
 
         return _state_dict
 
@@ -337,12 +405,17 @@ class SFTDataset(IterableDataset, Stateful):
         messages: list[dict],
         tools: list[dict] | None,
         enable_thinking: bool | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        drop_if_longer_than: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Single-shot tokenization with per-assistant-turn span detection for loss masking.
 
         Makes 1 + 2k template calls (k = number of assistant turns) instead of n+1 for
         per-turn or O(n²) for prefix-diff. input_ids matches the single-shot output
         exactly so sanity_check is always satisfied.
+
+        If drop_if_longer_than is set and len(input_ids) > drop_if_longer_than, returns
+        (input_ids, None) immediately — skipping the 2k prefix calls so no work is
+        wasted on conversations that will be dropped anyway.
         """
         apply_chat_template_kwargs = {**self.apply_chat_template_kwargs}
         if enable_thinking is not None:
@@ -363,6 +436,11 @@ class SFTDataset(IterableDataset, Stateful):
 
         # 1 call: correct input_ids guaranteed to match single-shot output
         input_ids = _tok(messages)
+
+        # Early exit for oversized conversations: skip the 2k prefix calls entirely.
+        if drop_if_longer_than is not None and len(input_ids) > drop_if_longer_than:
+            return input_ids, None
+
         loss_mask = torch.zeros_like(input_ids)
 
         gen_len = len(self.generation_prompt)
@@ -370,14 +448,41 @@ class SFTDataset(IterableDataset, Stateful):
         # 2 calls per assistant turn to locate its token span in input_ids.
         # Requires chat_template_kwargs to include truncate_history_thinking=False so that
         # prefix calls (_tok(messages[:i])) render identically to the full conversation call.
-        for i, message in enumerate(messages):
-            if message["role"] == "assistant":
+        assistant_indices = [
+            i for i, message in enumerate(messages) if message["role"] == "assistant"
+        ]
+        if self.chat_template_prefix_workers <= 1 or len(assistant_indices) < 2:
+            for i in assistant_indices:
                 prefix_len = len(_tok(messages[:i])) if i > 0 else 0
                 turn_end = len(_tok(messages[: i + 1]))
                 # mask generation-prompt header; train on the rest of the assistant turn
                 loss_mask[prefix_len + gen_len : turn_end] = 1
+        else:
+            executor = self._get_chat_template_prefix_executor()
+            span_futures = {}
+            for i in assistant_indices:
+                prefix_future = (
+                    executor.submit(_tok, messages[:i]) if i > 0 else None
+                )
+                end_future = executor.submit(_tok, messages[: i + 1])
+                span_futures[i] = (prefix_future, end_future)
+
+            for i in assistant_indices:
+                prefix_future, end_future = span_futures[i]
+                prefix_len = len(prefix_future.result()) if prefix_future else 0
+                turn_end = len(end_future.result())
+                loss_mask[prefix_len + gen_len : turn_end] = 1
 
         return input_ids, loss_mask
+
+    def _get_chat_template_prefix_executor(self) -> ThreadPoolExecutor:
+        """Return the lazy per-worker pool used for prefix chat-template calls."""
+        if self._chat_template_prefix_executor is None:
+            self._chat_template_prefix_executor = ThreadPoolExecutor(
+                max_workers=self.chat_template_prefix_workers,
+                thread_name_prefix="sft-chat-template-prefix",
+            )
+        return self._chat_template_prefix_executor
 
     def sanity_check(
         self,
@@ -444,9 +549,14 @@ class SFTDataset(IterableDataset, Stateful):
         # tokenize each message
         if self.apply_chat_template:
             # Single-shot: input_ids IS the template output, sanity_check trivially passes.
+            # Pass drop_if_longer_than so oversized conversations skip the expensive 2k
+            # prefix calls and return (input_ids, None) — caught below.
+            drop_threshold = self.max_length + 1 if self.drop_long_samples else None
             input_ids, loss_mask = self._process_with_single_shot(
-                messages, tools, enable_thinking
+                messages, tools, enable_thinking, drop_if_longer_than=drop_threshold
             )
+            if loss_mask is None:
+                return None
         else:
             input_ids, loss_mask = [], []
             for i, message in enumerate(messages):
@@ -483,6 +593,17 @@ class SFTDataset(IterableDataset, Stateful):
         sequence_length = input_ids.shape[0]
         target_length = self.max_length + 1
 
+        # Drop oversized conversations when drop_long_samples=True. This is the
+        # only legal behavior for best_fit_packing (enforced at init); the other
+        # modes opt into it via the flag.
+        if sequence_length > target_length and self.drop_long_samples:
+            return None
+
+        # Count of real (non-pad, post-shift) tokens the model will see from
+        # this conversation. Computed BEFORE any right_padding inflation so
+        # num_tokens_sampled stays accurate for all pad modes.
+        real_token_count = min(sequence_length - 1, self.max_length)
+
         # Calculate valid length (unpadded) of the sequence for the model
         # Note: We slice input_ids[:-1] later, so the valid length for training is len - 1
         # If truncated, it is target_length - 1
@@ -510,15 +631,15 @@ class SFTDataset(IterableDataset, Stateful):
                 loss_mask = loss_mask[:target_length]
                 position_ids = position_ids[:target_length]
 
-        elif self.pad_mode == "greedy_packing":
-            # notice the actual packing logic happens in the `_yield_buffer` function.
-            # truncate if longer than max_length (respect truncation setting)
+        elif self.pad_mode in ("greedy_packing", "best_fit_packing"):
+            # Packing modes: actual bin-assembly happens in __iter__ /
+            # _greedy_pack_buffer / _best_fit_pack_pool. Truncate if longer
+            # than max_length+1 (only reachable when drop_long_samples=False,
+            # which is rejected at init for best_fit_packing).
             if len(input_ids) > target_length:
                 input_ids = input_ids[:target_length]
                 loss_mask = loss_mask[:target_length]
                 position_ids = position_ids[:target_length]
-            # In GREEDY_PACKING mode, keep a real attention mask (all ones).
-            # Collate will pad it later in `collate_sft_batch`.
         else:
             raise ValueError(f"Unknown pad mode {self.pad_mode}")
 
@@ -527,7 +648,7 @@ class SFTDataset(IterableDataset, Stateful):
         input_ids = input_ids[:-1]
         position_ids = position_ids[:-1]
 
-        return input_ids, labels, position_ids
+        return input_ids, labels, position_ids, real_token_count
 
     def _greedy_pack_buffer(self):
         if not self._buffer["input_ids"]:
@@ -551,11 +672,95 @@ class SFTDataset(IterableDataset, Stateful):
             "positions": positions,
         }, labels
 
+    def _best_fit_pack_pool(self) -> list[dict]:
+        """Sort the pool by length descending and best-fit-assign into bins.
+
+        Each bin is a dict ``{"ids": [...], "labels": [...], "pos": [...],
+        "used": int}``. Returns the list of closed bins and clears the pool.
+        """
+        T = int(self.buffer_max_length)
+        # Sort by conversation length descending so larger conversations are
+        # placed first and small ones slot into the leftover space.
+        self._pool.sort(key=lambda t: t[0].shape[0], reverse=True)
+
+        bins: list[dict] = []
+        for input_ids, labels, positions in self._pool:
+            L = int(input_ids.shape[0])
+            # Oversized conversations are dropped upstream; defensive guard.
+            assert L <= T, f"oversized conversation ({L} > {T}) reached BFD"
+            best_idx = -1
+            best_rem = T + 1
+            for i, b in enumerate(bins):
+                rem = T - b["used"]
+                if rem >= L and rem < best_rem:
+                    best_idx = i
+                    best_rem = rem
+            if best_idx == -1:
+                bins.append(
+                    {
+                        "ids": [input_ids],
+                        "labels": [labels],
+                        "pos": [positions],
+                        "used": L,
+                    }
+                )
+            else:
+                bins[best_idx]["ids"].append(input_ids)
+                bins[best_idx]["labels"].append(labels)
+                bins[best_idx]["pos"].append(positions)
+                bins[best_idx]["used"] += L
+        self._pool = []
+        return bins
+
+    def _emit_bin(self, b: dict):
+        """Materialize one BFD bin into the (dict, label) yield contract.
+
+        Uses a single pre-allocated tensor per output (input_ids, labels,
+        positions) so memory traffic is O(T) rather than the O(T^2) growth of
+        repeated torch.cat.
+        """
+        T = int(self.buffer_max_length)
+        used = b["used"]
+        input_ids = torch.empty(T, dtype=b["ids"][0].dtype)
+        labels = torch.empty(T, dtype=b["labels"][0].dtype)
+        positions = torch.empty(T, dtype=b["pos"][0].dtype)
+        off = 0
+        for ids, lbl, pos in zip(b["ids"], b["labels"], b["pos"]):
+            n = ids.shape[0]
+            input_ids[off : off + n] = ids
+            labels[off : off + n] = lbl
+            positions[off : off + n] = pos
+            off += n
+        if used < T:
+            input_ids[used:] = self.pad_id
+            labels[used:] = IGNORE_INDEX
+            positions[used:] = 0
+        return {"input": input_ids, "positions": positions}, labels
+
     def __iter__(self):
         while True:
             for sample in self._get_data_iter():
-                input_ids, labels, positions = self._process_one_row(sample)
+                processed = self._process_one_row(sample)
+                self._sample_idx += 1
+                if processed is None:
+                    # Oversized conversation dropped (only when drop_long_samples=True).
+                    self._n_dropped_oversized += 1
+                    if self._n_dropped_oversized % 64 == 0:
+                        logger.warning(
+                            f"[sft {self.pad_mode}] dropped "
+                            f"{self._n_dropped_oversized} oversized "
+                            f"conversations (> {self.buffer_max_length} tokens)"
+                        )
+                    continue
+                input_ids, labels, positions, real_token_count = processed
                 new_len = input_ids.shape[0]
+
+                # Per-dataset sampling stats. Counts real conversation tokens
+                # excluding any pad introduced by right_padding — matches
+                # pretrain MixedDataset.num_tokens_sampled semantics.
+                self.num_docs_sampled[0] += 1
+                self.num_tokens_sampled[0] += int(real_token_count)
+
                 if self.pad_mode == "right_padding":
                     # Yield consistent dict structure immediately
                     return_dict = {
@@ -563,9 +768,18 @@ class SFTDataset(IterableDataset, Stateful):
                         "positions": positions,
                     }
                     yield return_dict, labels
-                    self._sample_idx += 1
                     continue
 
+                if self.pad_mode == "best_fit_packing":
+                    self._pool.append((input_ids, labels, positions))
+                    if len(self._pool) >= self.packing_pool_size:
+                        bins = self._best_fit_pack_pool()
+                        self._rng.shuffle(bins)
+                        for b in bins:
+                            yield self._emit_bin(b)
+                    continue
+
+                # greedy_packing path
                 if self._buffer["current_len"] + new_len > self.buffer_max_length:
                     if self._buffer["current_len"] > 0:
                         yield self._greedy_pack_buffer()
@@ -580,7 +794,15 @@ class SFTDataset(IterableDataset, Stateful):
                     self._buffer["position_ids"].append(positions)
                     self._buffer["labels"].append(labels)
                     self._buffer["current_len"] += new_len
-                self._sample_idx += 1
+
+            # Inner stream exhausted. For best_fit_packing, flush whatever
+            # is left in the pool so partial bins aren't lost between
+            # epochs (and so the dataset terminates cleanly when not infinite).
+            if self.pad_mode == "best_fit_packing" and self._pool:
+                bins = self._best_fit_pack_pool()
+                self._rng.shuffle(bins)
+                for b in bins:
+                    yield self._emit_bin(b)
 
             if not self.infinite:
                 logger.warning("Dataset has run out of data")
@@ -628,11 +850,39 @@ class SFTDataLoader(ParallelAwareDataloader):
         apply_chat_template: bool = False
         """Apply tokenizer chat template to messages."""
 
-        pad_mode: Literal["right_padding", "greedy_packing"] = "greedy_packing"
-        """How to pad/pack sequences into a fixed-length batch."""
+        pad_mode: Literal["right_padding", "greedy_packing", "best_fit_packing"] = (
+            "greedy_packing"
+        )
+        """How to pad/pack sequences into a fixed-length batch.
+        - right_padding: each conversation padded individually to seq_len+1.
+        - greedy_packing: first-fit-no-split. Conversations concatenated into a
+          bin until the next won't fit, then bin is padded and yielded.
+        - best_fit_packing: buffer `packing_pool_size` conversations, sort by
+          length, best-fit-assign to bins. Lower padding than greedy. Requires
+          drop_long_samples=True (oversized convs are dropped, never truncated).
+        """
+
+        packing_pool_size: int = 4096
+        """Only used by best_fit_packing. Conversations buffered per rank before
+        each BFD pass. Larger pool → tighter packing and lower per-batch ratio
+        noise at the cost of more CPU memory."""
+
+        drop_long_samples: bool = False
+        """If True, conversations longer than buffer_max_length (= seq_len + 1)
+        are dropped instead of truncated. Tracked via _n_dropped_oversized.
+        Required for pad_mode='best_fit_packing'."""
+
+        dataset_alias: str | None = None
+        """Label used for per-dataset sampling stats in metrics
+        (data_docs/<alias>, data_tokens/<alias>). If None, falls back to
+        dataset_path, then to the message-builder dataset name."""
 
         chat_template_kwargs: dict = field(default_factory=dict)
         """Extra kwargs forwarded to tokenizer.apply_chat_template."""
+
+        chat_template_prefix_workers: int = 4
+        """Thread workers for per-assistant prefix chat-template renders.
+        Set to 1 to use the serial prefix-render path."""
 
         ignore_input_ids_mismatch: bool = False
         """Ignore input_ids mismatch when applying chat template per-turn."""

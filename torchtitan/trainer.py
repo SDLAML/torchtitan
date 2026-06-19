@@ -212,9 +212,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         torch._C._log_api_usage_once("torchtitan.train")
 
         self.config = config
-        assert (
-            config.model_spec is not None
-        ), "model_spec must be set before creating Trainer"
+        assert config.model_spec is not None, (
+            "model_spec must be set before creating Trainer"
+        )
         model_spec = config.model_spec
 
         device_module, device_type = utils.device_module, utils.device_type
@@ -292,6 +292,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             snapshot_every_n_steps=snapshot_every_n_steps,
             seed=config.debug.seed,
         )
+
+        if (
+            getattr(config.dataloader, "pack_strategy", "greedy") == "best_fit"
+            and config.training.all_tokens_valid
+        ):
+            raise ValueError(
+                "training.all_tokens_valid=True is incompatible with "
+                "dataloader.pack_strategy='best_fit': best-fit packing emits "
+                "IGNORE_INDEX labels on pad positions, so not every label is "
+                "valid. Set training.all_tokens_valid=False."
+            )
 
         mixing_scheduler_configs = getattr(
             config.dataloader, "data_mixing_scheduler_configs", None
@@ -592,7 +603,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         data_iterator = iter(data_iterable)
 
         while True:
-            data_load_start = time.perf_counter()
             try:
                 batch = next(data_iterator)
             except StopIteration as ex:
@@ -603,9 +613,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             ntokens_batch = labels.numel()
             self.ntokens_seen += ntokens_batch
             self.metrics_processor.ntokens_since_last_log += ntokens_batch
-            self.metrics_processor.data_loading_times.append(
-                time.perf_counter() - data_load_start
-            )
 
             # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield input_dict, labels
@@ -668,10 +675,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             if attention_masks is not None:
                 extra_kwargs["attention_masks"] = attention_masks
 
-        if self.config.training.enable_token_mask_for_moe:
-            loss_mask = labels != IGNORE_INDEX
-            extra_kwargs["loss_mask"] = loss_mask
-
         if self.parallel_dims.cp_enabled:
             inputs, labels, extra_kwargs = prepare_context_parallel_input(
                 inputs,
@@ -681,6 +684,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 self.device,
                 self.config.parallelism.context_parallel_load_balancer,
             )
+            # TODO(SFT x CP): SFT loader emits per-doc "positions" in
+            # extra_inputs while prepare_context_parallel_input also writes
+            # extra_kwargs["positions"] (sequential arange). The forward at
+            # L752 unpacks both and raises TypeError on the duplicate kwarg.
+            # Temporary workaround: drop loader-provided positions so RoPE
+            # uses CP's sequential positions. Per-doc RoPE on multi-doc
+            # packed bins is therefore not semantically correct, but the
+            # attention mask was already built from doc-local positions in
+            # get_attention_masks above. Proper fix: make
+            # prepare_context_parallel_input use loader-provided positions
+            # (shard them through cp_shard like inputs/labels) so RoPE
+            # matches doc boundaries.
+            extra_inputs.pop("positions", None)
+
+        # Build the MoE token mask AFTER CP sharding so its token layout matches
+        # the CP-sharded labels / hidden states (same shard + same load-balancer
+        # reorder). Building it before CP leaves it full-length and breaks
+        # idx[m] in the MoE router under CP.
+        if self.config.training.enable_token_mask_for_moe:
+            extra_kwargs["loss_mask"] = labels != IGNORE_INDEX
 
         return inputs, labels, extra_inputs, extra_kwargs
 
@@ -763,16 +786,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Collect all microbatches on CPU and compute global valid token count.
         microbatches = []
-
+        data_load_start = time.perf_counter()
         if self.config.training.all_tokens_valid:
             # Fast path: every label is valid and every rank has the same fixed
             # token count. Count from the actual CPU microbatches to avoid any
             # communication while staying robust to shape drift.
             local_valid_tokens = 0
+            
             for _microbatch in range(self.gradient_accumulation_steps):
                 input_dict, labels = next(data_iterator)
                 local_valid_tokens += labels.numel()
                 microbatches.append((input_dict, labels))
+
             batch_degree = (
                 parallel_dims.get_mesh("batch").size()
                 if parallel_dims.dp_enabled
@@ -782,24 +807,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 float(local_valid_tokens), device=self.device
             )
             global_valid_tokens = local_valid_tokens * batch_degree
+            global_total_tokens = global_valid_tokens
         else:
             local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+            local_total_tokens = torch.tensor(0, dtype=torch.int64)
             for _microbatch in range(self.gradient_accumulation_steps):
                 input_dict, labels = next(data_iterator)
                 local_valid_tokens += (labels != IGNORE_INDEX).sum()
+                local_total_tokens += labels.numel()
                 microbatches.append((input_dict, labels))
 
             # All-reduce to get global token count across DP ranks
             # Move to GPU for distributed communication
             local_valid_tokens = local_valid_tokens.to(self.device)
+            local_total_tokens = local_total_tokens.to(self.device)
             if parallel_dims.dp_enabled:
                 batch_mesh = parallel_dims.get_mesh("batch")
                 global_valid_tokens = dist_utils.dist_sum(
                     local_valid_tokens, batch_mesh
                 )
+                global_total_tokens = dist_utils.dist_sum(
+                    local_total_tokens, batch_mesh
+                )
             else:
                 global_valid_tokens = local_valid_tokens.float()
+                global_total_tokens = local_total_tokens.float()
 
+        self.metrics_processor.data_loading_times.append(
+            time.perf_counter() - data_load_start
+        )
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
         fwd_bwd_start = time.perf_counter()
@@ -899,8 +935,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 parallel_dims.get_optional_mesh("loss"),
                 keep_tensor=True,
             )
-            if self.prev_data_sampled_tensor is None:
-                self.prev_data_sampled_tensor = torch.zeros_like(fused)
+            # On the first log of a Trainer instance (fresh start OR resume)
+            # we don't have a previous reference, so initialize prev to the
+            # current cumulative. The first computed delta is then 0 (one log
+            # point with all-zero actual_*_ratio) instead of dumping the whole
+            # carried-over cumulative as a spurious "this interval" value —
+            # which on resume would show phase-1's historical mix and
+            # subsequently amplify into several noisy logs as per-interval
+            # deltas catch up. Shape guard handles a hypothetical resume with
+            # a different number of datasets without raising.
+            if (
+                self.prev_data_sampled_tensor is None
+                or self.prev_data_sampled_tensor.shape != fused.shape
+            ):
+                self.prev_data_sampled_tensor = fused.clone()
             delta = fused - self.prev_data_sampled_tensor
             self.prev_data_sampled_tensor = fused.clone()
 
@@ -932,9 +980,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             actual_doc_ratio_dict = {}
             actual_token_ratio_dict = {}
 
+        global_valid_tokens_f = float(global_valid_tokens)
+        global_total_tokens_f = float(global_total_tokens)
+        valid_token_fraction = (
+            global_valid_tokens_f / global_total_tokens_f
+            if global_total_tokens_f > 0
+            else 1.0
+        )
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
+            "valid_token_fraction": valid_token_fraction,
+            "padding_fraction": 1.0 - valid_token_fraction,
         }
         extra_metrics.update(self.optimizers.get_lrs())
         extra_metrics.update(data_mix)

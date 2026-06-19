@@ -14,6 +14,7 @@ from pathlib import Path
 from random import Random
 from typing import Any
 
+import numpy as np
 import torch
 
 from datasets import Dataset, load_dataset
@@ -23,6 +24,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
@@ -476,9 +478,9 @@ class MixedDataset(IterableDataset, Stateful):
         ]
 
     def set_weights(self, weights: list[float]):
-        assert len(weights) == len(
-            self.datasets
-        ), "weights must have the same length as datasets"
+        assert len(weights) == len(self.datasets), (
+            "weights must have the same length as datasets"
+        )
         w = torch.tensor(weights, dtype=torch.float64)
         w[self.removed] = 0.0
         self.weights.copy_(w)
@@ -743,6 +745,191 @@ class GreedyPackedDataset(IterableDataset, Stateful):
         }
 
 
+class BestFitPackedDataset(IterableDataset, Stateful):
+    """Pack complete documents into fixed-length sequences using best-fit-decreasing.
+
+    Buffers `pool_size` documents from the upstream dataset, sorts them by length
+    descending, and assigns each to the open bin (sequence) with the smallest
+    remaining space that still fits it. Closed bins are padded to `seq_len` and
+    yielded in a randomly shuffled order so that batch ordering is decorrelated
+    from BFD's length-sort order (otherwise long-doc datasets dominate the first
+    batches after each pool refill).
+
+    Label positions corresponding to pad tokens are set to `IGNORE_INDEX` so
+    padding does not contribute to the training loss.
+    """
+
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        seq_len: int = 2048,
+        infinite: bool = False,
+        num_mtp_tokens: int = 0,
+        drop_long_samples: bool = False,
+        eos_id: int | None = None,
+        pad_id: int = 0,
+        pool_size: int = 4096,
+        seed: int = 0,
+    ) -> None:
+        self._data = dataset
+        self.seq_len = seq_len
+        self.infinite = infinite
+        self.num_mtp_tokens = num_mtp_tokens
+        self.drop_long_samples = drop_long_samples
+        self.eos_id = eos_id
+        self.pad_id = pad_id
+        self.pool_size = pool_size
+
+        # Variables for checkpointing
+        self._sample_idx = 0
+        self._pool: list[np.ndarray] = []
+        self._yield_queue: list[np.ndarray] = []
+        self._rng = np.random.default_rng(seed=seed)
+
+    @property
+    def dataset_name(self):
+        return self._data.dataset_name
+
+    @property
+    def dataset_path(self):
+        return self._data.dataset_path
+
+    def _get_data_iter(self):
+        return iter(self._data)
+
+    def _max_buffer_len(self) -> int:
+        return 1 + self.seq_len + self.num_mtp_tokens
+
+    def _bfd_pack(self, docs: list[np.ndarray]) -> list[tuple[np.ndarray, int]]:
+        max_len = self._max_buffer_len()
+        docs.sort(key=len, reverse=True)
+
+        # Each bin: [list_of_doc_arrays, total_len_used]
+        bins: list[list] = []
+        for doc in docs:
+            L = len(doc)
+            best_idx = -1
+            best_rem = max_len + 1
+            for i, b in enumerate(bins):
+                rem = max_len - b[1]
+                if rem >= L and rem < best_rem:
+                    best_idx = i
+                    best_rem = rem
+            if best_idx == -1:
+                if L > max_len:
+                    # Should have been filtered by drop_long_samples upstream.
+                    continue
+                bins.append([[doc], L])
+            else:
+                bins[best_idx][0].append(doc)
+                bins[best_idx][1] += L
+
+        # Materialize each bin into a (buf, used) pair. `used` is the number of
+        # real tokens in the bin; positions [used, max_len) are padding. We pass
+        # `used` through to `_emit` so it can mask the exact pad-target labels
+        # — necessary when pad_id == eos_id, otherwise inferring pad positions
+        # from token value would also mask the model's chance to learn the EOS
+        # tokens at the end of real documents.
+        out: list[tuple[np.ndarray, int]] = []
+        for doc_list, used in bins:
+            buf = np.empty(max_len, dtype=np.int64)
+            off = 0
+            for d in doc_list:
+                buf[off : off + len(d)] = d
+                off += len(d)
+            if off < max_len:
+                buf[off:] = self.pad_id
+            out.append((buf, used))
+        return out
+
+    def _emit(self, packed_with_used: tuple[np.ndarray, int]):
+        packed, used = packed_with_used
+        x = torch.from_numpy(packed)
+        input_ = x[:-1]
+        label = x[1:].clone()
+        # Label index i corresponds to predicting packed[i+1]. Positions
+        # [used, max_len) are pad, so label indices i with i+1 >= used
+        # (i.e. i >= used - 1) are pad targets and must be masked.
+        max_len = packed.shape[0]
+        if used < max_len:
+            label[max(used - 1, 0) :] = IGNORE_INDEX
+        return {"input": input_}, label
+
+    def __iter__(self):
+        max_len = self._max_buffer_len()
+
+        while True:
+            num_yielded = 0
+
+            # Drain any bins left over from a previous epoch / checkpoint restore.
+            while self._yield_queue:
+                yield self._emit(self._yield_queue.pop(0))
+
+            for sample_tokens in self._get_data_iter():
+                num_yielded += 1
+                self._sample_idx += 1
+
+                if self.drop_long_samples and len(sample_tokens) > max_len:
+                    continue
+
+                self._pool.append(np.asarray(sample_tokens, dtype=np.int64))
+
+                if len(self._pool) >= self.pool_size:
+                    bins = self._bfd_pack(self._pool)
+                    self._pool = []
+                    self._rng.shuffle(bins)
+                    self._yield_queue.extend(bins)
+                    while self._yield_queue:
+                        yield self._emit(self._yield_queue.pop(0))
+
+            # Data exhausted — flush remaining pool.
+            if self._pool:
+                bins = self._bfd_pack(self._pool)
+                self._pool = []
+                self._rng.shuffle(bins)
+                self._yield_queue.extend(bins)
+            while self._yield_queue:
+                yield self._emit(self._yield_queue.pop(0))
+
+            if not self.infinite:
+                logger.warning(
+                    f"BestFitPackedDataset {self.dataset_name} from {self.dataset_path} has run out of data"
+                )
+                break
+            elif num_yielded == 0:
+                # No samples yielded by upstream this epoch; stop to avoid infinite loop.
+                break
+            else:
+                self._sample_idx = 0
+                logger.warning(
+                    f"BestFitPackedDataset {self.dataset_name} from {self.dataset_path} is being re-looped"
+                )
+                if not isinstance(self._data, Dataset):
+                    if hasattr(self._data, "set_epoch") and hasattr(
+                        self._data, "epoch"
+                    ):
+                        self._data.set_epoch(self._data.epoch + 1)
+
+    def load_state_dict(self, state_dict):
+        self._sample_idx = state_dict["sample_idx"]
+        self._pool = [np.asarray(a, dtype=np.int64) for a in state_dict["pool"]]
+        self._yield_queue = [
+            (np.asarray(buf, dtype=np.int64), int(used))
+            for buf, used in state_dict["yield_queue"]
+        ]
+        self._rng.bit_generator.state = state_dict["rng_state"]
+        self._data.load_state_dict(state_dict["dataset"])
+
+    def state_dict(self):
+        return {
+            "sample_idx": self._sample_idx,
+            "pool": self._pool,
+            "yield_queue": self._yield_queue,
+            "rng_state": self._rng.bit_generator.state,
+            "dataset": self._data.state_dict(),
+        }
+
+
 def _normalize_list(
     xs: list[str | None] | None,
     length: int,
@@ -868,6 +1055,28 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         drop_long_samples: bool = False
         """Whether to drop samples longer than the sequence length"""
 
+        pack_strategy: str = "greedy"
+        """How to pack documents into sequences. "greedy" concatenates documents
+        and cuts at seq_len boundaries (documents may split across sequences).
+        "best_fit" buffers documents and uses best-fit-decreasing packing so that
+        every sequence holds only complete documents (with some padding).
+        """
+
+        packing_pool_size: int = 4096
+        """Only used when pack_strategy="best_fit". Number of documents buffered
+        per rank before each BFD pass. Larger pools give tighter packing and
+        lower per-batch ratio variance at the cost of more CPU memory and a
+        longer warmup before the first batch.
+        """
+
+        pad_id: int | None = None
+        """Only used when pack_strategy="best_fit". Token id written into padding
+        positions; label positions corresponding to a pad token are masked with
+        IGNORE_INDEX so padding does not contribute to the loss. If None, defaults
+        to ``tokenizer.eos_id`` — works with FlexAttention's EOS-based document
+        mask out of the box (each pad token becomes a one-token "document").
+        """
+
     def __init__(
         self,
         config: Config,
@@ -917,11 +1126,29 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         )
         resolved_dataset_aliases = _resolve_dataset_aliases(dataset_alias)
         drop_long_samples = config.drop_long_samples
+        pack_strategy = config.pack_strategy
+        if pack_strategy not in ("greedy", "best_fit"):
+            raise ValueError(
+                f"pack_strategy must be 'greedy' or 'best_fit', got {pack_strategy!r}"
+            )
+        packing_pool_size = config.packing_pool_size
+        pad_id = config.pad_id
+        if pack_strategy == "best_fit" and pad_id is None:
+            if tokenizer.eos_id is None:
+                raise ValueError(
+                    "pack_strategy='best_fit' requires a pad_id, but config.pad_id is "
+                    "unset and tokenizer.eos_id is None. Set config.pad_id explicitly."
+                )
+            pad_id = tokenizer.eos_id
+        # Deterministic per-rank seed for the BFD output shuffle. Different
+        # ranks get different shuffles; the same rank is reproducible across
+        # resumes once load_state_dict restores the RNG state.
+        bfd_seed = (seed or 0) * 1_000_003 + dp_rank
 
         if len(dataset_name) > 1:
-            assert (
-                dataset_files is None
-            ), "cannot supply dataset files when using multiple datasets"
+            assert dataset_files is None, (
+                "cannot supply dataset files when using multiple datasets"
+            )
         prepared_dataset_files = [
             (
                 None
@@ -941,9 +1168,9 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             dataset_weights,
             prepared_dataset_files,
         ]:
-            assert (
-                len(d) == normed_list_length
-            ), f"list {d} does not match length of list of datasets (length = {normed_list_length})"
+            assert len(d) == normed_list_length, (
+                f"list {d} does not match length of list of datasets (length = {normed_list_length})"
+            )
         hf_datasets = []
         for d_name, d_path, d_inner_name, d_split, d_key, d_files in zip(
             dataset_name,
@@ -967,13 +1194,25 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
                 dataset_key=d_key,
             )
             if not dataset_mix_in_seq:
-                hf_ds = GreedyPackedDataset(
-                    dataset=hf_ds,
-                    seq_len=seq_len,
-                    infinite=infinite,
-                    drop_long_samples=drop_long_samples,
-                    eos_id=tokenizer.eos_id,
-                )
+                if pack_strategy == "greedy":
+                    hf_ds = GreedyPackedDataset(
+                        dataset=hf_ds,
+                        seq_len=seq_len,
+                        infinite=infinite,
+                        drop_long_samples=drop_long_samples,
+                        eos_id=tokenizer.eos_id,
+                    )
+                else:  # best_fit
+                    hf_ds = BestFitPackedDataset(
+                        dataset=hf_ds,
+                        seq_len=seq_len,
+                        infinite=infinite,
+                        drop_long_samples=drop_long_samples,
+                        eos_id=tokenizer.eos_id,
+                        pad_id=pad_id,
+                        pool_size=packing_pool_size,
+                        seed=bfd_seed,
+                    )
             hf_datasets.append(hf_ds)
 
         if torch.distributed.is_initialized():
@@ -993,13 +1232,25 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         )
 
         if dataset_mix_in_seq:
-            hf_ds = GreedyPackedDataset(
-                dataset=hf_ds,
-                seq_len=seq_len,
-                infinite=infinite,
-                drop_long_samples=drop_long_samples,
-                eos_id=tokenizer.eos_id,
-            )
+            if pack_strategy == "greedy":
+                hf_ds = GreedyPackedDataset(
+                    dataset=hf_ds,
+                    seq_len=seq_len,
+                    infinite=infinite,
+                    drop_long_samples=drop_long_samples,
+                    eos_id=tokenizer.eos_id,
+                )
+            else:  # best_fit
+                hf_ds = BestFitPackedDataset(
+                    dataset=hf_ds,
+                    seq_len=seq_len,
+                    infinite=infinite,
+                    drop_long_samples=drop_long_samples,
+                    eos_id=tokenizer.eos_id,
+                    pad_id=pad_id,
+                    pool_size=packing_pool_size,
+                    seed=bfd_seed,
+                )
 
         if len(dataset_name) == 1:
             snapshot_every_n_steps = 1

@@ -102,17 +102,47 @@ class DataMixScheduler:
                 )
 
 
-class DummyDataMixScheduler:
-    def __init__(self):
+class SingleDatasetMixScheduler:
+    """Fallback scheduler for dataloaders that don't wrap a MixedDataset.
+
+    Walks `dataloader.dataset` via the `_data` chain looking for an object that
+    exposes `num_docs_sampled` / `num_tokens_sampled` counters. If found, logs
+    them under `data_docs/<alias>` / `data_tokens/<alias>` (alias comes from a
+    `dataset_alias` attribute on the same object, default "data"). If not
+    found, falls back to constant zeros — matching the prior dummy behavior
+    so this never errors on minimal/test loaders.
+    """
+
+    def __init__(self, dataloader):
+        self.dataloader = dataloader
+        self._stats = _resolve_stats_dataset(dataloader.dataset)
+        if self._stats is not None:
+            alias = getattr(self._stats, "dataset_alias", None) or "data"
+        else:
+            alias = "not_mixed_datasets"
+        # Sanitize: wandb interprets "/" as namespace separators, so a raw
+        # filesystem path or accidental empty path produces a weird hierarchy.
+        # Strip slashes and collapse to underscores.
+        self._alias = str(alias).strip("/").replace("/", "_") or "data"
         self.mixing_configs = {0: [1]}
 
     def get_weights_at_step(self, current_step: int):
         return [1]
 
     def get_log_dict_at_step(self, current_step: int):
-        data_mix_log = {"data_mixing/not_mixed_datasets": torch.tensor(1)}
-        data_docs_log = {"data_docs/not_mixed_datasets": torch.tensor(0)}
-        data_tokens_log = {"data_tokens/not_mixed_datasets": torch.tensor(0)}
+        data_mix_log = {f"data_mixing/{self._alias}": torch.tensor(1)}
+        if self._stats is not None:
+            docs = getattr(self._stats, "num_docs_sampled", None)
+            toks = getattr(self._stats, "num_tokens_sampled", None)
+            data_docs_log = {
+                f"data_docs/{self._alias}": _scalar_count(docs)
+            }
+            data_tokens_log = {
+                f"data_tokens/{self._alias}": _scalar_count(toks)
+            }
+        else:
+            data_docs_log = {f"data_docs/{self._alias}": torch.tensor(0)}
+            data_tokens_log = {f"data_tokens/{self._alias}": torch.tensor(0)}
         return data_mix_log, data_docs_log, data_tokens_log
 
     def convert_mixing_configs_to_json(self):
@@ -123,6 +153,54 @@ class DummyDataMixScheduler:
 
     def dump_mixing_configs(self, dump_folder: str):
         pass
+
+
+def _scalar_count(value) -> torch.Tensor:
+    """Coerce a counter to a 0-D tensor.
+
+    Expected: None, a Python scalar, or a 1-element tensor (as used by
+    SFTDataset). Multi-element tensors are summed and a warning is logged
+    once — this branch is unreachable in current code (the MixedDataset path
+    is taken first by build_data_mix_scheduler) but degrades gracefully if a
+    future caller wires in a per-dataset counter.
+    """
+    if value is None:
+        return torch.tensor(0)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return torch.tensor(0)
+        if value.numel() == 1:
+            return value.flatten()[0].detach()
+        # Defensive: sum across datasets and warn (don't drop or crash).
+        if not getattr(_scalar_count, "_warned_multi", False):
+            import warnings
+            warnings.warn(
+                "SingleDatasetMixScheduler received a multi-element counter "
+                f"(numel={value.numel()}); summing across elements. Use "
+                "DataMixScheduler for proper per-dataset breakdown.",
+                stacklevel=2,
+            )
+            _scalar_count._warned_multi = True
+        return value.detach().sum()
+    return torch.tensor(int(value))
+
+
+def _resolve_stats_dataset(dataset):
+    """Walk the dataset chain looking for an object with sampling counters."""
+    current = dataset
+    visited = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if hasattr(current, "num_docs_sampled") or hasattr(
+            current, "num_tokens_sampled"
+        ):
+            return current
+        current = getattr(current, "_data", None)
+    return None
+
+
+# Backward-compat alias: callers that imported DummyDataMixScheduler keep working.
+DummyDataMixScheduler = SingleDatasetMixScheduler
 
 
 def _parse_percentage_step_key(step_key: str) -> float | None:
@@ -224,7 +302,7 @@ def build_data_mix_scheduler(
 ):
     mixed_dataset = _resolve_mixed_dataset(dataloader.dataset)
     if mixed_dataset is None:
-        return DummyDataMixScheduler()
+        return SingleDatasetMixScheduler(dataloader)
     mixing_configs, datasets_names = None, None
     if mixing_scheduler_configs:
         if os.path.isfile(mixing_scheduler_configs):
