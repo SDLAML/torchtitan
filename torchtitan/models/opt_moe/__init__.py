@@ -525,6 +525,32 @@ moe_opt_moe_configs = {
             backend="cos_sin",
         ),
     ),
+    "synth-proxy-x2-width": OPTMoEModel.Config(
+        n_layers=16,
+        dim=512,
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=16,
+            feed_forward=FeedForward.Config(
+                hidden_dim=2048,
+                norm_everywhere=True,
+                norm_eps=1e-30,
+            ),
+            attention=GatedNormSWAttention.Config(
+                n_heads=8,
+                n_kv_heads=8,
+                head_dim=128,
+                qk_norm=True,
+                norm_everywhere=True,
+                norm_eps=1e-30,
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=10000.0,
+            backend="cos_sin",
+        ),
+    ),
     # ==== 0.4.0-model-architecture-ablation ====
     "M1-dense-600M-full_rope-proxy": OPTMoEModel.Config(
         n_layers=14,
