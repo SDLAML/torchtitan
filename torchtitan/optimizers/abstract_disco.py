@@ -91,7 +91,8 @@ def fused_rmnp_row_norm(g: torch.Tensor, eps: float) -> torch.Tensor:
     # Supports:
     # 2D: [d_out, d_in]
     # 3D: [n_experts, d_out, d_in]
-    return g / g.norm(p=2, dim=-1, keepdim=True).clamp_min(eps)
+    ratio = (g.size(-2) / g.size(-1)) ** 0.5
+    return g / g.norm(p=2, dim=-1, keepdim=True).clamp_min(eps) * ratio
 
 
 # @torch.compile(dynamic=False, fullgraph=True)
