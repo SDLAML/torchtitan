@@ -21,9 +21,9 @@ import tyro
 from torchtitan.tools.logging import logger
 
 
-def _deep_set(d: dict, path: list[str], value):
-    """Set d[path]=value; path segments support 'a' and 'a[3]'. Creates dicts/lists as needed."""
-    cur = d
+def _deep_set(obj: Any, path: list[str], value):
+    """Set a nested dataclass/dict/list config value."""
+    cur = obj
     for i, seg in enumerate(path):
         m = re.fullmatch(r"([A-Za-z0-9_]+)(?:\[(\d+)\])?", seg)
         if not m:
@@ -31,28 +31,33 @@ def _deep_set(d: dict, path: list[str], value):
         name, idx = m.group(1), m.group(2)
         last = i == len(path) - 1
 
+        if isinstance(cur, dict):
+            if name not in cur:
+                raise ValueError(f"Unknown config key: {name}")
+            container = cur[name]
+        else:
+            if not hasattr(cur, name):
+                raise ValueError(f"Unknown config field: {name}")
+            container = getattr(cur, name)
+
         if idx is None:
             if last:
-                cur[name] = value
+                if isinstance(cur, dict):
+                    cur[name] = value
+                else:
+                    setattr(cur, name, value)
             else:
-                nxt = cur.get(name)
-                if not isinstance(nxt, dict):
-                    nxt = {}
-                    cur[name] = nxt
-                cur = nxt
+                cur = container
         else:
             j = int(idx)
-            seq = cur.get(name)
+            seq = container
             if not isinstance(seq, list):
-                seq = []
-                cur[name] = seq
-            while len(seq) <= j:
-                seq.append({})
+                raise ValueError(f"Config field '{name}' is not a list")
+            if j >= len(seq):
+                raise IndexError(f"Config index '{name}[{j}]' is out of range")
             if last:
                 seq[j] = value
             else:
-                if not isinstance(seq[j], dict):
-                    seq[j] = {}
                 cur = seq[j]
 
 
@@ -118,12 +123,23 @@ class ConfigManager:
                 model_flavor=model_flavor,
                 module_name=module_name,
             )
+        optimizer_lr_from_cli = any(
+            arg == "--optimizer.lr" or arg.startswith("--optimizer.lr=")
+            for arg in args
+        )
         config_cls = type(loaded_config)
 
         self.config = tyro.cli(
             config_cls, args=args, default=loaded_config, registry=custom_registry
         )
         self._normalize_scalar_list_fields(self.config)
+
+        if optimizer_lr_from_cli:
+            for param_group in self.config.optimizer.extra_param_group_split_rules:
+                param_group["lr"] = self.config.optimizer.lr
+
+        for path, value in idx_overrides:
+            _deep_set(self.config, path, value)
 
         self._validate_config()
 

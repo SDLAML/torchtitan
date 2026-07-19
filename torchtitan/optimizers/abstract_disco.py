@@ -87,6 +87,13 @@ def fused_image_spectral(g: torch.Tensor, eps: float):
     return g
 
 
+def fused_rmnp_row_norm(g: torch.Tensor, eps: float) -> torch.Tensor:
+    # Supports:
+    # 2D: [d_out, d_in]
+    # 3D: [n_experts, d_out, d_in]
+    return g / g.norm(p=2, dim=-1, keepdim=True).clamp_min(eps)
+
+
 # @torch.compile(dynamic=False, fullgraph=True)
 def fused_bias_rms(g: torch.Tensor, eps: float):
     rms_value = torch.sqrt(g.pow(2).mean())
@@ -158,6 +165,9 @@ class AbstractDiSCO(torch.optim.Optimizer):
 
         elif norm_factor == "image_spectral":
             g = fused_image_spectral(g, eps)
+
+        elif norm_factor == "rmnp_row_norm":
+            g = fused_rmnp_row_norm(g, eps)
 
         elif norm_factor.startswith("embed"):
             # Handle 2-D and batched 3-D consistently
@@ -270,9 +280,9 @@ class AbstractDiSCO(torch.optim.Optimizer):
                 # it only supports for 2D tensors for now.
                 assert splits_dim in [0, 1], "splits_dim must be 0 or 1 for 2D tensors"
                 assert splits_into > 1, "splits_into must be greater than 1"
-                assert (
-                    g.shape[splits_dim] % splits_into == 0
-                ), "splits_into must be a divisor of the dimension to split"
+                assert g.shape[splits_dim] % splits_into == 0, (
+                    "splits_into must be a divisor of the dimension to split"
+                )
                 d_out, d_in = g.shape
                 if splits_dim == 0:
                     # Split rows: [d_out, d_in] -> [Group, d_out/Group, d_in]
