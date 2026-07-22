@@ -44,34 +44,38 @@ def _get_or_make_compiled_lmo(
 def fused_embed_linear(g: torch.Tensor, eps: float):
     # dim=-1 / size(-1): works for both 2-D [D_out, D_in] and
     # batched 3-D [N, D_out, D_in] (per-row L2 along last dim).
-    rms_values = torch.sqrt(g.pow(2).sum(dim=-1, keepdim=True))
+    g_fp32 = g.float()
+    row_l2_norm = torch.sqrt(g_fp32.pow(2).sum(dim=-1, keepdim=True))
     dim = g.size(-1)
-    g = g / (rms_values + eps) * dim
-    return g
+    g_fp32 = g_fp32 / (row_l2_norm + eps) * dim
+    return g_fp32.to(g.dtype)
 
 
 # @torch.compile(dynamic=False, fullgraph=True)
 def fused_embed_sqrt(g: torch.Tensor, eps: float):
-    rms_values = torch.sqrt(g.pow(2).sum(dim=-1, keepdim=True))
+    g_fp32 = g.float()
+    row_l2_norm = torch.sqrt(g_fp32.pow(2).sum(dim=-1, keepdim=True))
     dim = g.size(-1)
-    g = g / (rms_values + eps) * (dim**0.5)
-    return g
+    g_fp32 = g_fp32 / (row_l2_norm + eps) * (dim**0.5)
+    return g_fp32.to(g.dtype)
 
 
 # @torch.compile(dynamic=False, fullgraph=True)
 def fused_unembed_linear(g: torch.Tensor, eps: float):
-    rms_values = torch.sqrt(g.pow(2).sum(dim=-1, keepdim=True))
+    g_fp32 = g.float()
+    row_l2_norm = torch.sqrt(g_fp32.pow(2).sum(dim=-1, keepdim=True))
     dim = g.size(-1)
-    g = g / (rms_values + eps) / dim
-    return g
+    g_fp32 = g_fp32 / (row_l2_norm + eps) / dim
+    return g_fp32.to(g.dtype)
 
 
 # @torch.compile(dynamic=False, fullgraph=True)
 def fused_unembed_sqrt(g: torch.Tensor, eps: float):
-    rms_values = torch.sqrt(g.pow(2).sum(dim=-1, keepdim=True))
+    g_fp32 = g.float()
+    row_l2_norm = torch.sqrt(g_fp32.pow(2).sum(dim=-1, keepdim=True))
     dim = g.size(-1)
-    g = g / (rms_values + eps) / (dim**0.5)
-    return g
+    g_fp32 = g_fp32 / (row_l2_norm + eps) / (dim**0.5)
+    return g_fp32.to(g.dtype)
 
 
 # @torch.compile(dynamic=False, fullgraph=True)
@@ -91,15 +95,19 @@ def fused_rmnp_row_norm(g: torch.Tensor, eps: float) -> torch.Tensor:
     # Supports:
     # 2D: [d_out, d_in]
     # 3D: [n_experts, d_out, d_in]
-    ratio = (g.size(-2) / g.size(-1)) ** 0.5
-    return g / g.norm(p=2, dim=-1, keepdim=True).clamp_min(eps) * ratio
+    ratio = (1 / g.size(-1)) ** 0.5
+    g_fp32 = g.float()
+    row_l2_norm = g_fp32.norm(p=2, dim=-1, keepdim=True)
+    g_fp32 = g_fp32 / row_l2_norm.clamp_min(eps) * ratio
+    return g_fp32.to(g.dtype)
 
 
 # @torch.compile(dynamic=False, fullgraph=True)
 def fused_bias_rms(g: torch.Tensor, eps: float):
-    rms_value = torch.sqrt(g.pow(2).mean())
-    g = g / (rms_value + eps)
-    return g
+    g_fp32 = g.float()
+    rms_value = torch.sqrt(g_fp32.pow(2).mean())
+    g_fp32 = g_fp32 / (rms_value + eps)
+    return g_fp32.to(g.dtype)
 
 
 # @torch.compile(dynamic=False, fullgraph=True)
@@ -281,9 +289,9 @@ class AbstractDiSCO(torch.optim.Optimizer):
                 # it only supports for 2D tensors for now.
                 assert splits_dim in [0, 1], "splits_dim must be 0 or 1 for 2D tensors"
                 assert splits_into > 1, "splits_into must be greater than 1"
-                assert g.shape[splits_dim] % splits_into == 0, (
-                    "splits_into must be a divisor of the dimension to split"
-                )
+                assert (
+                    g.shape[splits_dim] % splits_into == 0
+                ), "splits_into must be a divisor of the dimension to split"
                 d_out, d_in = g.shape
                 if splits_dim == 0:
                     # Split rows: [d_out, d_in] -> [Group, d_out/Group, d_in]

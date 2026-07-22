@@ -170,12 +170,50 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     return X.to(original_dtype)
 
 
+@torch.compile(dynamic=False, fullgraph=True)
+def hybrid_polar_express_triton_gate_up(
+    G: Tensor,
+    steps: int = 5,
+    eps: float = 1e-7,
+):
+    dtype = G.dtype
+    G_fp32 = G.float()
+    norm = G_fp32.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-8)
+    G = (G_fp32 / norm).to(dtype)
+    return polar_express_triton(G, steps, eps)
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def hybrid_polar_express_triton_down(
+    G: Tensor,
+    steps: int = 5,
+    eps: float = 1e-7,
+) -> Tensor:
+    # nn.Linear layout: [D_out, D_in]
+    # w2: [D_model, D_ff]
+    # Compute one FP32 norm per input column.
+    original_dtype = G.dtype
+    G_fp32 = G.float()
+
+    column_norm = G_fp32.norm(
+        p=2,
+        dim=0,
+        keepdim=True,
+    ).clamp_min(1e-8)
+
+    G_normalized = (G_fp32 / column_norm).to(original_dtype)
+
+    return polar_express_triton(G_normalized, steps, eps)
+
+
 zeropower_backends = dict(
     svd=zeropower_via_svd,
     newtonschulz5=zeropower_via_newtonschulz5,
     polar_express=zeropower_via_polar_express,
     newtonschulz5_triton=newton_schulz_triton,
     polar_express_triton=polar_express_triton,
+    hybrid_polar_express_triton_gate_up=hybrid_polar_express_triton_gate_up,
+    hybrid_polar_express_triton_down=hybrid_polar_express_triton_down,
     identity=lambda x, **kwargs: x,
 )
 

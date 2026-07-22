@@ -284,7 +284,7 @@ class OPTMoEModel(Decoder):
             if self.rope_of_swa is not None:
                 self.rope_of_swa = _dc.replace(self.rope_of_swa, max_seq_len=seq_len)
 
-            if self.layer.moe is not None:
+            if self.layer.moe is not None and self.layer.n_dense_layers < self.n_layers:
                 self.layer.moe._debug_force_load_balance = debug.moe_force_load_balance
 
             # Validate per-layer patterns: length and character set are checked by
