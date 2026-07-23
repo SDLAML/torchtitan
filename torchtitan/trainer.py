@@ -212,9 +212,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         torch._C._log_api_usage_once("torchtitan.train")
 
         self.config = config
-        assert config.model_spec is not None, (
-            "model_spec must be set before creating Trainer"
-        )
+        assert (
+            config.model_spec is not None
+        ), "model_spec must be set before creating Trainer"
         model_spec = config.model_spec
 
         device_module, device_type = utils.device_module, utils.device_type
@@ -792,7 +792,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             # token count. Count from the actual CPU microbatches to avoid any
             # communication while staying robust to shape drift.
             local_valid_tokens = 0
-            
+
             for _microbatch in range(self.gradient_accumulation_steps):
                 input_dict, labels = next(data_iterator)
                 local_valid_tokens += labels.numel()
@@ -869,11 +869,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.checkpointer.maybe_wait_for_staging()
 
         # Here we let the optimizer know that we need to calculate the
-        # norm at the next step
-        need_to_calculate_norm = (
-            self.config.metrics.log_norm_freq > 0
-            and self.metrics_processor.should_log(self.step)
-            and (self.step == 1 or self.step % self.config.metrics.log_norm_freq == 0)
+        # norm at the next step. Also always do it on the very last training
+        # step (even if it doesn't land on a log_norm_freq/log_freq boundary)
+        # so we get a final snapshot of the spectrum/norms at the end of
+        # training rather than possibly missing it entirely.
+        is_last_training_step = self.step == self.config.training.steps
+        need_to_calculate_norm = self.config.metrics.log_norm_freq > 0 and (
+            is_last_training_step
+            or (
+                self.metrics_processor.should_log(self.step)
+                and (
+                    self.step == 1 or self.step % self.config.metrics.log_norm_freq == 0
+                )
+            )
         )
         if need_to_calculate_norm:
             self.optimizers.calculate_norm_at_next_step()
@@ -890,7 +898,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         loss = torch.sum(torch.stack(accumulated_losses))
 
         # log metrics
-        if not self.metrics_processor.should_log(self.step):
+        if not (self.metrics_processor.should_log(self.step) or is_last_training_step):
             return
 
         data_mix, data_docs, data_tokens = self.data_mix_scheduler.get_log_dict_at_step(

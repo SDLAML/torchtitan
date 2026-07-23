@@ -93,6 +93,19 @@ def effective_rank(W):
     return torch.exp(-(p * p.log()).sum())
 
 
+@torch.no_grad()
+def effective_rank_squared(W):
+    # Same as `effective_rank`, but the probability distribution is over
+    # squared singular values (spectral "energy", same p_i as the
+    # cumulative spectral energy E(k) = sum_{i<=k} sigma_i^2 / sum_j sigma_j^2
+    # in optimizers/spectrum_logging.py) rather than raw singular values:
+    #   p_i = sigma_i^2 / sum_j sigma_j^2,  r_eff^2 = exp(-sum_i p_i log p_i)
+    S = torch.linalg.svdvals(W.to(torch.float32), driver="gesvd")
+    S_sq = S * S
+    p = (S_sq / (S_sq.sum() + 1e-12)).clamp_min(1e-12)
+    return torch.exp(-(p * p.log()).sum())
+
+
 NORM_FUNCTIONS = {
     "rms_to_rms": rms_to_rms_norm,
     "l1_to_rms": l1_to_rms_norm,
@@ -103,6 +116,7 @@ NORM_FUNCTIONS = {
     "average_entry_size": average_entry_size,
     "stable_rank": stable_rank,
     "effective_rank": effective_rank,
+    "effective_rank_squared": effective_rank_squared,
 }
 
 
@@ -113,7 +127,7 @@ NORM_FUNCTIONS = {
 def fused_metrics(W, eps=1e-20):
     if W.ndim < 2:
         # Operator norms require a matrix.
-        return {"supremum": W.abs().max()}
+        return {"supremum": W.abs().max(), "spectrum": W.abs()}
 
     Wf = W.float()
     Wf_square = Wf * Wf
@@ -145,6 +159,10 @@ def fused_metrics(W, eps=1e-20):
     p = (S / (S.sum() + eps)).clamp_min(eps)
     erank = torch.exp(-(p * p.log()).sum())
 
+    S_sq = S * S
+    p_sq = (S_sq / (S_sq.sum() + eps)).clamp_min(eps)
+    erank_sq = torch.exp(-(p_sq * p_sq.log()).sum())
+
     avg_entry = frob_norm / math.sqrt(fan_out * fan_in)
 
     return {
@@ -157,6 +175,8 @@ def fused_metrics(W, eps=1e-20):
         "average_entry_size": avg_entry,
         "stable_rank": srank,
         "effective_rank": erank,
+        "effective_rank_squared": erank_sq,
+        "spectrum": S,
     }
 
 
@@ -224,9 +244,15 @@ def calculate_norm(
     if transpose:
         W = W.transpose(0, 1)
     if use_fused_metrics:
-        norms = fused_metrics(W)
-        norms = {norm_name: norms[norm_name] for norm_name in norms_to_log}
+        all_norms = fused_metrics(W)
+        norms = {norm_name: all_norms[norm_name] for norm_name in norms_to_log}
+        norms["spectrum"] = all_norms["spectrum"]
     else:
         norms = {norm_name: NORM_FUNCTIONS[norm_name](W) for norm_name in norms_to_log}
+        norms["spectrum"] = (
+            torch.linalg.svdvals(W.to(torch.float32), driver="gesvd")
+            if W.ndim >= 2
+            else W.abs()
+        )
 
     return norms

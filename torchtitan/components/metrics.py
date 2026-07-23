@@ -123,6 +123,14 @@ class TensorBoardLogger(BaseLogger):
     def log(self, metrics: dict[str, Any], step: int) -> None:
         for k, v in metrics.items():
             tag = k if self.tag is None else f"{self.tag}/{k}"
+            if not isinstance(v, (int, float, torch.Tensor)):
+                # optimizers/spectrum_logging.py's process_norms_for_logging
+                # (called from OptimizersContainer.get_parameter_norms())
+                # builds wandb-specific objects (wandb.Image/wandb.Histogram)
+                # for spectrum entries, since this codebase only logs to
+                # W&B. TensorBoard has no use for those — skip rather than
+                # crash on a type it can't pass to add_scalar.
+                continue
             self.writer.add_scalar(tag, v, step)
 
     def close(self) -> None:
@@ -172,10 +180,16 @@ class WandBLogger(BaseLogger):
         logger.info("WandB logging enabled")
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
-        wandb_metrics = {
-            (k if self.tag is None else f"{self.tag}/{k}"): v
-            for k, v in metrics.items()
-        }
+        # Spectrum entries arrive already as wandb.Image/wandb.Histogram
+        # objects — see optimizers/spectrum_logging.py's
+        # process_norms_for_logging(), called from
+        # OptimizersContainer.get_parameter_norms() — so every value here
+        # is already exactly what wandb.log() expects, no dispatch needed.
+        wandb_metrics = (
+            metrics
+            if self.tag is None
+            else {f"{self.tag}/{k}": v for k, v in metrics.items()}
+        )
         self.wandb.log(wandb_metrics, step=step)
 
     def close(self) -> None:

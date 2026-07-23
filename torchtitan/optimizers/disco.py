@@ -597,6 +597,17 @@ class DiSCO(AbstractDiSCO):
         # Persistent workspace: created on first step, reused every subsequent step.
         self._fsdp_once_workspace_cache: dict[str, object] | None = None
 
+        # Static per-parameter singular-value spectrum length/offset tables (see
+        # below for how these are populated when fsdp_params is non-empty). Must
+        # be initialized here too so referencing them is always safe even when
+        # this rank has no FSDP-sharded params.
+        self._fsdp_spectrum_len_by_param: list[int] = []
+        self._fsdp_rank_owned_param_indices: list[list[int]] = []
+        self._fsdp_spectrum_offsets_by_rank: list[list[int]] = []
+        self._fsdp_spectrum_total_by_rank: list[int] = []
+        self._fsdp_spectrum_max_total: int = 0
+        self._fsdp_spectrum_offsets: list[int] = []
+
         if not self.fsdp_params:
             return
 
@@ -610,6 +621,48 @@ class DiSCO(AbstractDiSCO):
 
         total_buckets = math.ceil(len(self.fsdp_params) / world_size)
         self._fsdp_total_buckets = total_buckets
+
+        # Static per-parameter singular-value spectrum length. `self.fsdp_params[i]`
+        # is a DTensor/Parameter, so `.shape` is the *global* logical shape — the
+        # a2a reconstruction in step_fsdp gives the owning rank the full (unsharded)
+        # tensor for its owned param, so the global shape is what norm/spectrum
+        # calculation actually sees. Known at init time from shapes alone, never
+        # from data, so every rank can compute this table for every other rank's
+        # owned params too (needed to pad every rank's flat spectrum buffer to the
+        # same total size, as required by `funcol.all_gather_tensor`).
+        def _fsdp_spectrum_len(p) -> int:
+            shape = tuple(p.shape)
+            if len(shape) == 1:
+                return max(int(shape[0]), 1)
+            return min(int(shape[-2]), int(shape[-1]))
+
+        self._fsdp_spectrum_len_by_param: list[int] = [
+            _fsdp_spectrum_len(p) for p in self.fsdp_params
+        ]
+        self._fsdp_rank_owned_param_indices: list[list[int]] = [
+            [i for i in range(len(self.fsdp_params)) if i % world_size == r]
+            for r in range(world_size)
+        ]
+        self._fsdp_spectrum_offsets_by_rank: list[list[int]] = []
+        self._fsdp_spectrum_total_by_rank: list[int] = []
+        for r in range(world_size):
+            offsets: list[int] = []
+            running = 0
+            for i in self._fsdp_rank_owned_param_indices[r]:
+                offsets.append(running)
+                running += self._fsdp_spectrum_len_by_param[i]
+            self._fsdp_spectrum_offsets_by_rank.append(offsets)
+            self._fsdp_spectrum_total_by_rank.append(running)
+        self._fsdp_spectrum_max_total = (
+            max(self._fsdp_spectrum_total_by_rank)
+            if self._fsdp_spectrum_total_by_rank
+            else 0
+        )
+        self._fsdp_spectrum_offsets = (
+            self._fsdp_spectrum_offsets_by_rank[rank]
+            if rank < len(self._fsdp_spectrum_offsets_by_rank)
+            else []
+        )
 
         for bucket_idx in range(total_buckets):
             start_idx = bucket_idx * world_size
@@ -895,6 +948,16 @@ class DiSCO(AbstractDiSCO):
         self._expert_ep_per_rank: int = 0
         self._expert_kinds_of_norms: int = 0
         self._expert_transpose: bool = False
+        # Static per-block singular-value spectrum length (min(A, B) of the local
+        # per-expert matrix); uniform within a block since blocks group same-shape
+        # experts. Known at init time from shapes alone, never from data.
+        self._expert_spectrum_len_per_block: list[int] = []
+        # Static offset of each block's spectrum values within the single flat
+        # per-rank spectrum buffer (unlike fsdp/ddp, every rank contributes the
+        # same shape per block — ep_per_rank is uniform across ranks — so no
+        # pad-to-max-per-rank scheme is needed here, just one static layout).
+        self._expert_spectrum_block_offset: list[int] = []
+        self._expert_spectrum_total_size: int = 0
         self._expert_kwargs_per_block: list[dict | None] = []
         self._expert_block_group_idx: list[int | None] = []
         self._expert_big_g_specs: list[
@@ -973,11 +1036,25 @@ class DiSCO(AbstractDiSCO):
                         loc.device,
                     )
                 )
+                self._expert_spectrum_len_per_block.append(
+                    min(int(loc.shape[1]), int(loc.shape[2]))
+                )
             else:
                 kwargs = None
                 self._expert_block_group_idx.append(None)
                 self._expert_big_g_specs.append(None)
+                self._expert_spectrum_len_per_block.append(0)
             self._expert_kwargs_per_block.append(kwargs)
+
+        running = 0
+        for block_idx, (start, end) in enumerate(self._expert_blocks):
+            self._expert_spectrum_block_offset.append(running)
+            running += (
+                (end - start)
+                * ep_per_rank
+                * self._expert_spectrum_len_per_block[block_idx]
+            )
+        self._expert_spectrum_total_size = running
 
         # Precompute expert update apply plan (grouped by group/device/dtype).
         update_buckets: dict[
@@ -1036,6 +1113,14 @@ class DiSCO(AbstractDiSCO):
         self._ddp_owner_rank_by_param: list[int] = []
         self._ddp_owner_bucket_by_param: list[int] = []
         self._ddp_clean_param_names: list[str] = []
+        # Static per-parameter singular-value spectrum length/offset tables (see
+        # below for how these are populated when ddp_params is non-empty). Must
+        # be initialized here too so referencing them is always safe even when
+        # this rank has no DDP-replicated params.
+        self._ddp_spectrum_len_by_param: list[int] = []
+        self._ddp_spectrum_offsets_by_rank: list[list[int]] = []
+        self._ddp_spectrum_total_by_rank: list[int] = []
+        self._ddp_spectrum_max_total: int = 0
         self._ddp_update_plan: list[
             tuple[
                 int,
@@ -1180,6 +1265,40 @@ class DiSCO(AbstractDiSCO):
         self._ddp_clean_param_names = [
             remove_orig_mod_and_weight_for_p_name(pn) for pn in self.ddp_param_names
         ]
+
+        # Static per-parameter singular-value spectrum length (min(fan_in, fan_out), or
+        # the diag-embedded length for 1-D params). Known at init time from shapes
+        # alone, never from data, so every rank can compute this table for every
+        # other rank's owned params too (needed to pad every rank's flat spectrum
+        # buffer to the same total size, as required by `funcol.all_gather_tensor`).
+        def _ddp_spectrum_len(p) -> int:
+            shape = tuple(p.shape)
+            if len(shape) == 1:
+                return max(int(shape[0]), 1)
+            return min(int(shape[0]), int(shape[1]))
+
+        self._ddp_spectrum_len_by_param: list[int] = [
+            _ddp_spectrum_len(p) for p in self.ddp_params
+        ]
+        # Per rank, the list of owned param indices is already in increasing
+        # owner-bucket order (`_ddp_rank_owned_param_indices[r][pos]` has
+        # owner_bucket == pos), so a running cumulative sum gives each owned
+        # param's start offset within that rank's flat spectrum buffer.
+        self._ddp_spectrum_offsets_by_rank: list[list[int]] = []
+        self._ddp_spectrum_total_by_rank: list[int] = []
+        for r in range(world_size):
+            offsets: list[int] = []
+            running = 0
+            for i in self._ddp_rank_owned_param_indices[r]:
+                offsets.append(running)
+                running += self._ddp_spectrum_len_by_param[i]
+            self._ddp_spectrum_offsets_by_rank.append(offsets)
+            self._ddp_spectrum_total_by_rank.append(running)
+        self._ddp_spectrum_max_total = (
+            max(self._ddp_spectrum_total_by_rank)
+            if self._ddp_spectrum_total_by_rank
+            else 0
+        )
         self._ddp_update_plan = [
             (
                 group_idx,
@@ -2461,6 +2580,7 @@ class DiSCO(AbstractDiSCO):
                 upd_norms = calculate_norm(scratch, self.norms_to_log, transpose=need_T)
             else:
                 upd_norms = calculate_norm(-lr * u, self.norms_to_log, transpose=need_T)
+            upd_spectrum = upd_norms.pop("spectrum")
 
             # Gather the parameter itself to a full tensor if needed
             if apply_on_weight and isinstance(p, DTensor):
@@ -2468,6 +2588,7 @@ class DiSCO(AbstractDiSCO):
 
             if apply_on_weight:
                 wnorm = calculate_norm(p, self.norms_to_log, transpose=need_T)
+                w_spectrum = wnorm.pop("spectrum")
 
             cleaned_p_name = remove_orig_mod_and_weight_for_p_name(p_name)
             for norm_name in self.norms_to_log:
@@ -2478,6 +2599,12 @@ class DiSCO(AbstractDiSCO):
                     final_norms[f"track_param_{norm_name}/{cleaned_p_name}"] = wnorm[
                         norm_name
                     ]
+            # This path already operates on fully-materialized local tensors
+            # (no FSDP/EP sharding survives to this point), so the spectrum is
+            # already complete locally — no extra collective is needed.
+            final_norms[f"track_spectrum_update/{cleaned_p_name}"] = upd_spectrum
+            if apply_on_weight:
+                final_norms[f"track_spectrum_param/{cleaned_p_name}"] = w_spectrum
 
         if self.is_dp_rank_0:
             self.norms_at_current_step.update(final_norms)
@@ -2552,12 +2679,36 @@ class DiSCO(AbstractDiSCO):
                 big_u = self.lmo(big_g, **kwargs0, transpose_experts=transpose)
             all_updates[start:end] = big_u.view(K, ep_per_rank, *big_u.shape[1:])
 
+        # Singular-value spectrum: one flat per-rank buffer covering ALL blocks
+        # (static offsets precomputed in _precompute_experts_metadata), pre-zeroed
+        # so skipped/padding slots are correct for free. Every rank contributes the
+        # same shape here (ep_per_rank is uniform across ranks, unlike fsdp/ddp's
+        # diagonal ownership), so this can be gathered with a single collective
+        # together with the scalar norms below — no pad-to-max scheme needed.
+        update_spectrum_flat = (
+            torch.zeros(
+                self._expert_spectrum_total_size, dtype=torch.float32, device=device
+            )
+            if need_to_calculate_norm and self._expert_spectrum_total_size > 0
+            else None
+        )
+        weight_spectrum_flat = (
+            torch.zeros(
+                self._expert_spectrum_total_size, dtype=torch.float32, device=device
+            )
+            if update_spectrum_flat is not None and apply_on_weight
+            else None
+        )
+
         if need_to_calculate_norm:
             for block_idx, (start, end) in enumerate(blocks):
                 block_params = expert_params[start:end]
                 block_updates = all_updates[start:end]
                 if not block_params or not block_updates:
                     continue
+                block_base = self._expert_spectrum_block_offset[block_idx]
+                K_block = self._expert_spectrum_len_per_block[block_idx]
+                local_pos = 0
                 for p, u in zip(block_params, block_updates):
                     if u is None:
                         continue
@@ -2567,7 +2718,11 @@ class DiSCO(AbstractDiSCO):
                         update_norms = calculate_norm(
                             u[ep_idx], self.norms_to_log, transpose=transpose
                         )
+                        upd_spec = update_norms.pop("spectrum")
                         norms_of_update.extend(update_norms.values())
+                        if update_spectrum_flat is not None:
+                            off = block_base + local_pos * K_block
+                            update_spectrum_flat[off : off + K_block].copy_(upd_spec)
 
                         if apply_on_weight:
                             weight_norms = calculate_norm(
@@ -2575,7 +2730,12 @@ class DiSCO(AbstractDiSCO):
                                 self.norms_to_log,
                                 transpose=transpose,
                             )
+                            w_spec = weight_norms.pop("spectrum")
                             norms_of_weight.extend(weight_norms.values())
+                            if weight_spectrum_flat is not None:
+                                off = block_base + local_pos * K_block
+                                weight_spectrum_flat[off : off + K_block].copy_(w_spec)
+                        local_pos += 1
 
         if not skip_update:
             if any(u is not None for u in all_updates):
@@ -2589,19 +2749,24 @@ class DiSCO(AbstractDiSCO):
                 if apply_on_weight:  # keep weight-norms aligned
                     norms_of_weight.extend([padding_norms] * pad_needed)
 
-            norms_tensor = torch.stack(norms_of_update).float().to(device)
-            gathered_update_norms = funcol.all_gather_tensor(
-                norms_tensor, gather_dim=0, group=fsdp_mesh
-            )
-
+            # Single flat per-rank buffer: [scalar update norms, scalar weight
+            # norms, spectrum update, spectrum weight] — one collective for
+            # everything in this step, instead of a separate all_gather per
+            # block/kind (scalar norms and both spectrum halves are all fully
+            # computed above with no ordering dependency between them).
+            local_parts = [torch.stack(norms_of_update).float().to(device)]
             if apply_on_weight:
-                norms_tensor = torch.stack(norms_of_weight).float().to(device)
-                # TODO: This barrier may be removable because the subsequent
-                # all_gather_tensor is a collective synchronization point.
-                dist.barrier()
-                gathered_weight_norms = funcol.all_gather_tensor(
-                    norms_tensor, gather_dim=0, group=fsdp_mesh
-                )
+                local_parts.append(torch.stack(norms_of_weight).float().to(device))
+            if update_spectrum_flat is not None:
+                local_parts.append(update_spectrum_flat)
+                if weight_spectrum_flat is not None:
+                    local_parts.append(weight_spectrum_flat)
+
+            local_buf = torch.cat(local_parts)
+            gathered = funcol.all_gather_tensor(
+                local_buf, gather_dim=0, group=fsdp_mesh
+            )
+            per_rank_total = local_buf.numel()
 
             if local_rank == 0:
                 norm_names = list(self.norms_to_log)
@@ -2609,12 +2774,15 @@ class DiSCO(AbstractDiSCO):
                 P = len(expert_params)  # parameters per rank
                 E = ep_per_rank  # experts per rank
                 K = kinds_of_norms  # norms per expert
-                block = P * E * K  # values contributed by each rank
+                block = P * E * K  # == expected_total
+
+                weight_scalar_offset = expected_total if apply_on_weight else None
+                spectrum_offset = expected_total * (2 if apply_on_weight else 1)
 
                 for idx in range(world_size * block):
                     r, rem = divmod(idx, block)  # producing rank
-                    p, rem = divmod(rem, E * K)  # parameter index
-                    e, k = divmod(rem, K)  # expert, norm indices
+                    p, rem2 = divmod(rem, E * K)  # parameter index
+                    e, k = divmod(rem2, K)  # expert, norm indices
 
                     actual_ep_idx = e + r * E
                     if actual_ep_idx >= expert_params[0].shape[0]:
@@ -2624,17 +2792,52 @@ class DiSCO(AbstractDiSCO):
                         expert_param_names[p]
                     )
                     norm_name = norm_names[k]
+                    rank_base = r * per_rank_total
 
                     key_update = (
                         f"track_update_{norm_name}/ep_{actual_ep_idx}/{cleaned_name}"
                     )
-                    final_norms[key_update] = gathered_update_norms[idx]
+                    final_norms[key_update] = gathered[rank_base + rem]
 
                     if apply_on_weight:
                         key_param = (
                             f"track_param_{norm_name}/ep_{actual_ep_idx}/{cleaned_name}"
                         )
-                        final_norms[key_param] = gathered_weight_norms[idx]
+                        final_norms[key_param] = gathered[
+                            rank_base + weight_scalar_offset + rem
+                        ]
+
+                if update_spectrum_flat is not None:
+                    for block_idx, (start, end) in enumerate(blocks):
+                        K_block = self._expert_spectrum_len_per_block[block_idx]
+                        if K_block == 0:
+                            continue
+                        block_base = self._expert_spectrum_block_offset[block_idx]
+                        block_names = expert_param_names[start:end]
+                        P_block = end - start
+                        expected_block = P_block * ep_per_rank
+
+                        for bidx in range(world_size * expected_block):
+                            r, rem = divmod(bidx, expected_block)
+                            p_idx, e = divmod(rem, ep_per_rank)
+                            actual_ep_idx = e + r * ep_per_rank
+                            if actual_ep_idx >= expert_params[0].shape[0]:
+                                continue  # skip pure padding slots
+
+                            cleaned_name = remove_orig_mod_and_weight_for_p_name(
+                                block_names[p_idx]
+                            )
+                            rank_base = r * per_rank_total
+                            local_off = block_base + rem * K_block
+                            spec_start = rank_base + spectrum_offset + local_off
+                            final_norms[
+                                f"track_spectrum_update/ep_{actual_ep_idx}/{cleaned_name}"
+                            ] = gathered[spec_start : spec_start + K_block]
+                            if weight_spectrum_flat is not None:
+                                w_start = spec_start + self._expert_spectrum_total_size
+                                final_norms[
+                                    f"track_spectrum_param/ep_{actual_ep_idx}/{cleaned_name}"
+                                ] = gathered[w_start : w_start + K_block]
 
         if self.is_dp_rank_0:
             self.norms_at_current_step.update(final_norms)
@@ -2787,6 +2990,42 @@ class DiSCO(AbstractDiSCO):
                     workspace["w_norm_local_flat"] = w_norm_local_flat
                 w_norm_local_flat.zero_()
 
+        # Singular-value spectrum: a separate flat buffer padded to the largest
+        # per-rank total across all ranks (`_ddp_spectrum_max_total`), since
+        # different ranks own params of different shapes and therefore different
+        # total spectrum lengths — unlike the fixed-stride scalar norm buffers.
+        upd_spectrum_local_flat = None
+        w_spectrum_local_flat = None
+        rank_spectrum_offsets = (
+            self._ddp_spectrum_offsets_by_rank[rank]
+            if rank < len(self._ddp_spectrum_offsets_by_rank)
+            else []
+        )
+        if need_to_calculate_norm and self._ddp_spectrum_max_total > 0:
+            required_spectrum_elems = self._ddp_spectrum_max_total
+            upd_spectrum_local_flat = workspace.get("upd_spectrum_local_flat")
+            if (
+                upd_spectrum_local_flat is None
+                or upd_spectrum_local_flat.numel() != required_spectrum_elems
+            ):
+                upd_spectrum_local_flat = torch.zeros(
+                    required_spectrum_elems, dtype=torch.float32, device=device
+                )
+                workspace["upd_spectrum_local_flat"] = upd_spectrum_local_flat
+            upd_spectrum_local_flat.zero_()
+
+            if apply_on_weight:
+                w_spectrum_local_flat = workspace.get("w_spectrum_local_flat")
+                if (
+                    w_spectrum_local_flat is None
+                    or w_spectrum_local_flat.numel() != required_spectrum_elems
+                ):
+                    w_spectrum_local_flat = torch.zeros(
+                        required_spectrum_elems, dtype=torch.float32, device=device
+                    )
+                    workspace["w_spectrum_local_flat"] = w_spectrum_local_flat
+                w_spectrum_local_flat.zero_()
+
         # ---- local update norms (owner slots only) ----
         if need_to_calculate_norm and upd_norm_local_flat is not None:
             for my_idx in self._ddp_owned_indices:
@@ -2800,10 +3039,19 @@ class DiSCO(AbstractDiSCO):
                     raise ValueError("Missing DDP norm scratch buffer for owned index.")
                 torch.mul(u, -lr, out=scratch)
                 upd_norms = calculate_norm(scratch, self.norms_to_log)
-                base = self._ddp_owner_bucket_by_param[my_idx] * num_norm_types
+                upd_spectrum = upd_norms.pop("spectrum")
+                owner_bucket = self._ddp_owner_bucket_by_param[my_idx]
+                base = owner_bucket * num_norm_types
                 upd_norm_local_flat[base : base + num_norm_types].copy_(
                     torch.stack(list(upd_norms.values()))
                 )
+                if upd_spectrum_local_flat is not None and owner_bucket < len(
+                    rank_spectrum_offsets
+                ):
+                    off = rank_spectrum_offsets[owner_bucket]
+                    upd_spectrum_local_flat[off : off + upd_spectrum.numel()].copy_(
+                        upd_spectrum
+                    )
 
         # -------- Phase C: apply once (pre-cast + grouped foreach apply) --------
         if not skip_update:
@@ -2829,10 +3077,19 @@ class DiSCO(AbstractDiSCO):
                 elif isinstance(w, DTensor):
                     w = w.to_local()
                 w_norms = calculate_norm(w, self.norms_to_log)
-                base = self._ddp_owner_bucket_by_param[my_idx] * num_norm_types
+                w_spectrum = w_norms.pop("spectrum")
+                owner_bucket = self._ddp_owner_bucket_by_param[my_idx]
+                base = owner_bucket * num_norm_types
                 w_norm_local_flat[base : base + num_norm_types].copy_(
                     torch.stack(list(w_norms.values()))
                 )
+                if w_spectrum_local_flat is not None and owner_bucket < len(
+                    rank_spectrum_offsets
+                ):
+                    off = rank_spectrum_offsets[owner_bucket]
+                    w_spectrum_local_flat[off : off + w_spectrum.numel()].copy_(
+                        w_spectrum
+                    )
 
         # -------- Phase D: final norm gather/log --------
         if not need_to_calculate_norm:
@@ -2858,6 +3115,24 @@ class DiSCO(AbstractDiSCO):
                 gathered_w = w
         else:
             gathered_w = None
+
+        gathered_upd_spectrum = None
+        gathered_w_spectrum = None
+        if upd_spectrum_local_flat is not None:
+            if dp_replicate_mesh is not None and world_size > 1:
+                gathered_upd_spectrum = funcol.all_gather_tensor(
+                    upd_spectrum_local_flat, gather_dim=0, group=dp_replicate_mesh
+                )
+            else:
+                gathered_upd_spectrum = upd_spectrum_local_flat
+
+            if apply_on_weight and w_spectrum_local_flat is not None:
+                if dp_replicate_mesh is not None and world_size > 1:
+                    gathered_w_spectrum = funcol.all_gather_tensor(
+                        w_spectrum_local_flat, gather_dim=0, group=dp_replicate_mesh
+                    )
+                else:
+                    gathered_w_spectrum = w_spectrum_local_flat
 
         if self.is_dp_rank_0:
             cleaned_names = (
@@ -2891,6 +3166,33 @@ class DiSCO(AbstractDiSCO):
                         final_norms[f"track_param_{norm_name}/{cleaned}"] = gathered_w[
                             idx
                         ]
+
+            if gathered_upd_spectrum is not None:
+                spectrum_lens = (
+                    self._ddp_spectrum_len_by_param
+                    if len(self._ddp_spectrum_len_by_param) == len(ddp_param_names)
+                    else None
+                )
+                spectrum_offsets_by_rank = self._ddp_spectrum_offsets_by_rank
+                if spectrum_lens is not None:
+                    for param_idx, cleaned in enumerate(cleaned_names):
+                        owner_rank = owner_ranks[param_idx]
+                        owner_bucket = owner_buckets[param_idx]
+                        if owner_rank >= len(spectrum_offsets_by_rank):
+                            continue
+                        rank_offsets = spectrum_offsets_by_rank[owner_rank]
+                        if owner_bucket >= len(rank_offsets):
+                            continue
+                        length = spectrum_lens[param_idx]
+                        chunk_start = owner_rank * self._ddp_spectrum_max_total
+                        start = chunk_start + rank_offsets[owner_bucket]
+                        final_norms[
+                            f"track_spectrum_update/{cleaned}"
+                        ] = gathered_upd_spectrum[start : start + length]
+                        if apply_on_weight and gathered_w_spectrum is not None:
+                            final_norms[
+                                f"track_spectrum_param/{cleaned}"
+                            ] = gathered_w_spectrum[start : start + length]
 
         if self.is_dp_rank_0:
             self.norms_at_current_step.update(final_norms)
@@ -2952,6 +3254,58 @@ class DiSCO(AbstractDiSCO):
         if self.is_dp_rank_0:
             self.norms_at_current_step.update(final_norms)
 
+    def _gather_and_log_fsdp_spectrum(
+        self,
+        upd_spectrum_local_flat,
+        w_spectrum_local_flat,
+        fsdp_mesh,
+        fsdp_param_names,
+        apply_on_weight,
+    ):
+        """
+        Gathers raw singular-value spectra from all ranks and logs them on rank 0.
+
+        Unlike `_gather_and_log_fsdp_norms`, per-param length varies (it's
+        min(fan_in, fan_out), not a fixed stride), so each rank's local buffer is
+        padded to `_fsdp_spectrum_max_total` (the largest per-rank total across all
+        ranks, precomputed once in `_precompute_fsdp_metadata`) rather than to a
+        uniform per-param stride.
+        """
+        gathered_upd = funcol.all_gather_tensor(
+            upd_spectrum_local_flat, gather_dim=0, group=fsdp_mesh
+        )
+        gathered_w = None
+        if apply_on_weight and w_spectrum_local_flat is not None:
+            gathered_w = funcol.all_gather_tensor(
+                w_spectrum_local_flat, gather_dim=0, group=fsdp_mesh
+            )
+
+        final_norms = {}
+        if self.is_dp_rank_0:
+            world_size = len(self._fsdp_spectrum_offsets_by_rank)
+            cleaned_names = [
+                remove_orig_mod_and_weight_for_p_name(pn) for pn in fsdp_param_names
+            ]
+            for param_idx, cleaned_p_name in enumerate(cleaned_names):
+                owner_rank = param_idx % world_size
+                owner_bucket = param_idx // world_size
+                rank_offsets = self._fsdp_spectrum_offsets_by_rank[owner_rank]
+                if owner_bucket >= len(rank_offsets):
+                    continue
+                length = self._fsdp_spectrum_len_by_param[param_idx]
+                chunk_start = owner_rank * self._fsdp_spectrum_max_total
+                start = chunk_start + rank_offsets[owner_bucket]
+                final_norms[f"track_spectrum_update/{cleaned_p_name}"] = gathered_upd[
+                    start : start + length
+                ]
+                if apply_on_weight and gathered_w is not None:
+                    final_norms[f"track_spectrum_param/{cleaned_p_name}"] = gathered_w[
+                        start : start + length
+                    ]
+
+        if self.is_dp_rank_0:
+            self.norms_at_current_step.update(final_norms)
+
     @record_function("disco.step_fsdp")
     def step_fsdp(
         self,
@@ -2984,6 +3338,21 @@ class DiSCO(AbstractDiSCO):
         global_updates = [None] * len(fsdp_params)
         norms_of_update, norms_of_weight = [], []
         padding_norms = self._get_cached_padding_norms(device)
+
+        # Singular-value spectrum: a separate flat buffer padded to the largest
+        # per-rank total across all ranks (`_fsdp_spectrum_max_total`), since
+        # different ranks own params of different shapes and therefore different
+        # total spectrum lengths — unlike the fixed-stride scalar norm buffers.
+        upd_spectrum_local_flat = None
+        w_spectrum_local_flat = None
+        if need_to_calculate_norm and self._fsdp_spectrum_max_total > 0:
+            upd_spectrum_local_flat = torch.zeros(
+                self._fsdp_spectrum_max_total, dtype=torch.float32, device=device
+            )
+            if apply_on_weight:
+                w_spectrum_local_flat = torch.zeros(
+                    self._fsdp_spectrum_max_total, dtype=torch.float32, device=device
+                )
 
         # Use pre-computed total_buckets from init.
         total_buckets = self._fsdp_total_buckets
@@ -3052,9 +3421,16 @@ class DiSCO(AbstractDiSCO):
 
                     if need_to_calculate_norm and my_param_in_bucket:
                         lr, *_ = self.groups_info[bucket_group_indices[rank]]
-                        bucket_norm_dicts[bucket_idx] = calculate_norm(
-                            -lr * u, self.norms_to_log
-                        )
+                        d = calculate_norm(-lr * u, self.norms_to_log)
+                        spec = d.pop("spectrum")
+                        bucket_norm_dicts[bucket_idx] = d
+                        if upd_spectrum_local_flat is not None and bucket_idx < len(
+                            self._fsdp_spectrum_offsets
+                        ):
+                            off = self._fsdp_spectrum_offsets[bucket_idx]
+                            upd_spectrum_local_flat[off : off + spec.numel()].copy_(
+                                spec
+                            )
 
             if need_to_calculate_norm:
                 for b in range(total_buckets):
@@ -3197,6 +3573,14 @@ class DiSCO(AbstractDiSCO):
                     if my_param_in_bucket:
                         lr, *_ = self.groups_info[bucket_group_indices[rank]]
                         upd_norms = calculate_norm(-lr * u, self.norms_to_log)
+                        spec = upd_norms.pop("spectrum")
+                        if upd_spectrum_local_flat is not None and bucket_idx < len(
+                            self._fsdp_spectrum_offsets
+                        ):
+                            off = self._fsdp_spectrum_offsets[bucket_idx]
+                            upd_spectrum_local_flat[off : off + spec.numel()].copy_(
+                                spec
+                            )
                     else:
                         upd_norms = padding_norms
                     norms_of_update.extend(upd_norms.values())
@@ -3271,12 +3655,26 @@ class DiSCO(AbstractDiSCO):
                 ]
                 full_weight = torch.cat(recv_views, dim=0)
 
-                w_norms = (
-                    calculate_norm(full_weight, self.norms_to_log)
-                    if my_param_in_bucket
-                    else padding_norms
-                )
+                if my_param_in_bucket:
+                    w_norms = calculate_norm(full_weight, self.norms_to_log)
+                    w_spec = w_norms.pop("spectrum")
+                    if w_spectrum_local_flat is not None and bucket_idx < len(
+                        self._fsdp_spectrum_offsets
+                    ):
+                        off = self._fsdp_spectrum_offsets[bucket_idx]
+                        w_spectrum_local_flat[off : off + w_spec.numel()].copy_(w_spec)
+                else:
+                    w_norms = padding_norms
                 norms_of_weight.extend(w_norms.values())
+
+        if need_to_calculate_norm and upd_spectrum_local_flat is not None:
+            self._gather_and_log_fsdp_spectrum(
+                upd_spectrum_local_flat,
+                w_spectrum_local_flat,
+                fsdp_mesh,
+                fsdp_param_names,
+                apply_on_weight,
+            )
 
         if need_to_calculate_norm and norms_of_update:
             self._gather_and_log_fsdp_norms(

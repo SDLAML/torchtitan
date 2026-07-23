@@ -31,6 +31,7 @@ from torchtitan.optimizers import (
     create_disco_param_groups,
     DiSCO,
 )
+from torchtitan.optimizers.spectrum_logging import process_norms_for_logging
 from torchtitan.tools.logging import logger
 
 __all__ = [
@@ -284,7 +285,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
                 # all_norms.update(
                 #     naive_param_norm.get_parameter_norms([model_part], [optimizer])
                 # )
-        return all_norms
+        return process_norms_for_logging(all_norms)
 
     def get_lrs(self):
         lrs = {}
