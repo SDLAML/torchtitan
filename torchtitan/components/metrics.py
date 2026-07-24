@@ -593,13 +593,13 @@ class MetricsProcessor(Configurable):
         metrics = {
             "loss_metrics/global_avg_loss": global_avg_loss,
             "loss_metrics/global_max_loss": global_max_loss,
-            "grad_norm": grad_norm,
-            "throughput(tps)": tps,
-            "tflops": tflops,
-            "mfu(%)": mfu,
-            "iso_throughput(tps)": iso_tps,
-            "iso_tflops": iso_tflops,
-            "iso_mfu(%)": iso_mfu,
+            "training_metrics/grad_norm": grad_norm,
+            "training_metrics/throughput(tps)": tps,
+            "training_metrics/tflops": tflops,
+            "training_metrics/mfu(%)": mfu,
+            "training_metrics/iso_throughput(tps)": iso_tps,
+            "training_metrics/iso_tflops": iso_tflops,
+            "training_metrics/iso_mfu(%)": iso_mfu,
             "time_metrics/end_to_end(s)": time_end_to_end,
             "time_metrics/data_loading(s)": time_data_loading,
             "time_metrics/data_loading(%)": time_data_loading_pct,
@@ -618,7 +618,7 @@ class MetricsProcessor(Configurable):
         }
 
         if grad_norm is None:
-            del metrics["grad_norm"]
+            del metrics["training_metrics/grad_norm"]
             grad_norm_str = ""
         else:
             grad_norm_str = f"{self.color.orange}grad_norm: {grad_norm:7.4f}  "
@@ -651,19 +651,36 @@ class MetricsProcessor(Configurable):
         self.device_memory_monitor.reset_peak_stats()
 
     def log_validation(
-        self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
+        self,
+        loss: float,
+        step: int,
+        ntokens: int | None = None,
+        elapsed_time: float | None = None,
+        extra_metrics: dict[str, Any] | None = None,
     ):
-        time_delta = time.perf_counter() - self.time_last_log
+        # ntokens/elapsed_time are optional so callers that don't track their
+        # own validation-only counters (e.g. flux's validator) keep reading
+        # the shared training counters, same as before this became overridable.
+        used_shared_counter = ntokens is None
+        if ntokens is None:
+            ntokens = self.ntokens_since_last_log
+        if elapsed_time is None:
+            elapsed_time = time.perf_counter() - self.time_last_log
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
         # tokens per second per device, abbreviated as tps
-        tps = self.ntokens_since_last_log / (
-            time_delta * self.parallel_dims.non_data_parallel_size
+        tps = (
+            ntokens / (elapsed_time * self.parallel_dims.non_data_parallel_size)
+            if elapsed_time > 0
+            else 0.0
         )
 
         metrics = {
-            "validation_metrics/loss": loss,
+            # Under loss_metrics/ (not validation_metrics/) so it lands on
+            # the same wandb/tensorboard chart as loss_metrics/global_avg_loss
+            # (train), letting train and val loss curves overlay directly.
+            "loss_metrics/val_loss": loss,
             "validation_metrics/throughput(tps)": tps,
             "validation_metrics/memory/max_active(GiB)": device_mem_stats.max_active_gib,
             "validation_metrics/memory/max_active(%)": device_mem_stats.max_active_pct,
@@ -685,7 +702,11 @@ class MetricsProcessor(Configurable):
             f"{color.blue}tps: {round(tps):,}{color.reset}"
         )
 
-        self.ntokens_since_last_log = 0
+        # Only clear the shared counter if we actually consumed it above;
+        # callers that pass their own ntokens never touched it, so training's
+        # own accounting must keep accruing across the validation pause.
+        if used_shared_counter:
+            self.ntokens_since_last_log = 0
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
 

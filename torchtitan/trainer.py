@@ -558,6 +558,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 pp_schedule=pp_schedule,
                 pp_has_first_stage=pp_has_first_stage,
                 pp_has_last_stage=pp_has_last_stage,
+                enable_token_mask_for_moe=config.training.enable_token_mask_for_moe,
+                seed=config.debug.seed,
             )
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -996,10 +998,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             else 1.0
         )
         extra_metrics = {
-            "n_tokens_seen": global_ntokens_seen,
-            "lr": lr,
-            "valid_token_fraction": valid_token_fraction,
-            "padding_fraction": 1.0 - valid_token_fraction,
+            "training_metrics/n_tokens_seen": global_ntokens_seen,
+            "training_metrics/lr": lr,
+            "training_metrics/valid_token_fraction": valid_token_fraction,
+            "training_metrics/padding_fraction": 1.0 - valid_token_fraction,
         }
         extra_metrics.update(self.optimizers.get_lrs())
         extra_metrics.update(data_mix)
@@ -1066,7 +1068,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
                 # Run validation if validator is available
                 if self.config.validator.enable and self.validator.should_validate(
-                    self.step
+                    self.step, total_steps=config.training.steps
                 ):
                     self.validator.validate(self.model_parts, self.step)
 

@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
@@ -43,8 +44,19 @@ class BaseValidator(Configurable):
     def validate(self, model_parts: list[nn.Module], step: int) -> None:
         raise NotImplementedError("validate method not implemented")
 
-    def should_validate(self, step: int) -> bool:
-        return step == 1 or step % self.config.freq == 0
+    def should_validate(self, step: int, total_steps: int | None = None) -> bool:
+        # freq<=0 disables periodic validation outright: freq=0 would
+        # otherwise raise ZeroDivisionError on `step % freq`, and freq<0
+        # doesn't error but is misleading -- Python's `%` only cares about
+        # magnitude for the "== 0" check, so e.g. freq=-1 would validate
+        # every step instead of disabling anything.
+        if self.config.freq <= 0:
+            return False
+        return (
+            step == 1
+            or step % self.config.freq == 0
+            or (total_steps is not None and step == total_steps)
+        )
 
 
 class Validator(BaseValidator):
@@ -83,6 +95,13 @@ class Validator(BaseValidator):
             default_factory=lambda: HuggingFaceTextDataLoader.Config(
                 dataset="c4_validation",
                 infinite=False,
+                # Validation should never truncate documents. "best_fit" packs
+                # whole documents into padded sequences (masking pad positions
+                # with IGNORE_INDEX) instead of "greedy"'s concatenate-and-cut
+                # behavior. A small pool keeps this from buffering thousands of
+                # documents before packing/emitting anything.
+                pack_strategy="best_fit",
+                packing_pool_size=64,
             )
         )
         """DataLoader configuration for validation"""
@@ -91,8 +110,6 @@ class Validator(BaseValidator):
             assert (
                 self.steps > 0 or self.steps == -1
             ), "validation steps must be positive or -1"
-
-    validation_dataloader: BaseDataLoader
 
     # TODO: improve the constructor signature
     def __init__(
@@ -113,6 +130,8 @@ class Validator(BaseValidator):
         pp_schedule: _PipelineSchedule | None = None,
         pp_has_first_stage: bool | None = None,
         pp_has_last_stage: bool | None = None,
+        enable_token_mask_for_moe: bool = False,
+        seed: int | None = None,
         **kwargs,
     ):
         super().__init__(config=config)
@@ -120,15 +139,27 @@ class Validator(BaseValidator):
         self.tokenizer = tokenizer
         self.parallel_dims = parallel_dims
         self.loss_fn = loss_fn
+        self.enable_token_mask_for_moe = enable_token_mask_for_moe
+        # Explicit rather than left to the dataloader's own default (which
+        # falls back to seeding packing/mixing RNGs from dp_rank alone). Not
+        # passing this through would still be deterministic per rebuild, but
+        # accidentally so, and decoupled from config.debug.seed like the
+        # training dataloader's seeding is.
+        self.seed = seed
         # pyrefly: ignore [unexpected-keyword]
-        dl_config = replace(config.dataloader, infinite=config.steps != -1)
-        self.validation_dataloader = dl_config.build(
-            dp_world_size=dp_world_size,
-            dp_rank=dp_rank,
-            tokenizer=tokenizer,
-            seq_len=seq_len,
-            local_batch_size=local_batch_size,
-        )
+        # Kept as build kwargs (not built here) so validate() can rebuild a
+        # fresh dataloader every round instead of resuming a single
+        # long-lived iterator. Otherwise each validation round would score a
+        # different slice of data (wherever the previous round's iterator
+        # stopped), making the logged validation loss zig-zag round to round
+        # instead of being comparable. Rebuilding also means best_fit's
+        # packing pool/rng restarts from the same state each time, so every
+        # round evaluates the same fixed set of batches.
+        self.dl_config = replace(config.dataloader, infinite=config.steps != -1)
+        self.dp_world_size = dp_world_size
+        self.dp_rank = dp_rank
+        self.seq_len = seq_len
+        self.local_batch_size = local_batch_size
         self.validation_context = validation_context
         self.maybe_enable_amp = maybe_enable_amp
         self.metrics_processor = metrics_processor
@@ -207,6 +238,11 @@ class Validator(BaseValidator):
                 self.parallelism.context_parallel_load_balancer,
             )
 
+        # Built AFTER CP sharding so its token layout matches the CP-sharded
+        # labels, mirroring Trainer.post_dataloading_process.
+        if self.enable_token_mask_for_moe:
+            extra_kwargs["loss_mask"] = labels != IGNORE_INDEX
+
         return inputs, labels, extra_inputs, extra_kwargs
 
     @torch.no_grad()
@@ -224,23 +260,38 @@ class Validator(BaseValidator):
         accumulated_losses = []
         device_type = utils.device_type
         num_steps = 0
+        val_ntokens = 0
+        val_start = time.perf_counter()
 
-        for input_dict, labels in self.validation_dataloader:
+        # Built fresh every call (rather than once in __init__) so every
+        # validation round scores the same fixed set of batches instead of
+        # resuming wherever the previous round's iterator stopped.
+        validation_dataloader = self.dl_config.build(
+            dp_world_size=self.dp_world_size,
+            dp_rank=self.dp_rank,
+            tokenizer=self.tokenizer,
+            seq_len=self.seq_len,
+            local_batch_size=self.local_batch_size,
+            seed=self.seed,
+        )
+
+        for input_dict, labels in validation_dataloader:
             # pyrefly: ignore [missing-attribute, unsupported-operation]
             if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
 
-            self.metrics_processor.ntokens_since_last_log += labels.numel()
+            val_ntokens += labels.numel()
             for k, v in input_dict.items():
                 input_dict[k] = v.to(device_type)
             labels = labels.to(device_type)
 
-            # Process data (extract inputs, handle attention masks, CP sharding)
-            inputs, labels, extra_inputs, extra_kwargs = self.post_dataloading_process(
-                input_dict, labels, model_parts
-            )
-
-            # Count valid tokens for this batch
+            # Count valid tokens BEFORE post_dataloading_process. With CP
+            # enabled, post_dataloading_process shards labels across CP ranks;
+            # counting after that would make each CP rank count only its own
+            # shard, and the all-reduce below (over the DP-only "batch" mesh)
+            # would never sum those shards back together, undercounting the
+            # true per-batch valid-token total. Counting here mirrors
+            # Trainer.train_step, which also counts before CP sharding.
             local_valid_tokens = torch.tensor(0, dtype=torch.int64, device=device_type)
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
 
@@ -252,6 +303,11 @@ class Validator(BaseValidator):
                 )
             else:
                 global_valid_tokens = local_valid_tokens.float()
+
+            # Process data (extract inputs, handle attention masks, CP sharding)
+            inputs, labels, extra_inputs, extra_kwargs = self.post_dataloading_process(
+                input_dict, labels, model_parts
+            )
 
             if parallel_dims.pp_enabled:
                 assert self.pp_schedule is not None
@@ -307,7 +363,12 @@ class Validator(BaseValidator):
         else:
             global_avg_loss = loss.item()
 
-        self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
+        self.metrics_processor.log_validation(
+            loss=global_avg_loss,
+            step=step,
+            ntokens=val_ntokens,
+            elapsed_time=time.perf_counter() - val_start,
+        )
 
         # Set model back to train mode
         for model in model_parts:
