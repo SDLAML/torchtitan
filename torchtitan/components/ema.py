@@ -68,8 +68,9 @@ class EMAOptimizersContainer(OptimizersContainer):
 
         half_life_fraction: float = 0.05
         """Used when decay is None: decay = 2 ** (-1 / (half_life_fraction * t)),
-        where t is elapsed steps since start_step. Keeps roughly the most
-        recent half_life_fraction share of steps dominant. Default 0.05
+        where t is the number of EMA updates fired so far (elapsed steps since
+        start_step, divided by update_every_n_steps). Keeps roughly the most
+        recent half_life_fraction share of updates dominant. Default 0.05
         matches the common decay = 2 ** (-20 / t) rule of thumb."""
 
         start_step: int = 0
@@ -130,11 +131,15 @@ class EMAOptimizersContainer(OptimizersContainer):
         step() convention to honor here."""
         if not self.enable or current_step < self.start_step:
             return
-        if (current_step - self.start_step) % self.update_every_n_steps != 0:
+        elapsed = current_step - self.start_step
+        if elapsed % self.update_every_n_steps != 0:
             return
-        # Clamped to >= 1 to avoid dividing by zero when current_step happens
-        # to equal start_step exactly.
-        t = max(current_step - self.start_step + self.step_bias, 1)
+        # t counts EMA updates (firings), not raw steps -- the half-life
+        # formula in _decay_at is defined in terms of applications of decay,
+        # which only matches elapsed steps when update_every_n_steps == 1.
+        # Still stateless: firing count is a pure function of current_step.
+        # Clamped to >= 1 to avoid dividing by zero on the first firing.
+        t = max((elapsed + self.step_bias) // self.update_every_n_steps, 1)
         self._update(t)
 
     def _decay_at(self, t: int) -> float:
