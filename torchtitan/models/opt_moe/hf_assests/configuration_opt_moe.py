@@ -90,11 +90,13 @@ class OptMoEConfig(PretrainedConfig):
         mlp_bias=False,
         head_dim=None,
         qk_norm=False,
+        mid_norm=False,
         norm_everywhere=False,
         force_router_on_fp32=True,
         gated_attention_type=None,
         gate_only=False,
         mid_norm_position="after",
+        head_wise_mid_norm=False,
         use_rope=True,
         sliding_window_size=-1,
         qk_rope_dim=None,
@@ -140,11 +142,13 @@ class OptMoEConfig(PretrainedConfig):
         self.norm_everywhere = norm_everywhere
         self.force_router_on_fp32 = bool(force_router_on_fp32)
         self.qk_norm = qk_norm
+        self.mid_norm = bool(mid_norm)
         self.gated_attention_type = _normalize_gated_attention_type(
             gated_attention_type
         )
         self.gate_only = bool(gate_only)
         self.mid_norm_position = _normalize_mid_norm_position(mid_norm_position)
+        self.head_wise_mid_norm = bool(head_wise_mid_norm)
         self.use_rope = use_rope
         self.sliding_window_size = sliding_window_size
 

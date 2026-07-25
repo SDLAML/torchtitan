@@ -384,6 +384,8 @@ class OptMoEAttention(nn.Module):
 
     _NORM_MODE_NONE = "no_norm"
     _NORM_MODE_QK = "qk_norm"
+    _NORM_MODE_O = "o_norm"
+    _NORM_MODE_QKO = "qko_norm"
     _NORM_MODE_QKVO = "qkvo_norm"
 
     def __init__(
@@ -423,6 +425,7 @@ class OptMoEAttention(nn.Module):
         self.mid_norm_position = _normalize_mid_norm_position(
             getattr(config, "mid_norm_position", "after")
         )
+        self.head_wise_mid_norm = bool(getattr(config, "head_wise_mid_norm", False))
 
         attention_bias = getattr(config, "attention_bias", False)
         self.qkv_proj = QKVParallelLinear(
@@ -445,10 +448,15 @@ class OptMoEAttention(nn.Module):
         # --- Norms ---
         use_norm_everywhere = _get_attention_norm_everywhere(config)
         use_qk_norm = bool(getattr(config, "qk_norm", False))
+        use_mid_norm = bool(getattr(config, "mid_norm", False))
         if use_norm_everywhere:
             self.norm_mode = self._NORM_MODE_QKVO
+        elif use_qk_norm and use_mid_norm:
+            self.norm_mode = self._NORM_MODE_QKO
         elif use_qk_norm:
             self.norm_mode = self._NORM_MODE_QK
+        elif use_mid_norm:
+            self.norm_mode = self._NORM_MODE_O
         else:
             self.norm_mode = self._NORM_MODE_NONE
 
@@ -478,17 +486,22 @@ class OptMoEAttention(nn.Module):
             self.q_norm = _weightless_rms_norm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = _weightless_rms_norm(self.head_dim, eps=rms_norm_eps)
             self._attn_forward = self._forward_qk_norm
+        elif self.norm_mode == self._NORM_MODE_O:
+            if not self.gate_only:
+                self.mid_norm = self._build_mid_norm(rms_norm_eps)
+            self._attn_forward = self._forward_o_norm
+        elif self.norm_mode == self._NORM_MODE_QKO:
+            self.q_norm = _weightless_rms_norm(self.head_dim, eps=rms_norm_eps)
+            self.k_norm = _weightless_rms_norm(self.head_dim, eps=rms_norm_eps)
+            if not self.gate_only:
+                self.mid_norm = self._build_mid_norm(rms_norm_eps)
+            self._attn_forward = self._forward_qko_norm
         elif self.norm_mode == self._NORM_MODE_QKVO:
             self.q_norm = _weightless_rms_norm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = _weightless_rms_norm(self.head_dim, eps=rms_norm_eps)
             self.v_norm = _weightless_rms_norm(self.head_dim, eps=rms_norm_eps)
             if not self.gate_only:
-                if self.mid_norm_position == "after":
-                    self.mid_norm = _weightless_rms_norm(self.q_size, eps=rms_norm_eps)
-                else:
-                    self.mid_norm = _weightless_rms_norm(
-                        self.head_dim, eps=rms_norm_eps
-                    )
+                self.mid_norm = self._build_mid_norm(rms_norm_eps)
             self._attn_forward = self._forward_qkvo_norm
         else:
             self._attn_forward = self._forward_no_norm
@@ -565,7 +578,16 @@ class OptMoEAttention(nn.Module):
         return self.mid_norm(attn_output).view(tokens, -1)
 
     def _apply_mid_norm_after(self, attn_output: torch.Tensor) -> torch.Tensor:
+        if self.head_wise_mid_norm:
+            tokens = attn_output.shape[0]
+            attn_output = attn_output.view(tokens, self.num_heads, self.head_dim)
+            return self.mid_norm(attn_output).view(tokens, -1)
         return self.mid_norm(attn_output)
+
+    def _build_mid_norm(self, rms_norm_eps: float) -> nn.Module:
+        if self.mid_norm_position == "after" and not self.head_wise_mid_norm:
+            return _weightless_rms_norm(self.q_size, eps=rms_norm_eps)
+        return _weightless_rms_norm(self.head_dim, eps=rms_norm_eps)
 
     def _forward_no_norm(
         self,
@@ -593,6 +615,44 @@ class OptMoEAttention(nn.Module):
         if self.use_rope:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _forward_o_norm(
+        self,
+        positions: torch.Tensor,
+        qkv: torch.Tensor,
+    ) -> torch.Tensor:
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.use_rope:
+            q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        if not self.gate_only:
+            if self.mid_norm_position == "before":
+                attn_output = self._apply_mid_norm_before(attn_output)
+            else:
+                attn_output = self._apply_mid_norm_after(attn_output)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _forward_qko_norm(
+        self,
+        positions: torch.Tensor,
+        qkv: torch.Tensor,
+    ) -> torch.Tensor:
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+        q = self.q_norm(q_by_head).view(q.shape)
+        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+        k = self.k_norm(k_by_head).view(k.shape)
+        if self.use_rope:
+            q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        if not self.gate_only:
+            if self.mid_norm_position == "before":
+                attn_output = self._apply_mid_norm_before(attn_output)
+            else:
+                attn_output = self._apply_mid_norm_after(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -651,9 +711,10 @@ class OptMoEAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             # Apply norms
-            if (
-                self.norm_mode == self._NORM_MODE_QK
-                or self.norm_mode == self._NORM_MODE_QKVO
+            if self.norm_mode in (
+                self._NORM_MODE_QK,
+                self._NORM_MODE_QKO,
+                self._NORM_MODE_QKVO,
             ):
                 q_by_head = q.view(
                     *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
@@ -675,15 +736,22 @@ class OptMoEAttention(nn.Module):
 
             attn_output = self.attn(q, k, v)
 
-            if self.norm_mode == self._NORM_MODE_QKVO and not self.gate_only:
-                if self.mid_norm_position == "before":
-                    attn_output = self._apply_mid_norm_before(attn_output)
+            apply_mid_norm = (
+                self.norm_mode
+                in (
+                    self._NORM_MODE_O,
+                    self._NORM_MODE_QKO,
+                    self._NORM_MODE_QKVO,
+                )
+                and not self.gate_only
+            )
+            if apply_mid_norm and self.mid_norm_position == "before":
+                attn_output = self._apply_mid_norm_before(attn_output)
 
             attn_output = self._apply_gate(attn_output, hidden_states)
 
-            if self.norm_mode == self._NORM_MODE_QKVO and not self.gate_only:
-                if self.mid_norm_position == "after":
-                    attn_output = self._apply_mid_norm_after(attn_output)
+            if apply_mid_norm and self.mid_norm_position == "after":
+                attn_output = self._apply_mid_norm_after(attn_output)
 
             output, _ = self.o_proj(attn_output)
             return output

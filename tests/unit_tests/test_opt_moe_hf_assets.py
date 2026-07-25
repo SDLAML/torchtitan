@@ -23,6 +23,10 @@ def _build_native_model_config(
     *,
     gate_only: bool = False,
     mid_norm_position: str = "after",
+    head_wise_mid_norm: bool = False,
+    qk_norm: bool = False,
+    mid_norm: bool = False,
+    norm_everywhere: bool = True,
     qk_rope_dim: int | None = None,
 ) -> OPTMoEModel.Config:
     head_dim = 4
@@ -38,11 +42,13 @@ def _build_native_model_config(
                 n_heads=2,
                 n_kv_heads=2,
                 head_dim=head_dim,
-                qk_norm=False,
-                norm_everywhere=True,
+                qk_norm=qk_norm,
+                mid_norm=mid_norm,
+                norm_everywhere=norm_everywhere,
                 gated_attention_type="head-wise",
                 gate_only=gate_only,
                 mid_norm_position=mid_norm_position,
+                head_wise_mid_norm=head_wise_mid_norm,
                 use_rope=False,
                 qk_rope_dim=qk_rope_dim,
                 attn_backend="sdpa",
@@ -65,6 +71,10 @@ def _build_hf_attention(
     *,
     gate_only: bool = False,
     mid_norm_position: str = "after",
+    head_wise_mid_norm: bool = False,
+    qk_norm: bool = False,
+    mid_norm: bool = False,
+    norm_everywhere: bool = True,
     qk_rope_dim: int | None = None,
 ) -> OptMoEAttention:
     config = OptMoEConfig(
@@ -73,11 +83,13 @@ def _build_hf_attention(
         num_key_value_heads=2,
         head_dim=4,
         max_position_embeddings=8,
-        qk_norm=False,
-        norm_everywhere=True,
+        qk_norm=qk_norm,
+        mid_norm=mid_norm,
+        norm_everywhere=norm_everywhere,
         gated_attention_type="head-wise",
         gate_only=gate_only,
         mid_norm_position=mid_norm_position,
+        head_wise_mid_norm=head_wise_mid_norm,
         use_rope=False,
         qk_rope_dim=qk_rope_dim,
         attention_bias=False,
@@ -181,20 +193,51 @@ class TestOptMoEHFAssets(unittest.TestCase):
         self.assertEqual(exported["partial_rotary_factor"], 0.5)
 
     def test_hf_attention_matches_native_for_new_attention_modes(self):
-        for gate_only, mid_norm_position in ((True, "after"), (False, "before")):
+        for (
+            gate_only,
+            mid_norm_position,
+            head_wise_mid_norm,
+            qk_norm,
+            mid_norm,
+            norm_everywhere,
+        ) in (
+            (True, "after", False, False, False, True),
+            (False, "before", False, False, False, True),
+            (False, "after", True, False, False, True),
+            # mid_norm-only: no qk_norm, no norm_everywhere -> v_norm stays off.
+            (False, "after", False, False, True, False),
+            # qk_norm + mid_norm without norm_everywhere -> v_norm still off.
+            (False, "after", False, True, True, False),
+        ):
             with self.subTest(
                 gate_only=gate_only,
                 mid_norm_position=mid_norm_position,
+                head_wise_mid_norm=head_wise_mid_norm,
+                qk_norm=qk_norm,
+                mid_norm=mid_norm,
+                norm_everywhere=norm_everywhere,
             ):
                 torch.manual_seed(0)
                 native_attention = _build_native_model_config(
                     gate_only=gate_only,
                     mid_norm_position=mid_norm_position,
+                    head_wise_mid_norm=head_wise_mid_norm,
+                    qk_norm=qk_norm,
+                    mid_norm=mid_norm,
+                    norm_everywhere=norm_everywhere,
                 ).layer.attention.build(dim=8)
                 hf_attention = _build_hf_attention(
                     gate_only=gate_only,
                     mid_norm_position=mid_norm_position,
+                    head_wise_mid_norm=head_wise_mid_norm,
+                    qk_norm=qk_norm,
+                    mid_norm=mid_norm,
+                    norm_everywhere=norm_everywhere,
                 )
+
+                if not norm_everywhere:
+                    self.assertIsInstance(native_attention.v_norm, torch.nn.Identity)
+                    self.assertIsInstance(hf_attention.v_norm, torch.nn.Identity)
 
                 _copy_attention_weights(native_attention, hf_attention)
 

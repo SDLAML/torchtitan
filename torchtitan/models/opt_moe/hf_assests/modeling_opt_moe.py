@@ -634,6 +634,7 @@ class OptMoEAttention(nn.Module):
         self.mid_norm_position = _normalize_mid_norm_position(
             getattr(config, "mid_norm_position", "after")
         )
+        self.head_wise_mid_norm = bool(getattr(config, "head_wise_mid_norm", False))
 
         self.q_proj = nn.Linear(
             config.hidden_size,
@@ -667,7 +668,14 @@ class OptMoEAttention(nn.Module):
 
         if attention_norm_everywhere:
             self.v_norm = OptMoERMSNorm(self.head_dim, config.rms_norm_eps)
-            if self.mid_norm_position == "after":
+        else:
+            self.v_norm = nn.Identity()
+
+        use_mid_norm = (
+            bool(getattr(config, "mid_norm", False)) or attention_norm_everywhere
+        )
+        if use_mid_norm:
+            if self.mid_norm_position == "after" and not self.head_wise_mid_norm:
                 self.mid_norm = OptMoERMSNorm(
                     config.num_attention_heads * self.head_dim,
                     config.rms_norm_eps,
@@ -675,7 +683,6 @@ class OptMoEAttention(nn.Module):
             else:
                 self.mid_norm = OptMoERMSNorm(self.head_dim, config.rms_norm_eps)
         else:
-            self.v_norm = nn.Identity()
             self.mid_norm = nn.Identity()
 
         # Gated attention: head-wise or element-wise gate projection
@@ -797,9 +804,18 @@ class OptMoEAttention(nn.Module):
                     orig_dtype
                 )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         if self.mid_norm_position == "after" and not self.gate_only:
-            attn_output = self.mid_norm(attn_output)
+            if self.head_wise_mid_norm:
+                bsz, seq_len = input_shape
+                n_heads = self.config.num_attention_heads
+                attn_output = attn_output.reshape(bsz, seq_len, n_heads, self.head_dim)
+                attn_output = self.mid_norm(attn_output)
+                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            else:
+                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+                attn_output = self.mid_norm(attn_output)
+        else:
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
