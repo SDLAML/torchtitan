@@ -223,6 +223,83 @@ def _validate_exported_hf_config(
         )
 
 
+def _checkpoint_has_prefix(input_dir: Path, prefix: str) -> bool:
+    """Whether the on-disk DCP checkpoint's metadata has any key starting with
+    ``prefix``. Mirrors CheckpointManager._checkpoint_has_prefix -- duplicated
+    here since this script calls dcp.load directly rather than through
+    CheckpointManager, so it needs the same guard against a missing key
+    raising inside DCP's load planner.
+    """
+    try:
+        metadata = dcp.FileSystemReader(str(input_dir)).read_metadata()
+        return any(k.startswith(prefix) for k in metadata.state_dict_metadata)
+    except Exception:
+        return False
+
+
+def _load_ema_state_dict(
+    actual_model, input_dir: Path
+) -> "dict[str, torch.Tensor] | None":
+    """Load the EMA weights for ``actual_model`` from a DCP checkpoint.
+
+    Returns a native (non-HF) FQN -> tensor state dict, or None if the
+    checkpoint has no EMA data (EMA was disabled during training, or the
+    checkpoint predates EMA support). Doesn't mutate actual_model's own
+    parameters -- the EMA weights are a separate set of tensors.
+    """
+    from torchtitan.components.ema import EMAOptimizersContainer
+
+    if not _checkpoint_has_prefix(input_dir, "ema_optimizer."):
+        return None
+
+    ema_container = EMAOptimizersContainer.Config(enable=True).build(
+        model_parts=[actual_model]
+    )
+    dcp.load({"ema_optimizer": ema_container}, checkpoint_id=str(input_dir))
+
+    ema_opt = ema_container.optimizers[0]
+    ema_state_dict = {}
+    for name, p in actual_model.named_parameters():
+        state = ema_opt.state.get(p)
+        if state is not None and "ema_params" in state:
+            ema_state_dict[name] = state["ema_params"]
+    return ema_state_dict
+
+
+def _export_hf_weights(
+    state_dict: dict, sd_adapter, target_dtype, output_dir: Path
+) -> None:
+    """Convert a native state dict to HF format, cast, and write safetensors.
+    Shared by the main-weights and EMA-weights export paths."""
+    hf_state_dict = sd_adapter.to_hf(state_dict)
+    if target_dtype != torch.float32:
+        hf_state_dict = {k: v.to(target_dtype) for k, v in hf_state_dict.items()}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_torch_state_dict(
+        hf_state_dict,
+        output_dir,
+        max_shard_size="5GB",
+        safe_serialization=True,
+        metadata={"format": "pt"},
+    )
+
+
+def _copy_hf_assets(src_dir: Path, dst_dir: Path) -> None:
+    """Copy the non-weight HF assets (config.json, modeling files, tokenizer,
+    etc.) from an already-exported HF directory into a second one -- so the
+    EMA export can reuse them instead of regenerating, since EMA weights
+    share the main export's architecture/config."""
+    weight_names = {"model.safetensors", "model.safetensors.index.json"}
+    for item in src_dir.iterdir():
+        if item.name in weight_names or item.name.endswith(".safetensors"):
+            continue
+        dest = dst_dir / item.name
+        if item.is_dir():
+            shutil.copytree(item, dest, dirs_exist_ok=True)
+        else:
+            shutil.copy(item, dest)
+
+
 def try_to_copy_tokenizer(output_dir, hf_assets_path):
     """
     if these files exist in the hf_assets_path, then copy them to the output_dir
@@ -253,6 +330,7 @@ def convert_to_hf(
     hf_assets_path: "Path | None",
     export_dtype: str,
     job_config: "Path | None" = None,
+    ema_output: "Path | None" = None,
 ):
     """Convert a DCP checkpoint to HuggingFace safetensors format.
 
@@ -265,6 +343,9 @@ def convert_to_hf(
       6. Optionally cast dtype.
       7. Write HF safetensors.
       8. Copy HF config/modeling files and generate config.json.
+      9. If ema_output is given and the checkpoint has EMA weights (see
+         torchtitan.components.ema), also export those to ema_output, reusing
+         the config/tokenizer files just written to output_dir.
     """
     # 1. Get ModelSpec from the model registry
     model_spec = _resolve_model_spec_for_conversion(
@@ -292,23 +373,9 @@ def convert_to_hf(
     state_dict = model._get_state_dict()
     dcp.load(state_dict, checkpoint_id=str(input_dir))
 
-    # 5. Convert native → HF state dict
-    hf_state_dict = sd_adapter.to_hf(state_dict)
-
-    # 6. Apply export dtype if requested
+    # 5-7. Convert native → HF state dict, apply export dtype, write safetensors
     target_dtype = TORCH_DTYPE_MAP[export_dtype]
-    if target_dtype != torch.float32:
-        hf_state_dict = {k: v.to(target_dtype) for k, v in hf_state_dict.items()}
-
-    # 7. Write HF safetensors
-    output_dir.mkdir(parents=True, exist_ok=True)
-    save_torch_state_dict(
-        hf_state_dict,
-        output_dir,
-        max_shard_size="5GB",
-        safe_serialization=True,
-        metadata={"format": "pt"},
-    )
+    _export_hf_weights(state_dict, sd_adapter, target_dtype, output_dir)
 
     # 8. Copy HF config/modeling files and generate config.json
     if model_spec.hf_assets_setup_fn is not None:
@@ -330,6 +397,20 @@ def convert_to_hf(
     try_to_copy_tokenizer(output_dir, hf_assets_path)
 
     print(f"model is saved to {output_dir}")
+
+    # 9. Optionally also export EMA weights
+    if ema_output is not None:
+        ema_state_dict = _load_ema_state_dict(actual_model, input_dir)
+        if ema_state_dict is None:
+            print(
+                f"[WARNING] --ema_output was given but the checkpoint at {input_dir} "
+                "has no EMA weights (EMA was disabled during that training run, or "
+                "this checkpoint predates EMA support). Skipping EMA export."
+            )
+        else:
+            _export_hf_weights(ema_state_dict, sd_adapter, target_dtype, ema_output)
+            _copy_hf_assets(output_dir, ema_output)
+            print(f"EMA weights saved to {ema_output}")
 
 
 if __name__ == "__main__":
@@ -378,6 +459,18 @@ if __name__ == "__main__":
         choices=["float16", "bfloat16", "float32"],
         help="Export dtype for HF checkpoint (default: float32).",
     )
+    parser.add_argument(
+        "--ema_output",
+        type=Path,
+        default=None,
+        help="If provided, also export the checkpoint's EMA weights "
+        "(see torchtitan.components.ema) to this directory in HF format. "
+        "Reuses output_dir's config/tokenizer files instead of regenerating "
+        "them, since EMA weights share the same architecture/config as the "
+        "main export. If the checkpoint has no EMA weights (EMA was disabled "
+        "during training, or it predates EMA support), prints a warning and "
+        "skips the EMA export rather than failing.",
+    )
     args = parser.parse_args()
 
     convert_to_hf(
@@ -388,4 +481,5 @@ if __name__ == "__main__":
         args.hf_assets_path,
         args.export_dtype,
         args.job_config,
+        args.ema_output,
     )

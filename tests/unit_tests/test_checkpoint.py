@@ -49,6 +49,19 @@ class FakeLRSchedulersContainer:
         pass
 
 
+class FakeEMAOptimizersContainer:
+    """A fake EMAOptimizersContainer that does nothing (EMA disabled)."""
+
+    def __init__(self):
+        pass
+
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, sd: dict):
+        pass
+
+
 class FakeDataLoader(DataLoader):
     """A fake DataLoader that returns a fake batch."""
 
@@ -122,6 +135,7 @@ class TestCheckpointManager(unittest.TestCase):
         # some optimizer.state_dict() behavior (e.g., the key being the parameter name.)
         self.optimizers = FakeOptimizersContainer()
         self.lr_schedulers = FakeLRSchedulersContainer()
+        self.ema_optimizer = FakeEMAOptimizersContainer()
         self.data_loader = FakeDataLoader()
         self.ft_manager = DummyFTManager()
 
@@ -185,6 +199,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -219,6 +234,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -261,6 +277,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -285,6 +302,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -310,6 +328,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -341,6 +360,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -376,6 +396,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -397,6 +418,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -453,6 +475,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=checkpoint_config,
             sd_adapter=None,
@@ -496,6 +519,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=states,
             config=checkpoint_config,
             sd_adapter=None,
@@ -542,6 +566,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=checkpoint_config,
             sd_adapter=None,
@@ -579,6 +604,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -606,6 +632,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -653,6 +680,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=[fake_model],
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -692,6 +720,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -720,6 +749,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -762,6 +792,7 @@ class TestCheckpointManager(unittest.TestCase):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema_optimizer=self.ema_optimizer,
             states=self.states,
             config=self.trainer_config.checkpoint,
             sd_adapter=None,
@@ -774,6 +805,150 @@ class TestCheckpointManager(unittest.TestCase):
         manager.save(curr_step=1)
         manager.save(curr_step=2, last_step=True)
         manager.load(step=1)
+
+
+class TestCheckpointManagerEMAResumeFlexibility(unittest.TestCase):
+    """Exercises real (non-mocked) DCP save/load for EMAOptimizersContainer's
+    resume-flexibility contract: ema.enable may differ between the run that
+    wrote a checkpoint and the run that resumes from it. Uses real dcp.save/
+    dcp.load (unlike the mocked tests above) because the behavior under test
+    -- CheckpointManager._checkpoint_has_prefix() probing real on-disk DCP
+    metadata -- only exercises meaningfully against a real checkpoint.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.distributed.is_initialized():
+            os.environ.setdefault("MASTER_ADDR", "localhost")
+            os.environ.setdefault("MASTER_PORT", "29601")
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            torch.distributed.init_process_group(backend="gloo")
+            cls._own_pg = True
+        else:
+            cls._own_pg = False
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._own_pg:
+            torch.distributed.destroy_process_group()
+
+    def setUp(self):
+        self.base_temp_dir = tempfile.mkdtemp()
+
+        self.ckpt_cfg = CheckpointManager.Config(
+            enable=True,
+            async_mode="disabled",
+            folder="",
+            interval=1,
+            keep_latest_k=0,
+            last_save_model_only=False,
+            export_dtype="float32",
+            exclude_from_loading=[],
+            initial_load_path=None,
+            initial_load_model_only=False,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.base_temp_dir, ignore_errors=True)
+
+    def _make_manager(self, model_parts, ema_optimizer, base_folder):
+        return CheckpointManager(
+            config=self.ckpt_cfg,
+            dataloader=None,
+            model_parts=model_parts,
+            optimizers=FakeOptimizersContainer(),
+            lr_schedulers=FakeLRSchedulersContainer(),
+            ema_optimizer=ema_optimizer,
+            states={},
+            sd_adapter=None,
+            base_folder=self.base_temp_dir,
+            ft_manager=DummyFTManager(),
+        )
+
+    def test_resume_with_ema_enabled_after_saving_with_ema_disabled(self):
+        from torchtitan.components.ema import EMAOptimizersContainer
+
+        # Save with EMA disabled.
+        model = nn.Linear(4, 4)
+        with torch.no_grad():
+            model.weight.fill_(3.0)
+        ema_off = EMAOptimizersContainer.Config(enable=False).build(model_parts=[model])
+        mgr1 = self._make_manager([model], ema_off, self.base_temp_dir)
+        mgr1.save(curr_step=1, last_step=False)
+        mgr1.close()
+
+        # Resume with EMA enabled: must not crash, and must reseed the EMA
+        # params from the resumed model weights (not stale pre-load values).
+        model2 = nn.Linear(4, 4)
+        with torch.no_grad():
+            model2.weight.fill_(0.0)
+        ema_on = EMAOptimizersContainer.Config(enable=True, decay=0.9).build(
+            model_parts=[model2]
+        )
+        mgr2 = self._make_manager([model2], ema_on, self.base_temp_dir)
+        loaded = mgr2.load(step=1)
+        self.assertTrue(loaded)
+        self.assertTrue(
+            torch.allclose(model2.weight, torch.full_like(model2.weight, 3.0))
+        )
+        ema_val = ema_on.optimizers[0].state[model2.weight]["ema_params"]
+        self.assertTrue(
+            torch.allclose(ema_val, torch.full_like(ema_val, 3.0)),
+            f"EMA params should reseed from resumed weights (3.0), got {ema_val}",
+        )
+        mgr2.close()
+
+    def test_resume_with_ema_enabled_after_saving_with_ema_enabled(self):
+        from torchtitan.components.ema import EMAOptimizersContainer
+
+        model = nn.Linear(4, 4)
+        with torch.no_grad():
+            model.weight.fill_(1.0)
+        ema1 = EMAOptimizersContainer.Config(enable=True, decay=0.5).build(
+            model_parts=[model]
+        )
+        mgr1 = self._make_manager([model], ema1, self.base_temp_dir)
+        with torch.no_grad():
+            model.weight.fill_(5.0)
+        ema1.step(1)  # ema_params = 0.5*1.0 + 0.5*5.0 = 3.0
+        mgr1.save(curr_step=1, last_step=False)
+        mgr1.close()
+
+        model2 = nn.Linear(4, 4)
+        ema2 = EMAOptimizersContainer.Config(enable=True, decay=0.5).build(
+            model_parts=[model2]
+        )
+        mgr2 = self._make_manager([model2], ema2, self.base_temp_dir)
+        loaded = mgr2.load(step=1)
+        self.assertTrue(loaded)
+        ema_val2 = ema2.optimizers[0].state[model2.weight]["ema_params"]
+        self.assertTrue(
+            torch.allclose(ema_val2, torch.full_like(ema_val2, 3.0)),
+            f"EMA params should restore the real saved value (3.0), got {ema_val2}",
+        )
+        mgr2.close()
+
+    def test_resume_with_ema_disabled_after_saving_with_ema_enabled(self):
+        from torchtitan.components.ema import EMAOptimizersContainer
+
+        model = nn.Linear(4, 4)
+        ema1 = EMAOptimizersContainer.Config(enable=True, decay=0.5).build(
+            model_parts=[model]
+        )
+        mgr1 = self._make_manager([model], ema1, self.base_temp_dir)
+        mgr1.save(curr_step=1, last_step=False)
+        mgr1.close()
+
+        # Resuming with EMA disabled must not crash and must not attempt to
+        # read anything for ema_optimizer.
+        model2 = nn.Linear(4, 4)
+        ema2 = EMAOptimizersContainer.Config(enable=False).build(model_parts=[model2])
+        mgr2 = self._make_manager([model2], ema2, self.base_temp_dir)
+        loaded = mgr2.load(step=1)
+        self.assertTrue(loaded)
+        self.assertEqual(ema2.state_dict(), {})
+        mgr2.close()
 
 
 if __name__ == "__main__":

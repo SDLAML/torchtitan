@@ -38,6 +38,7 @@ from torch.distributed.checkpoint.state_dict_saver import (
 )
 from torch.distributed.checkpoint.stateful import Stateful
 from torchtitan.components.dataloader import BaseDataLoader
+from torchtitan.components.ema import EMAOptimizersContainer
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
@@ -54,6 +55,7 @@ OPTIMIZER = "optimizer"
 LR_SCHEDULER = "lr_scheduler"
 DATALOADER = "dataloader"
 TRAIN_STATE = "train_state"
+EMA_OPTIMIZER = "ema_optimizer"
 
 
 class AsyncMode(str, enum.Enum):
@@ -362,6 +364,7 @@ class CheckpointManager(Configurable):
         model_parts: list[nn.Module],
         optimizers: OptimizersContainer,
         lr_schedulers: LRSchedulersContainer,
+        ema_optimizer: EMAOptimizersContainer,
         states: dict[str, Any],
         sd_adapter: BaseStateDictAdapter | None,
         base_folder: str = "",
@@ -377,6 +380,7 @@ class CheckpointManager(Configurable):
                 OPTIMIZER: optimizers,
                 DATALOADER: dataloader,
                 LR_SCHEDULER: lr_schedulers,
+                EMA_OPTIMIZER: ema_optimizer,
             }
         )
 
@@ -405,6 +409,7 @@ class CheckpointManager(Configurable):
                         OPTIMIZER,
                         LR_SCHEDULER,
                         TRAIN_STATE,
+                        EMA_OPTIMIZER,
                     }:
                         ret[k] = v.state_dict()
                 return ret
@@ -849,12 +854,18 @@ class CheckpointManager(Configurable):
         logger.info(f"Loading the checkpoint from {checkpoint_id}.")
         begin = time.monotonic()
         states = self._states_to_load(model_only)
+        needs_ema_reseed = not model_only and self._maybe_exclude_missing_ema(
+            states, checkpoint_id
+        )
         self.dcp_load(
             states,
             checkpoint_id=checkpoint_id,
             from_hf=from_hf,
             from_quantized=from_quantized,
         )
+        if needs_ema_reseed:
+            self.states[EMA_OPTIMIZER].load_state_dict({})
+
         GarbageCollection.collect("GC collection for checkpoint loading.")
         logger.info(
             f"Finished loading the checkpoint in {time.monotonic() - begin:.2f} seconds."
@@ -952,6 +963,17 @@ class CheckpointManager(Configurable):
             sd.update(states[MODEL].state_dict())
         return sd
 
+    def _checkpoint_has_prefix(self, checkpoint_id: str, prefix: str) -> bool:
+        """Whether the on-disk checkpoint's metadata has any key starting with
+        ``prefix``. Used to detect an optional component being genuinely
+        absent from a checkpoint before attempting to load it.
+        """
+        try:
+            metadata = dcp.FileSystemReader(checkpoint_id).read_metadata()
+            return any(k.startswith(prefix) for k in metadata.state_dict_metadata)
+        except Exception:
+            return False
+
     def _states_to_load(self, model_only: bool) -> dict[str, Any]:
         """Determines which states to load for the given step.
 
@@ -982,6 +1004,26 @@ class CheckpointManager(Configurable):
             states_to_load.pop(DATALOADER)
 
         return states_to_load
+
+    def _maybe_exclude_missing_ema(
+        self, states_to_load: dict[str, Any], checkpoint_id: str
+    ) -> bool:
+        """Drop EMA_OPTIMIZER from ``states_to_load`` (in place) if this
+        checkpoint has no EMA data on disk (saved with EMA disabled, or
+        predating EMA support) -- otherwise DCP's load planner raises before
+        our own load_state_dict() ever runs. Only called when not model_only;
+        a from_hf load is always model_only, so it never reaches here.
+
+        Returns whether the caller must reseed EMA_OPTIMIZER (by calling
+        ``self.states[EMA_OPTIMIZER].load_state_dict({})``) once the model has
+        been loaded, so EMA cold-starts from the resumed weights.
+        """
+        if EMA_OPTIMIZER not in states_to_load or self._checkpoint_has_prefix(
+            checkpoint_id, f"{EMA_OPTIMIZER}."
+        ):
+            return False
+        del states_to_load[EMA_OPTIMIZER]
+        return True
 
     def _save_last_step(self, curr_step: int) -> None:
         # We only consider saving model only at the end of the training. So this
