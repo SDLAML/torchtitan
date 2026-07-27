@@ -395,6 +395,82 @@ moe_opt_moe_configs = {
             backend="cos_sin",
         ),
     ),
+    "mis-30b-a3b": OPTMoEModel.Config(
+        n_layers=40,
+        dim=2048,
+        swa_pattern="SSSF" * 10,
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=1,
+            feed_forward=FeedForward.Config(
+                hidden_dim=8192,
+                norm_everywhere=True,
+                norm_eps=1e-30,
+            ),
+            moe=MoE.Config(
+                hidden_dim=512,
+                num_experts=256,
+                num_shared_experts=1,
+                top_k=8,
+                norm_everywhere=True,
+                scaling_factor=2.8232,
+            ),
+            attention=GatedNormSWAttention.Config(
+                n_heads=32,
+                n_kv_heads=4,
+                head_dim=128,
+                qk_norm=True,
+                norm_everywhere=True,
+                norm_eps=1e-30,
+                sliding_window_size=128,
+                attn_mask_type="block_causal",
+                attn_backend="flex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=10000.0,
+            backend="cos_sin",
+        ),
+    ),
+    "mis-100b-a5b": OPTMoEModel.Config(
+        n_layers=40,
+        dim=3072,
+        swa_pattern="SSSF" * 10,
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=1,
+            feed_forward=FeedForward.Config(
+                hidden_dim=8192,
+                norm_everywhere=True,
+                norm_eps=1e-30,
+            ),
+            moe=MoE.Config(
+                hidden_dim=1024,
+                num_experts=256,
+                num_shared_experts=1,
+                top_k=8,
+                norm_everywhere=True,
+                scaling_factor=2.8232,
+            ),
+            attention=GatedNormSWAttention.Config(
+                n_heads=32,
+                n_kv_heads=4,
+                head_dim=128,
+                qk_norm=True,
+                norm_everywhere=True,
+                norm_eps=1e-30,
+                sliding_window_size=128,
+                attn_mask_type="block_causal",
+                attn_backend="flex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128,
+            max_seq_len=4096,
+            theta=10000.0,
+            backend="cos_sin",
+        ),
+    ),
     #
     #
     "swarm-proxy-50M": OPTMoEModel.Config(

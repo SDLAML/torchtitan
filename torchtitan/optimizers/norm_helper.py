@@ -94,6 +94,17 @@ def effective_rank(W):
 
 
 @torch.no_grad()
+def effective_rank_normalized(W):
+    # Same as `effective_rank`, but divided by min(fan_in, fan_out) so the
+    # result lies in (0, 1] and is comparable across parameters/models of
+    # different sizes.
+    S = torch.linalg.svdvals(W.to(torch.float32), driver="gesvd")
+    p = (S / (S.sum() + 1e-12)).clamp_min(1e-12)
+    erank = torch.exp(-(p * p.log()).sum())
+    return erank / min(W.shape[-2], W.shape[-1])
+
+
+@torch.no_grad()
 def effective_rank_squared(W):
     # Same as `effective_rank`, but the probability distribution is over
     # squared singular values (spectral "energy", same p_i as the
@@ -116,6 +127,7 @@ NORM_FUNCTIONS = {
     "average_entry_size": average_entry_size,
     "stable_rank": stable_rank,
     "effective_rank": effective_rank,
+    "effective_rank_normalized": effective_rank_normalized,
     "effective_rank_squared": effective_rank_squared,
 }
 
@@ -158,6 +170,7 @@ def fused_metrics(W, eps=1e-20):
 
     p = (S / (S.sum() + eps)).clamp_min(eps)
     erank = torch.exp(-(p * p.log()).sum())
+    erank_norm = erank / min(fan_out, fan_in)
 
     S_sq = S * S
     p_sq = (S_sq / (S_sq.sum() + eps)).clamp_min(eps)
@@ -175,6 +188,7 @@ def fused_metrics(W, eps=1e-20):
         "average_entry_size": avg_entry,
         "stable_rank": srank,
         "effective_rank": erank,
+        "effective_rank_normalized": erank_norm,
         "effective_rank_squared": erank_sq,
         "spectrum": S,
     }

@@ -506,6 +506,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.optimizers.norms_to_log = norm_helper.get_norms_to_log(
             config.metrics.norms_to_log
         )
+        # enable_plot/enable_export live on OptimizersContainer.Config itself
+        # (config.optimizer.*) and are already set by its __init__; only
+        # export_dir depends on the top-level dump_folder, so patch that in.
+        self.optimizers.spectrum_logging_config = (
+            self.optimizers.spectrum_logging_config._replace(
+                export_dir=os.path.join(config.dump_folder, "spectrum_export")
+            )
+        )
 
         # Online EMA of model weights (e.g. for cheap mid-WSD-training eval
         # without a full LR decay). Always built and the hook always
@@ -1027,7 +1035,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         extra_metrics.update(actual_token_ratio_dict)
 
         if need_to_calculate_norm:
-            param_norms = self.optimizers.get_parameter_norms()
+            param_norms = self.optimizers.get_parameter_norms(step=self.step)
             extra_metrics.update(param_norms)
 
         self.optimizers.join_log_queue()

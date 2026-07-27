@@ -30,6 +30,7 @@ from torchtitan.optimizers import (
     create_disco_optimizer_kwargs_from_optimizer_config,
     create_disco_param_groups,
     DiSCO,
+    spectrum_logging,
 )
 from torchtitan.optimizers.spectrum_logging import process_norms_for_logging
 from torchtitan.tools.logging import logger
@@ -129,6 +130,23 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         - more info: https://pytorch.org/docs/stable/optim.html
         """
 
+        enable_spectrum_plot: bool = True
+        """
+        Whether to render each tracked parameter's singular-value spectrum as
+        a plot image for W&B (see optimizers/spectrum_logging.py). Only
+        takes effect when metrics.log_norm_freq > 0.
+        """
+
+        enable_spectrum_export: bool = False
+        """
+        Whether to export the full raw singular-value spectra (every tracked
+        parameter, every norm-logging step) to a Parquet file uploaded as a
+        versioned W&B Artifact, for offline/programmatic analysis beyond what
+        the plot shows. Off by default: can be large for big MoE models (see
+        optimizers/spectrum_logging.py). Only takes effect when
+        metrics.log_norm_freq > 0.
+        """
+
     optimizers: list[T]
     model_parts: list[nn.Module]
 
@@ -189,6 +207,10 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         self.norms_to_log: list[str] | None = None
         self.log_queue: queue.Queue | None = None
         self.log_thread: threading.Thread | None = None
+        self.spectrum_logging_config = spectrum_logging.SpectrumLoggingConfig(
+            enable_plot=config.enable_spectrum_plot,
+            enable_export=config.enable_spectrum_export,
+        )
 
         for model in self.model_parts:
             if issubclass(optimizer_cls, DiSCO):
@@ -262,7 +284,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             if isinstance(optimizer, DiSCO):
                 optimizer.calculate_norm_at_next_step(self.norms_to_log)
 
-    def get_parameter_norms(self):
+    def get_parameter_norms(self, step: int):
         all_norms = {}
         for i, model_part in enumerate(self.model_parts):
             # NB: assumes correspondences between model parts and optimizers
@@ -285,7 +307,11 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
                 # all_norms.update(
                 #     naive_param_norm.get_parameter_norms([model_part], [optimizer])
                 # )
-        return process_norms_for_logging(all_norms)
+        return process_norms_for_logging(
+            all_norms,
+            step=step,
+            config=self.spectrum_logging_config,
+        )
 
     def get_lrs(self):
         lrs = {}
@@ -357,6 +383,10 @@ class OptimizersInBackwardContainer(OptimizersContainer):
         optimizer_kwargs = self._build_optimizer_kwargs(config)
         all_params = []
         self.model_parts = model_parts
+        self.spectrum_logging_config = spectrum_logging.SpectrumLoggingConfig(
+            enable_plot=config.enable_spectrum_plot,
+            enable_export=config.enable_spectrum_export,
+        )
 
         optim_dict = {}
         for model in self.model_parts:
