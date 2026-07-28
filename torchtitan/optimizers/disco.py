@@ -19,6 +19,7 @@ from torch.profiler import record_function  # labels in PyTorch profiler
 from torchtitan.tools.logging import logger
 from .abstract_disco import AbstractDiSCO
 
+from .gram_helper import calculate_gram_metrics
 from .norm_helper import calculate_norm
 from .utils import remove_orig_mod_and_weight_for_p_name
 
@@ -90,6 +91,47 @@ def gather_tp_shard(tensor, tp_mesh, tp_world_size, original_placements):
     # dist.all_gather(output_tensors, tensor, group=tp_group)
     # return torch.cat(output_tensors, dim=shard_dim)
     return funcol.all_gather_tensor(tensor, gather_dim=shard_dim, group=tp_mesh)
+
+
+def _pseudo_post_update_weight(w, u, lr, wd):
+    """Cheap elementwise replica of the real apply formula (see
+    _update_embed_params_fast / _update_ddp_params_fast /
+    _update_expert_params_fast / update_bucket_params: `w = w*(1-wd*lr) -
+    lr*u`), used ONLY so that track_param_* norms keep their historical
+    post-update meaning once `w` becomes pre-update in-scope for gram
+    metrics. Log-only approximation -- not the real applied tensor (which
+    may go through an extra communication-dtype cast), so no vectorized
+    optimization is needed; the SVD in calculate_norm dominates regardless.
+    """
+    pseudo_w = w * (1.0 - wd * lr) if wd != 0.0 else w
+    return pseudo_w - lr * u
+
+
+def _pack_segments(
+    segments: list[tuple[str, torch.Tensor | None]]
+) -> tuple[torch.Tensor, dict[str, int]]:
+    """Concatenate present (non-None) segments into one flat buffer for a
+    single collective, instead of one all_gather per segment. Returns the
+    buffer and a {name: offset} map for slicing it back apart after
+    gathering -- offsets are within *one rank's* contribution; the caller
+    adds `rank * per_rank_total` on top once gathered.
+
+    Deriving offsets here (from what was actually concatenated, in the same
+    call) rather than hand-computing them at each call site is deliberate:
+    a hand-derived offset can silently drift out of sync with pack order if
+    a segment is added/removed/reordered later, whereas this makes that
+    class of bug structurally impossible.
+    """
+    offsets: dict[str, int] = {}
+    parts: list[torch.Tensor] = []
+    running = 0
+    for name, tensor in segments:
+        if tensor is None:
+            continue
+        offsets[name] = running
+        parts.append(tensor)
+        running += tensor.numel()
+    return torch.cat(parts), offsets
 
 
 def calculate_shard_shape(shape, rank, world_size):
@@ -1585,7 +1627,7 @@ class DiSCO(AbstractDiSCO):
         self,
         cast_dtype: torch.dtype,
         device: torch.device,
-        apply_on_weight: bool,
+        need_to_calculate_norm: bool,
         skip_update: bool,
     ) -> dict[str, torch.Tensor | None]:
         """
@@ -1610,7 +1652,7 @@ class DiSCO(AbstractDiSCO):
             workspace["upd_recv_flat"] = torch.empty(
                 self._fsdp_max_bucket_send_elems, dtype=cast_dtype, device=device
             )
-        if apply_on_weight:
+        if need_to_calculate_norm:
             workspace["param_send_flat"] = torch.empty(
                 self._fsdp_max_bucket_send_elems, dtype=cast_dtype, device=device
             )
@@ -2393,7 +2435,6 @@ class DiSCO(AbstractDiSCO):
         scalar_params,
         scalar_param_names,
         skip_update=False,
-        apply_on_weight=True,
     ):
         """
         We hardcode the update for scalar parameters to be the `sign` of the gradient.
@@ -2426,15 +2467,14 @@ class DiSCO(AbstractDiSCO):
             return
 
         final_norms = {}
-        if apply_on_weight and self.need_to_calculate_norm:
-            for i, p in enumerate(scalar_params):
-                p_local = p.to_local() if isinstance(p, DTensor) else p
-                cleaned_p_name = remove_orig_mod_and_weight_for_p_name(
-                    scalar_param_names[i]
-                )
-                # The original code only logs the parameter's absolute value, as the
-                # update norm is constant (learning_rate * 1.0).
-                final_norms[f"scalar_param_supremum/{cleaned_p_name}"] = p_local.abs()
+        for i, p in enumerate(scalar_params):
+            p_local = p.to_local() if isinstance(p, DTensor) else p
+            cleaned_p_name = remove_orig_mod_and_weight_for_p_name(
+                scalar_param_names[i]
+            )
+            # The original code only logs the parameter's absolute value, as the
+            # update norm is constant (learning_rate * 1.0).
+            final_norms[f"scalar_param_supremum/{cleaned_p_name}"] = p_local.abs()
 
         if self.is_dp_rank_0:
             self.norms_at_current_step.update(final_norms)
@@ -2446,7 +2486,6 @@ class DiSCO(AbstractDiSCO):
         embed_param_names,
         workspace,
         skip_update=False,
-        apply_on_weight=True,
     ):
         # Reuse pre-allocated Python lists (reset before use)
         effective_grads: list = workspace["effective_grads"]
@@ -2549,65 +2588,88 @@ class DiSCO(AbstractDiSCO):
                 else:
                     updates[valid_idx[0]] = self.lmo(valid_grads[0], **param_kwargs)
 
-        # ===== UPDATE =====
-        # Fast-path extras applied via big_us_by_shape (_foreach_add_ with unbind).
-        # Canonicals [0,1] + partial fallback extras applied via update_plan.
-        if not skip_update:
-            self._update_embed_params_fast(updates, big_us_by_shape)
+        #  Norm/Gram Calculation (on full tensors for correctness). Runs
+        # BEFORE the real update is applied (see below) so `p` here is
+        # genuinely pre-update -- needed so calculate_gram_metrics gets W and
+        # U simultaneously (see gram_helper.py). track_param_* keeps its
+        # historical post-update meaning via a cheap local pseudo-weight
+        # (_pseudo_post_update_weight) instead of re-reading a real
+        # post-update p, which would need a second, redundant full_tensor().
+        if self.need_to_calculate_norm:
+            final_norms = {}
+            norm_scratch: list = workspace["norm_scratch"]
 
-        #  Norm Calculation (on full tensors for correctness)
-        if not self.need_to_calculate_norm:
-            return
-        final_norms = {}
-        apply_on_weight = apply_on_weight and self.need_to_calculate_norm
-        norm_scratch: list = workspace["norm_scratch"]
+            for i, (p, p_name) in enumerate(zip(embed_params, embed_param_names)):
+                lr, nesterov, momentum, wd, param_kwargs = self.groups_info[
+                    self.parameters_to_groups[id(p)]
+                ]
 
-        for i, (p, p_name) in enumerate(zip(embed_params, embed_param_names)):
-            lr, nesterov, momentum, _, param_kwargs = self.groups_info[
-                self.parameters_to_groups[id(p)]
-            ]
+                # Gather full tensor for norm calculation
+                g = self.get_momentum_or_grad(
+                    p, momentum, nesterov, gather_to_local=True
+                )
+                u = self.lmo(g, **param_kwargs)
 
-            # Gather full tensor for norm calculation
-            g = self.get_momentum_or_grad(p, momentum, nesterov, gather_to_local=True)
-            u = self.lmo(g, **param_kwargs)
+                need_T = CONST_NAME_OF_EMBEDDING in p_name
 
-            need_T = CONST_NAME_OF_EMBEDDING in p_name
+                # Use pre-alloc float32 scratch to avoid -lr*u temp allocation (extras only)
+                scratch = norm_scratch[i]
+                if scratch is not None and scratch.shape == u.shape:
+                    torch.mul(u, -lr, out=scratch)
+                    upd_norms = calculate_norm(
+                        scratch, self.norms_to_log, transpose=need_T
+                    )
+                else:
+                    upd_norms = calculate_norm(
+                        -lr * u, self.norms_to_log, transpose=need_T
+                    )
+                upd_spectrum = upd_norms.pop("spectrum")
 
-            # Use pre-alloc float32 scratch to avoid -lr*u temp allocation (extras only)
-            scratch = norm_scratch[i]
-            if scratch is not None and scratch.shape == u.shape:
-                torch.mul(u, -lr, out=scratch)
-                upd_norms = calculate_norm(scratch, self.norms_to_log, transpose=need_T)
-            else:
-                upd_norms = calculate_norm(-lr * u, self.norms_to_log, transpose=need_T)
-            upd_spectrum = upd_norms.pop("spectrum")
+                # Gather the parameter itself to a full tensor. The real
+                # update hasn't been applied yet at this point, so this is
+                # genuinely the pre-update weight.
+                if isinstance(p, DTensor):
+                    p = p.full_tensor()
 
-            # Gather the parameter itself to a full tensor if needed
-            if apply_on_weight and isinstance(p, DTensor):
-                p = p.full_tensor()
-
-            if apply_on_weight:
-                wnorm = calculate_norm(p, self.norms_to_log, transpose=need_T)
+                pseudo_w = _pseudo_post_update_weight(p, u, lr, wd)
+                wnorm = calculate_norm(pseudo_w, self.norms_to_log, transpose=need_T)
                 w_spectrum = wnorm.pop("spectrum")
 
-            cleaned_p_name = remove_orig_mod_and_weight_for_p_name(p_name)
-            for norm_name in self.norms_to_log:
-                final_norms[f"track_update_{norm_name}/{cleaned_p_name}"] = upd_norms[
-                    norm_name
-                ]
-                if apply_on_weight:
+                # Always called -- cheap no-op when the registry is empty
+                # (see gram_helper.py), so no extra "is gram active" flag or
+                # branch is needed.
+                gram_metrics = calculate_gram_metrics(
+                    p, u, self.gram_metrics_to_log, transpose=need_T
+                )
+
+                cleaned_p_name = remove_orig_mod_and_weight_for_p_name(p_name)
+                for norm_name in self.norms_to_log:
+                    final_norms[
+                        f"track_update_{norm_name}/{cleaned_p_name}"
+                    ] = upd_norms[norm_name]
                     final_norms[f"track_param_{norm_name}/{cleaned_p_name}"] = wnorm[
                         norm_name
                     ]
-            # This path already operates on fully-materialized local tensors
-            # (no FSDP/EP sharding survives to this point), so the spectrum is
-            # already complete locally — no extra collective is needed.
-            final_norms[f"track_spectrum_update/{cleaned_p_name}"] = upd_spectrum
-            if apply_on_weight:
+                for gram_name, val in gram_metrics.items():
+                    final_norms[f"track_gram_{gram_name}/{cleaned_p_name}"] = val
+                # This path already operates on fully-materialized local tensors
+                # (no FSDP/EP sharding survives to this point), so the spectrum is
+                # already complete locally — no extra collective is needed.
+                final_norms[f"track_spectrum_update/{cleaned_p_name}"] = upd_spectrum
                 final_norms[f"track_spectrum_param/{cleaned_p_name}"] = w_spectrum
 
-        if self.is_dp_rank_0:
-            self.norms_at_current_step.update(final_norms)
+            if self.is_dp_rank_0:
+                self.norms_at_current_step.update(final_norms)
+
+        # ===== UPDATE =====
+        # Fast-path extras applied via big_us_by_shape (_foreach_add_ with unbind).
+        # Canonicals [0,1] + partial fallback extras applied via update_plan.
+        # Runs AFTER norm/gram calculation (moved from before it) so that the
+        # `p`/`p.full_tensor()` reads above see genuinely pre-update weights.
+        # Unconditional on need_to_calculate_norm -- the update must happen
+        # every step regardless of whether norm-logging ran this step.
+        if not skip_update:
+            self._update_embed_params_fast(updates, big_us_by_shape)
 
     @record_function("disco.step_experts")
     def step_experts(
@@ -2616,7 +2678,6 @@ class DiSCO(AbstractDiSCO):
         expert_param_names,
         workspace,
         skip_update=False,
-        apply_on_weight=True,
     ):
         (expert_big_g_bufs, expert_dst_views_by_block) = (
             workspace["big_g_bufs"],
@@ -2625,8 +2686,7 @@ class DiSCO(AbstractDiSCO):
 
         need_to_calculate_norm = self.need_to_calculate_norm
 
-        norms_of_update, norms_of_weight, final_norms = [], [], {}
-        apply_on_weight = apply_on_weight and need_to_calculate_norm
+        norms_of_update, norms_of_weight, norms_of_gram, final_norms = [], [], [], {}
 
         device = expert_params[0].device
         fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
@@ -2696,7 +2756,7 @@ class DiSCO(AbstractDiSCO):
             torch.zeros(
                 self._expert_spectrum_total_size, dtype=torch.float32, device=device
             )
-            if update_spectrum_flat is not None and apply_on_weight
+            if update_spectrum_flat is not None
             else None
         )
 
@@ -2724,17 +2784,31 @@ class DiSCO(AbstractDiSCO):
                             off = block_base + local_pos * K_block
                             update_spectrum_flat[off : off + K_block].copy_(upd_spec)
 
-                        if apply_on_weight:
-                            weight_norms = calculate_norm(
-                                p_local[ep_idx],
-                                self.norms_to_log,
-                                transpose=transpose,
-                            )
-                            w_spec = weight_norms.pop("spectrum")
-                            norms_of_weight.extend(weight_norms.values())
-                            if weight_spectrum_flat is not None:
-                                off = block_base + local_pos * K_block
-                                weight_spectrum_flat[off : off + K_block].copy_(w_spec)
+                        weight_norms = calculate_norm(
+                            p_local[ep_idx],
+                            self.norms_to_log,
+                            transpose=transpose,
+                        )
+                        w_spec = weight_norms.pop("spectrum")
+                        norms_of_weight.extend(weight_norms.values())
+                        if weight_spectrum_flat is not None:
+                            off = block_base + local_pos * K_block
+                            weight_spectrum_flat[off : off + K_block].copy_(w_spec)
+
+                        # p_local[ep_idx] and u[ep_idx] are both already
+                        # full, pre-update tensors in scope here (the real
+                        # update is applied later, at
+                        # `_update_expert_params_fast` below) -- no
+                        # reordering needed for this path. Always called --
+                        # cheap no-op when the registry is empty (see
+                        # gram_helper.py).
+                        gram_metrics = calculate_gram_metrics(
+                            p_local[ep_idx],
+                            u[ep_idx],
+                            self.gram_metrics_to_log,
+                            transpose=transpose,
+                        )
+                        norms_of_gram.extend(gram_metrics.values())
                         local_pos += 1
 
         if not skip_update:
@@ -2746,17 +2820,29 @@ class DiSCO(AbstractDiSCO):
             pad_needed = expected_total - len(norms_of_update)
             if pad_needed > 0:
                 norms_of_update.extend([padding_norms] * pad_needed)
-                if apply_on_weight:  # keep weight-norms aligned
-                    norms_of_weight.extend([padding_norms] * pad_needed)
+                norms_of_weight.extend([padding_norms] * pad_needed)
+
+            # G == 0 (no gram metrics registered yet) naturally makes
+            # expected_total_gram 0 and norms_of_gram stays empty -- no
+            # separate "is gram active" flag/branch needed anywhere below.
+            G = len(self.gram_metrics_to_log)
+            expected_total_gram = len(expert_params) * ep_per_rank * G
+            pad_needed_gram = expected_total_gram - len(norms_of_gram)
+            if pad_needed_gram > 0:
+                norms_of_gram.extend([padding_norms] * pad_needed_gram)
 
             # Single flat per-rank buffer: [scalar update norms, scalar weight
-            # norms, spectrum update, spectrum weight] — one collective for
-            # everything in this step, instead of a separate all_gather per
-            # block/kind (scalar norms and both spectrum halves are all fully
-            # computed above with no ordering dependency between them).
-            local_parts = [torch.stack(norms_of_update).float().to(device)]
-            if apply_on_weight:
-                local_parts.append(torch.stack(norms_of_weight).float().to(device))
+            # norms, gram metrics, spectrum update, spectrum weight] — one
+            # collective for everything in this step, instead of a separate
+            # all_gather per block/kind (scalar norms, gram metrics, and both
+            # spectrum halves are all fully computed above with no ordering
+            # dependency between them).
+            local_parts = [
+                torch.stack(norms_of_update).float().to(device),
+                torch.stack(norms_of_weight).float().to(device),
+            ]
+            if norms_of_gram:
+                local_parts.append(torch.stack(norms_of_gram).float().to(device))
             if update_spectrum_flat is not None:
                 local_parts.append(update_spectrum_flat)
                 if weight_spectrum_flat is not None:
@@ -2776,8 +2862,9 @@ class DiSCO(AbstractDiSCO):
                 K = kinds_of_norms  # norms per expert
                 block = P * E * K  # == expected_total
 
-                weight_scalar_offset = expected_total if apply_on_weight else None
-                spectrum_offset = expected_total * (2 if apply_on_weight else 1)
+                weight_scalar_offset = expected_total
+                gram_scalar_offset = 2 * expected_total
+                spectrum_offset = 2 * expected_total + expected_total_gram
 
                 for idx in range(world_size * block):
                     r, rem = divmod(idx, block)  # producing rank
@@ -2799,13 +2886,38 @@ class DiSCO(AbstractDiSCO):
                     )
                     final_norms[key_update] = gathered[rank_base + rem]
 
-                    if apply_on_weight:
-                        key_param = (
-                            f"track_param_{norm_name}/ep_{actual_ep_idx}/{cleaned_name}"
-                        )
-                        final_norms[key_param] = gathered[
-                            rank_base + weight_scalar_offset + rem
-                        ]
+                    key_param = (
+                        f"track_param_{norm_name}/ep_{actual_ep_idx}/{cleaned_name}"
+                    )
+                    final_norms[key_param] = gathered[
+                        rank_base + weight_scalar_offset + rem
+                    ]
+
+                # block_g == 0 when G == 0, so this loop naturally no-ops --
+                # no explicit "is gram active" guard needed.
+                gram_names = list(self.gram_metrics_to_log)
+                block_g = P * E * G
+                for idx in range(world_size * block_g):
+                    r, rem = divmod(idx, block_g)  # producing rank
+                    p, rem2 = divmod(rem, E * G)  # parameter index
+                    e, g = divmod(rem2, G)  # expert, gram-metric indices
+
+                    actual_ep_idx = e + r * E
+                    if actual_ep_idx >= expert_params[0].shape[0]:
+                        continue  # skip pure padding slots
+
+                    cleaned_name = remove_orig_mod_and_weight_for_p_name(
+                        expert_param_names[p]
+                    )
+                    gram_name = gram_names[g]
+                    rank_base = r * per_rank_total
+
+                    key_gram = (
+                        f"track_gram_{gram_name}/ep_{actual_ep_idx}/{cleaned_name}"
+                    )
+                    final_norms[key_gram] = gathered[
+                        rank_base + gram_scalar_offset + rem
+                    ]
 
                 if update_spectrum_flat is not None:
                     for block_idx, (start, end) in enumerate(blocks):
@@ -2849,11 +2961,10 @@ class DiSCO(AbstractDiSCO):
         ddp_param_names,
         workspace,
         skip_update: bool = False,
-        apply_on_weight: bool = True,
     ):
 
         need_to_calculate_norm = self.need_to_calculate_norm
-        apply_on_weight = apply_on_weight and need_to_calculate_norm
+        num_gram_types = len(self.gram_metrics_to_log)
 
         # --- distributed groups ---
         dp_replicate_mesh = (
@@ -2978,17 +3089,30 @@ class DiSCO(AbstractDiSCO):
                 workspace["upd_norm_local_flat"] = upd_norm_local_flat
             upd_norm_local_flat.zero_()
 
-            if apply_on_weight:
-                w_norm_local_flat = workspace.get("w_norm_local_flat")
-                if (
-                    w_norm_local_flat is None
-                    or w_norm_local_flat.numel() != required_norm_elems
-                ):
-                    w_norm_local_flat = torch.empty(
-                        required_norm_elems, dtype=torch.float32, device=device
-                    )
-                    workspace["w_norm_local_flat"] = w_norm_local_flat
-                w_norm_local_flat.zero_()
+            w_norm_local_flat = workspace.get("w_norm_local_flat")
+            if (
+                w_norm_local_flat is None
+                or w_norm_local_flat.numel() != required_norm_elems
+            ):
+                w_norm_local_flat = torch.empty(
+                    required_norm_elems, dtype=torch.float32, device=device
+                )
+                workspace["w_norm_local_flat"] = w_norm_local_flat
+            w_norm_local_flat.zero_()
+
+        gram_norm_local_flat = None
+        if need_to_calculate_norm and num_gram_types > 0:
+            required_gram_elems = total_buckets * num_gram_types
+            gram_norm_local_flat = workspace.get("gram_norm_local_flat")
+            if (
+                gram_norm_local_flat is None
+                or gram_norm_local_flat.numel() != required_gram_elems
+            ):
+                gram_norm_local_flat = torch.empty(
+                    required_gram_elems, dtype=torch.float32, device=device
+                )
+                workspace["gram_norm_local_flat"] = gram_norm_local_flat
+            gram_norm_local_flat.zero_()
 
         # Singular-value spectrum: a separate flat buffer padded to the largest
         # per-rank total across all ranks (`_ddp_spectrum_max_total`), since
@@ -3014,17 +3138,16 @@ class DiSCO(AbstractDiSCO):
                 workspace["upd_spectrum_local_flat"] = upd_spectrum_local_flat
             upd_spectrum_local_flat.zero_()
 
-            if apply_on_weight:
-                w_spectrum_local_flat = workspace.get("w_spectrum_local_flat")
-                if (
-                    w_spectrum_local_flat is None
-                    or w_spectrum_local_flat.numel() != required_spectrum_elems
-                ):
-                    w_spectrum_local_flat = torch.zeros(
-                        required_spectrum_elems, dtype=torch.float32, device=device
-                    )
-                    workspace["w_spectrum_local_flat"] = w_spectrum_local_flat
-                w_spectrum_local_flat.zero_()
+            w_spectrum_local_flat = workspace.get("w_spectrum_local_flat")
+            if (
+                w_spectrum_local_flat is None
+                or w_spectrum_local_flat.numel() != required_spectrum_elems
+            ):
+                w_spectrum_local_flat = torch.zeros(
+                    required_spectrum_elems, dtype=torch.float32, device=device
+                )
+                workspace["w_spectrum_local_flat"] = w_spectrum_local_flat
+            w_spectrum_local_flat.zero_()
 
         # ---- local update norms (owner slots only) ----
         if need_to_calculate_norm and upd_norm_local_flat is not None:
@@ -3053,19 +3176,20 @@ class DiSCO(AbstractDiSCO):
                         upd_spectrum
                     )
 
-        # -------- Phase C: apply once (pre-cast + grouped foreach apply) --------
-        if not skip_update:
-            apply_updates = self._prepare_ddp_apply_updates(
-                global_updates,
-                workspace,
-                tp_mesh=tp_mesh,
-            )
-            self._update_ddp_params_fast(apply_updates)
-
-        # -------- Phase C.5: Calculate Weight Norms (POST-UPDATE) --------
-        if apply_on_weight and w_norm_local_flat is not None:
+        # -------- Weight norms + gram metrics (PRE-UPDATE) --------
+        # Moved to run BEFORE Phase C's apply below (was "Phase C.5 POST-
+        # UPDATE"), so `w` here is genuinely pre-update -- needed so
+        # calculate_gram_metrics gets W and U simultaneously (see
+        # gram_helper.py). Same TP-gather/`.to_local()` as before, just
+        # earlier -- no new communication. track_param_* keeps its historical
+        # post-update meaning via a cheap local pseudo-weight
+        # (_pseudo_post_update_weight) instead of re-reading the parameter a
+        # second time after the real apply.
+        if w_norm_local_flat is not None:
             for my_idx in self._ddp_owned_indices:
                 w = ddp_params[my_idx]
+                group_idx = self._ddp_param_group_idx[my_idx]
+                lr, _, _, wd, _ = self.groups_info[group_idx]
                 tp_gather_info = (
                     self._ddp_tp_gather_info_by_idx[my_idx]
                     if tp_mesh is not None
@@ -3076,7 +3200,21 @@ class DiSCO(AbstractDiSCO):
                     w = gather_tp_shard(w_local, tp_mesh, tp_world_size, tp_gather_info)
                 elif isinstance(w, DTensor):
                     w = w.to_local()
-                w_norms = calculate_norm(w, self.norms_to_log)
+
+                # No gradient for this param this step (local_updates[my_idx]
+                # is None) -- the real apply still runs with a zero update
+                # (see Phase B's zero_by_shape substitution above, so only
+                # weight decay -- if any -- applies), rather than skipping
+                # the param outright. Weight-norm/gram must match that: still
+                # compute them (unlike the update-norm loop above, which
+                # correctly leaves its flat-buffer slot at zero for this
+                # param, since the update itself really is zero).
+                u = local_updates[my_idx]
+                if u is None:
+                    u = torch.zeros_like(w)
+
+                pseudo_w = _pseudo_post_update_weight(w, u, lr, wd)
+                w_norms = calculate_norm(pseudo_w, self.norms_to_log)
                 w_spectrum = w_norms.pop("spectrum")
                 owner_bucket = self._ddp_owner_bucket_by_param[my_idx]
                 base = owner_bucket * num_norm_types
@@ -3091,48 +3229,52 @@ class DiSCO(AbstractDiSCO):
                         w_spectrum
                     )
 
+                if gram_norm_local_flat is not None:
+                    gram_metrics = calculate_gram_metrics(
+                        w, u, self.gram_metrics_to_log
+                    )
+                    gram_base = owner_bucket * num_gram_types
+                    gram_norm_local_flat[gram_base : gram_base + num_gram_types].copy_(
+                        torch.stack(list(gram_metrics.values()))
+                    )
+
+        # -------- Phase C: apply once (pre-cast + grouped foreach apply) --------
+        if not skip_update:
+            apply_updates = self._prepare_ddp_apply_updates(
+                global_updates,
+                workspace,
+                tp_mesh=tp_mesh,
+            )
+            self._update_ddp_params_fast(apply_updates)
+
         # -------- Phase D: final norm gather/log --------
         if not need_to_calculate_norm:
             return
 
         if upd_norm_local_flat is None:
             return
-        upd = upd_norm_local_flat
+
+        # One collective for everything this step (scalar update/weight/gram
+        # norms + both spectrum halves), instead of up to 5 separate
+        # all_gather_tensor calls -- same "single flat buffer" pattern
+        # step_experts already uses. `offsets` is derived from what actually
+        # got packed, so it can't drift out of sync with pack order.
+        local_buf, offsets = _pack_segments(
+            [
+                ("upd", upd_norm_local_flat),
+                ("w", w_norm_local_flat),
+                ("gram", gram_norm_local_flat),
+                ("upd_spec", upd_spectrum_local_flat),
+                ("w_spec", w_spectrum_local_flat),
+            ]
+        )
         if dp_replicate_mesh is not None and world_size > 1:
-            gathered_upd = funcol.all_gather_tensor(
-                upd, gather_dim=0, group=dp_replicate_mesh
+            gathered = funcol.all_gather_tensor(
+                local_buf, gather_dim=0, group=dp_replicate_mesh
             )
         else:
-            gathered_upd = upd
-
-        if apply_on_weight and w_norm_local_flat is not None:
-            w = w_norm_local_flat
-            if dp_replicate_mesh is not None and world_size > 1:
-                gathered_w = funcol.all_gather_tensor(
-                    w, gather_dim=0, group=dp_replicate_mesh
-                )
-            else:
-                gathered_w = w
-        else:
-            gathered_w = None
-
-        gathered_upd_spectrum = None
-        gathered_w_spectrum = None
-        if upd_spectrum_local_flat is not None:
-            if dp_replicate_mesh is not None and world_size > 1:
-                gathered_upd_spectrum = funcol.all_gather_tensor(
-                    upd_spectrum_local_flat, gather_dim=0, group=dp_replicate_mesh
-                )
-            else:
-                gathered_upd_spectrum = upd_spectrum_local_flat
-
-            if apply_on_weight and w_spectrum_local_flat is not None:
-                if dp_replicate_mesh is not None and world_size > 1:
-                    gathered_w_spectrum = funcol.all_gather_tensor(
-                        w_spectrum_local_flat, gather_dim=0, group=dp_replicate_mesh
-                    )
-                else:
-                    gathered_w_spectrum = w_spectrum_local_flat
+            gathered = local_buf
+        per_rank_total = local_buf.numel()
 
         if self.is_dp_rank_0:
             cleaned_names = (
@@ -3156,18 +3298,24 @@ class DiSCO(AbstractDiSCO):
             for param_idx, cleaned in enumerate(cleaned_names):
                 owner_rank = owner_ranks[param_idx]
                 owner_bucket = owner_buckets[param_idx]
-                base = (owner_rank * total_buckets + owner_bucket) * num_norm_types
+                rank_base = owner_rank * per_rank_total
+                base = offsets["upd"] + owner_bucket * num_norm_types
+                w_base = offsets["w"] + owner_bucket * num_norm_types
                 for k, norm_name in enumerate(self.norms_to_log):
-                    idx = base + k
-                    final_norms[f"track_update_{norm_name}/{cleaned}"] = gathered_upd[
-                        idx
+                    final_norms[f"track_update_{norm_name}/{cleaned}"] = gathered[
+                        rank_base + base + k
                     ]
-                    if apply_on_weight:
-                        final_norms[f"track_param_{norm_name}/{cleaned}"] = gathered_w[
-                            idx
+                    final_norms[f"track_param_{norm_name}/{cleaned}"] = gathered[
+                        rank_base + w_base + k
+                    ]
+                if "gram" in offsets:
+                    gram_base = offsets["gram"] + owner_bucket * num_gram_types
+                    for gk, gram_name in enumerate(self.gram_metrics_to_log):
+                        final_norms[f"track_gram_{gram_name}/{cleaned}"] = gathered[
+                            rank_base + gram_base + gk
                         ]
 
-            if gathered_upd_spectrum is not None:
+            if "upd_spec" in offsets:
                 spectrum_lens = (
                     self._ddp_spectrum_len_by_param
                     if len(self._ddp_spectrum_len_by_param) == len(ddp_param_names)
@@ -3184,52 +3332,70 @@ class DiSCO(AbstractDiSCO):
                         if owner_bucket >= len(rank_offsets):
                             continue
                         length = spectrum_lens[param_idx]
-                        chunk_start = owner_rank * self._ddp_spectrum_max_total
-                        start = chunk_start + rank_offsets[owner_bucket]
-                        final_norms[
-                            f"track_spectrum_update/{cleaned}"
-                        ] = gathered_upd_spectrum[start : start + length]
-                        if apply_on_weight and gathered_w_spectrum is not None:
-                            final_norms[
-                                f"track_spectrum_param/{cleaned}"
-                            ] = gathered_w_spectrum[start : start + length]
+                        rank_base = owner_rank * per_rank_total
+                        upd_spec_start = (
+                            rank_base + offsets["upd_spec"] + rank_offsets[owner_bucket]
+                        )
+                        final_norms[f"track_spectrum_update/{cleaned}"] = gathered[
+                            upd_spec_start : upd_spec_start + length
+                        ]
+                        if "w_spec" in offsets:
+                            w_spec_start = (
+                                rank_base
+                                + offsets["w_spec"]
+                                + rank_offsets[owner_bucket]
+                            )
+                            final_norms[f"track_spectrum_param/{cleaned}"] = gathered[
+                                w_spec_start : w_spec_start + length
+                            ]
 
         if self.is_dp_rank_0:
             self.norms_at_current_step.update(final_norms)
 
-    def _gather_and_log_fsdp_norms(
+    def _gather_and_log_fsdp(
         self,
         norms_of_update,
         norms_of_weight,
+        upd_spectrum_local_flat,
+        w_spectrum_local_flat,
         fsdp_mesh,
         device,
         fsdp_param_names,
         world_size,
         total_buckets,
-        apply_on_weight,
+        norms_of_gram=None,
     ):
         """
-        Gathers FSDP norm tensors from all ranks and logs them on rank 0.
-        This is a collective operation followed by a rank-0 logging step.
+        Gathers FSDP norm/gram/spectrum tensors from all ranks and logs them
+        on rank 0. One collective for everything this step (scalar
+        update/weight/gram norms, fixed stride `total_buckets * num_types`,
+        plus both spectrum halves, variable per-param length padded per-rank
+        to `_fsdp_spectrum_max_total` -- see `_precompute_fsdp_metadata`),
+        instead of a separate all_gather per segment -- same "single flat
+        buffer" pattern `step_experts`/`step_ddp`'s Phase D use.
         """
-        # --- 1. Collective Communication: All ranks must participate ---
         upd = torch.stack(norms_of_update).float().to(device)
-        gathered_update_norms = funcol.all_gather_tensor(
-            upd, gather_dim=0, group=fsdp_mesh
+        w = torch.stack(norms_of_weight).float().to(device) if norms_of_weight else None
+        # norms_of_gram stays empty whenever the gram registry is empty (see
+        # gram_helper.py) -- no separate "is gram active" flag needed here.
+        gram = torch.stack(norms_of_gram).float().to(device) if norms_of_gram else None
+
+        local_buf, offsets = _pack_segments(
+            [
+                ("upd", upd),
+                ("w", w),
+                ("gram", gram),
+                ("upd_spec", upd_spectrum_local_flat),
+                ("w_spec", w_spectrum_local_flat),
+            ]
         )
+        gathered = funcol.all_gather_tensor(local_buf, gather_dim=0, group=fsdp_mesh)
+        per_rank_total = local_buf.numel()
 
-        gathered_weight_norms = None
-        if apply_on_weight and norms_of_weight:
-            w = torch.stack(norms_of_weight).float().to(device)
-            gathered_weight_norms = funcol.all_gather_tensor(
-                w, gather_dim=0, group=fsdp_mesh
-            )
-
-        # --- 2. Local Processing: Only rank 0 processes and logs the results ---
         final_norms = {}
         if self.is_dp_rank_0:
             num_norm_types = len(self.norms_to_log)
-            entries_per_rank = total_buckets * num_norm_types
+            num_gram_types = len(self.gram_metrics_to_log)
             cleaned_names = [
                 remove_orig_mod_and_weight_for_p_name(pn) for pn in fsdp_param_names
             ]
@@ -3237,71 +3403,48 @@ class DiSCO(AbstractDiSCO):
             for param_idx, cleaned_p_name in enumerate(cleaned_names):
                 owner_rank = param_idx % world_size
                 bucket_idx_on_owner = param_idx // world_size
-                base = (
-                    owner_rank * entries_per_rank + bucket_idx_on_owner * num_norm_types
-                )
+                rank_base = owner_rank * per_rank_total
+                base = offsets["upd"] + bucket_idx_on_owner * num_norm_types
 
                 for norm_idx, norm_name in enumerate(self.norms_to_log):
-                    idx = base + norm_idx
                     final_norms[
                         f"track_update_{norm_name}/{cleaned_p_name}"
-                    ] = gathered_update_norms[idx]
-                    if apply_on_weight and gathered_weight_norms is not None:
+                    ] = gathered[rank_base + base + norm_idx]
+                    if "w" in offsets:
+                        w_base = offsets["w"] + bucket_idx_on_owner * num_norm_types
                         final_norms[
                             f"track_param_{norm_name}/{cleaned_p_name}"
-                        ] = gathered_weight_norms[idx]
+                        ] = gathered[rank_base + w_base + norm_idx]
 
-        if self.is_dp_rank_0:
-            self.norms_at_current_step.update(final_norms)
+                if "gram" in offsets:
+                    gram_base = offsets["gram"] + bucket_idx_on_owner * num_gram_types
+                    for gram_idx, gram_name in enumerate(self.gram_metrics_to_log):
+                        final_norms[
+                            f"track_gram_{gram_name}/{cleaned_p_name}"
+                        ] = gathered[rank_base + gram_base + gram_idx]
 
-    def _gather_and_log_fsdp_spectrum(
-        self,
-        upd_spectrum_local_flat,
-        w_spectrum_local_flat,
-        fsdp_mesh,
-        fsdp_param_names,
-        apply_on_weight,
-    ):
-        """
-        Gathers raw singular-value spectra from all ranks and logs them on rank 0.
-
-        Unlike `_gather_and_log_fsdp_norms`, per-param length varies (it's
-        min(fan_in, fan_out), not a fixed stride), so each rank's local buffer is
-        padded to `_fsdp_spectrum_max_total` (the largest per-rank total across all
-        ranks, precomputed once in `_precompute_fsdp_metadata`) rather than to a
-        uniform per-param stride.
-        """
-        gathered_upd = funcol.all_gather_tensor(
-            upd_spectrum_local_flat, gather_dim=0, group=fsdp_mesh
-        )
-        gathered_w = None
-        if apply_on_weight and w_spectrum_local_flat is not None:
-            gathered_w = funcol.all_gather_tensor(
-                w_spectrum_local_flat, gather_dim=0, group=fsdp_mesh
-            )
-
-        final_norms = {}
-        if self.is_dp_rank_0:
-            world_size = len(self._fsdp_spectrum_offsets_by_rank)
-            cleaned_names = [
-                remove_orig_mod_and_weight_for_p_name(pn) for pn in fsdp_param_names
-            ]
-            for param_idx, cleaned_p_name in enumerate(cleaned_names):
-                owner_rank = param_idx % world_size
-                owner_bucket = param_idx // world_size
-                rank_offsets = self._fsdp_spectrum_offsets_by_rank[owner_rank]
-                if owner_bucket >= len(rank_offsets):
-                    continue
-                length = self._fsdp_spectrum_len_by_param[param_idx]
-                chunk_start = owner_rank * self._fsdp_spectrum_max_total
-                start = chunk_start + rank_offsets[owner_bucket]
-                final_norms[f"track_spectrum_update/{cleaned_p_name}"] = gathered_upd[
-                    start : start + length
-                ]
-                if apply_on_weight and gathered_w is not None:
-                    final_norms[f"track_spectrum_param/{cleaned_p_name}"] = gathered_w[
-                        start : start + length
+            if "upd_spec" in offsets:
+                for param_idx, cleaned_p_name in enumerate(cleaned_names):
+                    owner_rank = param_idx % world_size
+                    owner_bucket = param_idx // world_size
+                    rank_offsets = self._fsdp_spectrum_offsets_by_rank[owner_rank]
+                    if owner_bucket >= len(rank_offsets):
+                        continue
+                    length = self._fsdp_spectrum_len_by_param[param_idx]
+                    rank_base = owner_rank * per_rank_total
+                    upd_spec_start = (
+                        rank_base + offsets["upd_spec"] + rank_offsets[owner_bucket]
+                    )
+                    final_norms[f"track_spectrum_update/{cleaned_p_name}"] = gathered[
+                        upd_spec_start : upd_spec_start + length
                     ]
+                    if "w_spec" in offsets:
+                        w_spec_start = (
+                            rank_base + offsets["w_spec"] + rank_offsets[owner_bucket]
+                        )
+                        final_norms[
+                            f"track_spectrum_param/{cleaned_p_name}"
+                        ] = gathered[w_spec_start : w_spec_start + length]
 
         if self.is_dp_rank_0:
             self.norms_at_current_step.update(final_norms)
@@ -3313,11 +3456,9 @@ class DiSCO(AbstractDiSCO):
         fsdp_param_names,
         workspace,
         skip_update=False,
-        apply_on_weight=True,
     ):
 
         need_to_calculate_norm = self.need_to_calculate_norm
-        apply_on_weight = apply_on_weight and need_to_calculate_norm
 
         fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
         world_size, rank = fsdp_mesh.size(), fsdp_mesh.get_local_rank()
@@ -3336,8 +3477,25 @@ class DiSCO(AbstractDiSCO):
         fsdp_group = fsdp_mesh.get_group()
 
         global_updates = [None] * len(fsdp_params)
-        norms_of_update, norms_of_weight = [], []
+        norms_of_update, norms_of_weight, norms_of_gram = [], [], []
         padding_norms = self._get_cached_padding_norms(device)
+        # Empty whenever the gram registry is empty (see gram_helper.py) --
+        # no separate "is gram active" flag needed, callers just check
+        # truthiness of gram_padding/norms_of_gram.
+        gram_padding = {
+            name: self._get_cached_zero_scalar(device)
+            for name in self.gram_metrics_to_log
+        }
+
+        # Use pre-computed total_buckets from init.
+        total_buckets = self._fsdp_total_buckets
+
+        # Per-bucket LMO update, kept alive across both a2a modes so the
+        # (now pre-update) weight-norm/gram block below -- moved to run
+        # BEFORE the real apply -- can pair each bucket's full weight with
+        # its update. A "bit more temporary memory" (per-bucket references
+        # held a little longer), no new communication.
+        u_keepalive: list[torch.Tensor | None] = [None] * total_buckets
 
         # Singular-value spectrum: a separate flat buffer padded to the largest
         # per-rank total across all ranks (`_fsdp_spectrum_max_total`), since
@@ -3349,13 +3507,9 @@ class DiSCO(AbstractDiSCO):
             upd_spectrum_local_flat = torch.zeros(
                 self._fsdp_spectrum_max_total, dtype=torch.float32, device=device
             )
-            if apply_on_weight:
-                w_spectrum_local_flat = torch.zeros(
-                    self._fsdp_spectrum_max_total, dtype=torch.float32, device=device
-                )
-
-        # Use pre-computed total_buckets from init.
-        total_buckets = self._fsdp_total_buckets
+            w_spectrum_local_flat = torch.zeros(
+                self._fsdp_spectrum_max_total, dtype=torch.float32, device=device
+            )
 
         use_global_fast_path = self.fsdp_a2a_mode == "once"
         bucket_workspace = None
@@ -3400,7 +3554,6 @@ class DiSCO(AbstractDiSCO):
             # Clean LMO loop: only lmo() + optional reduce + optional norm.
             # Reverse-pack source view creation is moved outside this loop.
             bucket_norm_dicts: list[dict | None] = [None] * total_buckets
-            u_keepalive: list[torch.Tensor] = []
 
             with record_function("disco.fsdp_lmo_loop"):
                 for bucket_idx in range(total_buckets):
@@ -3416,8 +3569,11 @@ class DiSCO(AbstractDiSCO):
                             u, group=dp_replicate_mesh, op=dist.ReduceOp.AVG
                         )
 
-                    if not skip_update:
-                        u_keepalive.append(u)
+                    # Kept alive regardless of skip_update -- the (now
+                    # pre-update) weight-norm/gram block below needs it
+                    # whenever we're logging this step, independent of
+                    # whether the real update gets applied this call.
+                    u_keepalive[bucket_idx] = u
 
                     if need_to_calculate_norm and my_param_in_bucket:
                         lr, *_ = self.groups_info[bucket_group_indices[rank]]
@@ -3440,10 +3596,11 @@ class DiSCO(AbstractDiSCO):
                     )
 
             if not skip_update:
-                if len(u_keepalive) != total_buckets:
+                if any(x is None for x in u_keepalive):
                     raise RuntimeError(
                         "FSDP once-mode unexpected number of LMO outputs: "
-                        f"got={len(u_keepalive)}, expected={total_buckets}."
+                        f"got={sum(x is not None for x in u_keepalive)}, "
+                        f"expected={total_buckets}."
                     )
                 torch._foreach_copy_(workspace["u_bufs"], u_keepalive)
                 # Batch pack: single _foreach_copy_ into persistent flat dst views.
@@ -3460,7 +3617,9 @@ class DiSCO(AbstractDiSCO):
                         input_split_sizes=self._fsdp_global_output_splits_elems,
                         group=fsdp_group,
                     )
-                u_keepalive.clear()
+                # Not cleared here -- the (now pre-update) weight-norm/gram
+                # block below, which runs before the real apply, still needs
+                # every bucket's `u`.
 
                 if global_upd_recv_cast is not None:
                     global_upd_recv_cast.copy_(global_upd_recv)
@@ -3476,8 +3635,8 @@ class DiSCO(AbstractDiSCO):
         else:
             bucket_workspace = self._allocate_fsdp_bucket_workspace(
                 cast_dtype=cast_dtype,
-                device=workspace["device"],
-                apply_on_weight=apply_on_weight,
+                device=device,
+                need_to_calculate_norm=need_to_calculate_norm,
                 skip_update=skip_update,
             )
 
@@ -3543,6 +3702,10 @@ class DiSCO(AbstractDiSCO):
                 if dp_replicate_mesh and self.extra_reduce_for_HSDP:
                     dist.all_reduce(u, group=dp_replicate_mesh, op=dist.ReduceOp.AVG)
 
+                # Kept alive for the (now pre-update) weight-norm/gram block
+                # below, which runs before the real apply.
+                u_keepalive[bucket_idx] = u
+
                 if not skip_update:
                     upd_send_flat = upd_send_scratch[:recv_total]
                     updates_send_list = list(torch.split(u, split_rows, dim=0))
@@ -3585,18 +3748,16 @@ class DiSCO(AbstractDiSCO):
                         upd_norms = padding_norms
                     norms_of_update.extend(upd_norms.values())
 
-        # Single vectorised apply.
-        if not skip_update:
-            self.update_bucket_params(
-                fsdp_params,
-                global_updates,
-                0,
-                len(fsdp_params),
-                tp_mesh=tp_mesh,
-            )
-
-        # --- Calculate Weight Norms (POST-UPDATE) ---
-        if apply_on_weight:
+        # --- Calculate Weight Norms + Gram Metrics (PRE-UPDATE) ---
+        # Moved to run BEFORE "Single vectorised apply" below (was "POST-
+        # UPDATE"), so `full_weight` here is genuinely pre-update -- needed
+        # so calculate_gram_metrics gets W and U (from u_keepalive)
+        # simultaneously (see gram_helper.py). Same all_to_all_single as
+        # before, just earlier -- no new communication. track_param_* keeps
+        # its historical post-update meaning via a cheap local pseudo-weight
+        # (_pseudo_post_update_weight) instead of re-reading the parameter a
+        # second time after the real apply.
+        if need_to_calculate_norm:
             param_send_scratch = (
                 bucket_workspace["param_send_flat"] if bucket_workspace else None
             )
@@ -3653,39 +3814,57 @@ class DiSCO(AbstractDiSCO):
                     ].view(recv_shapes[src])
                     for src in range(world_size)
                 ]
-                full_weight = torch.cat(recv_views, dim=0)
+                full_weight = torch.cat(recv_views, dim=0)  # pre-update
 
                 if my_param_in_bucket:
-                    w_norms = calculate_norm(full_weight, self.norms_to_log)
+                    u = u_keepalive[bucket_idx]
+                    bucket_group_indices = self._fsdp_bucket_group_indices[bucket_idx]
+                    lr, _, _, wd, _ = self.groups_info[bucket_group_indices[rank]]
+                    pseudo_w = _pseudo_post_update_weight(full_weight, u, lr, wd)
+                    w_norms = calculate_norm(pseudo_w, self.norms_to_log)
                     w_spec = w_norms.pop("spectrum")
                     if w_spectrum_local_flat is not None and bucket_idx < len(
                         self._fsdp_spectrum_offsets
                     ):
                         off = self._fsdp_spectrum_offsets[bucket_idx]
                         w_spectrum_local_flat[off : off + w_spec.numel()].copy_(w_spec)
+
+                    # Always called -- cheap no-op when the registry is
+                    # empty (see gram_helper.py), so no extra "is gram
+                    # active" flag/branch is needed.
+                    gram_metrics = calculate_gram_metrics(
+                        full_weight, u, self.gram_metrics_to_log
+                    )
                 else:
                     w_norms = padding_norms
+                    gram_metrics = gram_padding
                 norms_of_weight.extend(w_norms.values())
+                norms_of_gram.extend(gram_metrics.values())
 
-        if need_to_calculate_norm and upd_spectrum_local_flat is not None:
-            self._gather_and_log_fsdp_spectrum(
-                upd_spectrum_local_flat,
-                w_spectrum_local_flat,
-                fsdp_mesh,
-                fsdp_param_names,
-                apply_on_weight,
+        # Single vectorised apply. Runs AFTER weight-norm/gram calculation
+        # above (moved from before it) so the full-weight reads above see
+        # genuinely pre-update weights.
+        if not skip_update:
+            self.update_bucket_params(
+                fsdp_params,
+                global_updates,
+                0,
+                len(fsdp_params),
+                tp_mesh=tp_mesh,
             )
 
         if need_to_calculate_norm and norms_of_update:
-            self._gather_and_log_fsdp_norms(
+            self._gather_and_log_fsdp(
                 norms_of_update,
                 norms_of_weight,
+                upd_spectrum_local_flat,
+                w_spectrum_local_flat,
                 fsdp_mesh,
                 device,
                 fsdp_param_names,
                 world_size,
                 total_buckets,
-                apply_on_weight,
+                norms_of_gram=norms_of_gram,
             )
 
         if dp_replicate_mesh is not None:

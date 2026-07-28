@@ -7,6 +7,7 @@
 import torch
 from torch.distributed.tensor import DTensor
 
+from .gram_helper import GRAM_METRIC_FUNCTIONS
 from .muon_utils import zeropower_backends
 from .norm_helper import NORM_FUNCTIONS
 
@@ -136,6 +137,11 @@ class AbstractDiSCO(torch.optim.Optimizer):
         # Norm tracking state
         self.need_to_calculate_norm: bool = False
         self.norms_to_log: list[str] = list(NORM_FUNCTIONS.keys())
+        # Gram metrics (functions of a weight AND its update, e.g. alignment)
+        # share the same need_to_calculate_norm gate -- no separate flag.
+        # GRAM_METRIC_FUNCTIONS is empty today, so this is a no-op until
+        # metrics are added (see optimizers/gram_helper.py).
+        self.gram_metrics_to_log: list[str] = list(GRAM_METRIC_FUNCTIONS.keys())
         self.norms_at_current_step: dict[str, torch.Tensor] = {}
 
     # ----- Step norm tracking -----
