@@ -46,6 +46,7 @@ def create_disco_optimizer_kwargs_from_optimizer_config(
     lr = optimizer_config.lr
     eps = optimizer_config.eps
     norm_factor = optimizer_config.norm_factor
+    pre_norm = getattr(optimizer_config, "pre_norm", "identity")
 
     optimizer_kwargs = {
         "parallel_dims": parallel_dims,
@@ -56,6 +57,7 @@ def create_disco_optimizer_kwargs_from_optimizer_config(
         "nesterov": nesterov,
         "eps": eps,
         "norm_factor": norm_factor,
+        "pre_norm": pre_norm,
         "backend": zeropower_backend_algorithm,
         "backend_steps": backend_steps,
     }
@@ -136,6 +138,7 @@ def create_disco_param_groups(
         "nesterov": optimizer_kwargs.get("nesterov"),
         "eps": optimizer_kwargs.get("eps"),
         "norm_factor": optimizer_kwargs.get("norm_factor"),
+        "pre_norm": optimizer_kwargs.get("pre_norm", "identity"),
         "backend": optimizer_kwargs.get("backend"),
         "backend_steps": optimizer_kwargs.get("backend_steps"),
         # should be explicitly set in the extra_param_group_split_rules

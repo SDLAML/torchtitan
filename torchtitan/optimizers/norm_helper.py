@@ -127,7 +127,7 @@ NORM_FUNCTIONS = {
     "average_entry_size": average_entry_size,
     "stable_rank": stable_rank,
     "effective_rank": effective_rank,
-    "effective_rank_normalized": effective_rank_normalized,
+    # "effective_rank_normalized": effective_rank_normalized,
     "effective_rank_squared": effective_rank_squared,
 }
 
@@ -188,7 +188,7 @@ def fused_metrics(W, eps=1e-20):
         "average_entry_size": avg_entry,
         "stable_rank": srank,
         "effective_rank": erank,
-        "effective_rank_normalized": erank_norm,
+        # "effective_rank_normalized": erank_norm,
         "effective_rank_squared": erank_sq,
         "spectrum": S,
     }

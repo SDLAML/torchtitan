@@ -104,6 +104,15 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         norm_factor: str = "spectral"
         """Which norm factor to use"""
 
+        pre_norm: str = "identity"
+        """
+        Pre-norm applied to the effective gradient before any communication
+        for LMO. "identity" is a no-op. Prefix before the first "-" selects
+        the variant: "row-*" (local, no comm), "col-*"/"mat-*" (one fused
+        all-reduce across FSDP-sharded params using this pre_norm that
+        step). See optimizers/pre_norm_helper.py.
+        """
+
         zeropower_backend: str = "newtonschulz5"
         "Which `zeropower_backend` to use."
 

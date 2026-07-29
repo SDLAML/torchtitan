@@ -17,6 +17,7 @@ tracking (a secondary concern layered on top) is covered at the end.
   update-shaping math per `norm_factor`), and norm/gram tracking *state*
   (`need_to_calculate_norm`, `norms_to_log`, `gram_metrics_to_log`, `norms_at_current_step`).
 - `norm_helper.py` / `gram_helper.py` — see "Norm/gram/spectrum tracking" below.
+- `pre_norm_helper.py` — see "Pre-norm: a stage before LMO" below.
 - `spectrum_logging.py` — turns raw `track_spectrum_*` tensors into W&B images / Parquet export.
 - `readme.md` — this file.
 
@@ -93,6 +94,68 @@ embed param count/sharding ever makes it matter, not something built today.
     buffer for everything up front) — the fast path, and the only one exercised by default.
   - `"bucket"`: one `all_to_all_single` pair *per bucket* — a fallback, apparently rarely
     exercised (see the bug below, which only this path hit).
+
+## Pre-norm: a stage before LMO
+
+`AbstractDiSCO.lmo` fuses "orthogonalize" (Newton-Schulz, needs the full matrix) with "post-norm"
+(`normalise_grad`). **Pre-norm** is a third, earlier stage applied to the effective gradient (raw
+grad, or momentum-blended buffer if `momentum > 0`) **before any communication for LMO** — so it
+runs on the raw tensor in its original dtype, before the communication-dtype downcast. Configured
+per group via `pre_norm` (defaults to `"identity"`, a no-op), same override mechanism
+(`extra_param_group_split_rules`) as `norm_factor`/`backend`.
+
+Only matters for `step_fsdp`/`step_embedding` — `step_ddp`/`step_experts` already have the full
+matrix locally (DDP replication; EP shards along the expert axis only), so pre-norm there is a
+direct computation, no special handling.
+
+Config values look like `"row-l2"`/`"col-l2"`/`"mat-l2"` — the prefix before the first `-`
+(`row`/`col`/`mat`) selects the communication strategy, the full string selects the formula
+(`pre_norm_helper.py`'s `PRE_NORM_*` registries), so later variants (`"col-rms"`, ...) slot in
+without touching dispatch code:
+
+- **row** (`row-l2`): reduces along dim=-1, which is never the FSDP-sharded dimension — a local
+  shard already holds complete rows, so this is **zero communication**. Applied inline, directly to
+  `g` (DTensor or plain Tensor, whichever it already is) at the exact point it's fetched in
+  `get_momentum_or_grad`/`get_momentum_or_grad_list`/`_get_effective_grad_by_group`
+  (`_apply_row_pre_norm`) — no separate pass, no cache, no `.to_local()` unwrap. dim=-1 reduction on
+  a DTensor dispatches locally per shard, same as any other local op.
+- **col**/**mat** (`col-l2`/`mat-l2`): reduce along the FSDP-sharded dimension / the whole matrix —
+  genuinely need combining across ranks. `_apply_reduce_pre_norm_pass` (called once per step, right
+  after `prepare_gradients_and_momentum`) does this in two batched phases instead of a per-param
+  loop:
+  1. Groups every col/mat param by `(is_fsdp_row_sharded, exact pre_norm string, local_shard_shape,
+     eps)` (`_precompute_pre_norm_metadata`, once at init — mirrors the existing
+     `_embed_extra_shape_groups`/FSDP-bucket shape-grouping pattern), then computes **one**
+     `torch.stack` + one vectorized reduction per shape group instead of N individual per-param
+     calls.
+  2. Every FSDP-sharded group's partial sum-of-squares gets packed into **one** buffer
+     (`_pack_segments`, same helper `step_ddp`/`step_fsdp` already use for norm-logging fusion) for
+     a **single** `dist.all_reduce`, regardless of how many groups or params exist that step.
+     Non-sharded groups (DDP/experts/non-FSDP-sharded embed) skip the all-reduce entirely — their
+     local view is already the full tensor.
+
+  Results are cached in `self._pre_normed_grad_cache` (keyed by `id(p)`); the 3 effective-grad
+  fetchers check this cache first and return directly instead of recomputing. `gather_to_local=True`
+  callers (only `step_embedding`'s norm-logging re-fetch, gated behind `need_to_calculate_norm`, not
+  the hot path) bypass the cache and reapply the full-tensor formula fresh once already gathered —
+  mathematically identical, no all-reduce needed once the data is whole.
+
+**Known limitation — TP composition is out of scope.** A param that's *both* FSDP/DDP-sharded and
+TP-sharded isn't handled correctly: row-norm assumes dim=-1 isn't TP-sharded (breaks under
+TP col-parallel, `Shard(dim=1)`); col/mat's "already full" branch for DDP/experts/non-sharded embed
+does a plain `.to_local()`, not `_prepare_ddp_lmo`'s TP-aware gather. Pre-norm is approximate under
+TP composition, not solved in this pass — same scoping decision made explicitly up front, not
+discovered as a gap.
+
+**Known limitation — 1-D params aren't supported.** Row/col/mat all assume a matrix shape
+`[rows, cols]` where FSDP shards dim 0 and dim=-1 is a separate, unsharded axis. For a genuinely
+1-D param (e.g. a bias vector — a real, supported case elsewhere, see `lmo()`'s `ndim==1` branch),
+dim=-1 *is* dim 0 *is* the sharded dim, so row's "dim=-1 is never sharded" premise and col/mat's
+row-vs-column distinction both collapse — worse, silently stacking several different 1-D params
+together would reduce *across params* instead of within one. `_precompute_pre_norm_metadata` raises
+a clear `ValueError` at init if a non-`identity` `pre_norm` is configured on a `<2`-D param (and
+scalar/`step_scalar` groups assert `pre_norm == "identity"` outright) rather than computing
+something silently wrong — use `"identity"` for bias-like params for now.
 
 ## A real, pre-existing bug found while reviewing this file
 

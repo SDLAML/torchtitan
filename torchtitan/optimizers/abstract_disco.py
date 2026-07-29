@@ -224,7 +224,7 @@ class AbstractDiSCO(torch.optim.Optimizer):
                 raise ValueError("conv_spectral expects 4-D or 5-D conv weights")
             g = fused_conv_spectral(g, out_ch, in_ch, spatial)
 
-        elif norm_factor == "none":
+        elif norm_factor in ("none", "identity"):
             pass
         else:
             raise ValueError(f"Unknown norm_factor: {norm_factor}")

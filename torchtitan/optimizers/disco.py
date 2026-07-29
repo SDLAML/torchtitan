@@ -21,6 +21,13 @@ from .abstract_disco import AbstractDiSCO
 
 from .gram_helper import calculate_gram_metrics
 from .norm_helper import calculate_norm
+from .pre_norm_helper import (
+    pre_norm_category,
+    PRE_NORM_FULL_FUNCTIONS,
+    PRE_NORM_PARTIAL_FUNCTIONS,
+    PRE_NORM_ROW_FUNCTIONS,
+    PRE_NORM_SHARDED_APPLY_FUNCTIONS,
+)
 from .utils import remove_orig_mod_and_weight_for_p_name
 
 __all__ = [
@@ -91,6 +98,24 @@ def gather_tp_shard(tensor, tp_mesh, tp_world_size, original_placements):
     # dist.all_gather(output_tensors, tensor, group=tp_group)
     # return torch.cat(output_tensors, dim=shard_dim)
     return funcol.all_gather_tensor(tensor, gather_dim=shard_dim, group=tp_mesh)
+
+
+def _is_fsdp_row_sharded(p) -> bool:
+    """
+    True iff `p` is a DTensor genuinely row-sharded (Shard(0)) along the
+    "fsdp" mesh dimension -- i.e. a local view of `p` only holds *some* rows,
+    not the full matrix. `step_fsdp`'s own params are always this way by
+    construction; `step_embedding`'s params are routed by a config check
+    (backend=="identity"), independent of physical sharding, so this needs a
+    per-param structural check.
+    """
+    if not isinstance(p, DTensor):
+        return False
+    mesh_dim_names = p.device_mesh.mesh_dim_names
+    if not mesh_dim_names or "fsdp" not in mesh_dim_names:
+        return False
+    placement = p.placements[mesh_dim_names.index("fsdp")]
+    return isinstance(placement, Shard) and placement.dim == 0
 
 
 def _pseudo_post_update_weight(w, u, lr, wd):
@@ -179,6 +204,7 @@ class DiSCO(AbstractDiSCO):
         backend,
         backend_steps,
         parallel_dims,
+        pre_norm="identity",
         communication_dtype=torch.bfloat16,
         extra_reduce_for_HSDP=False,
         experts_weights_layout="G-D_out-D_in",
@@ -200,6 +226,7 @@ class DiSCO(AbstractDiSCO):
             nesterov=nesterov,
             eps=eps,
             norm_factor=norm_factor if not debug_mode else "none",
+            pre_norm=pre_norm,
             backend=backend if not debug_mode else "identity",
             backend_steps=backend_steps,
             splits_into=None,  # should be explicitly set in the extra_param_group_split_rules
@@ -250,6 +277,8 @@ class DiSCO(AbstractDiSCO):
 
         self.communication_dtype = communication_dtype
         self.groups_info = {}
+        self.groups_pre_norm: dict[int, str] = {}
+        self.groups_pre_norm_eps: dict[int, float] = {}
         self.parameters_to_groups = {}
         for group_idx, group in enumerate(self.param_groups):
             lr = group["lr"]
@@ -265,6 +294,8 @@ class DiSCO(AbstractDiSCO):
                 "splits_dim": group["splits_dim"],
             }
             self.groups_info[group_idx] = [lr, nesterov, momentum, wd, param_kwargs]
+            self.groups_pre_norm[group_idx] = group.get("pre_norm", "identity")
+            self.groups_pre_norm_eps[group_idx] = group["eps"]
             for param in group["params"]:
                 self.parameters_to_groups[id(param)] = group_idx
 
@@ -323,6 +354,10 @@ class DiSCO(AbstractDiSCO):
                     assert (
                         group["norm_factor"] == "sign"
                     ), "scale params must use sign norm factor"
+                    assert group.get("pre_norm", "identity") == "identity", (
+                        "scale params must use identity pre_norm -- row/col/mat "
+                        "aren't well-defined for a 1-element tensor"
+                    )
                     self.scale_params.append(p)
                     self.scale_param_names.append(p_name)
                     continue
@@ -407,6 +442,7 @@ class DiSCO(AbstractDiSCO):
         self._precompute_ddp_metadata()
         self._precompute_embed_metadata()
         self._precompute_momentum_bufs()
+        self._precompute_pre_norm_metadata()
 
     # ------------------------------------------------------------------
     # Pre-compute helpers (called once from _build_param_lists at init)
@@ -1816,6 +1852,73 @@ class DiSCO(AbstractDiSCO):
         self._momentum_plan_key: tuple[float, ...] | None = None
         self._momentum_execution_plan: list[tuple[float, list, list]] = []
 
+    def _precompute_pre_norm_metadata(self):
+        """
+        Pre-compute the col/mat pre-norm plan: which non-scalar params need
+        the fused all-reduce pass (_apply_reduce_pre_norm_pass), grouped by
+        (is_fsdp_row_sharded, exact pre_norm string, local_shard_shape, eps)
+        so the pass can process each group with one torch.stack + batched op
+        instead of a per-param loop -- keying on the exact pre_norm string
+        (not just category) and eps keeps every batch's formula/eps uniform,
+        since different groups can share a category/shape but use different
+        eps or (in the future) different formulas within the same category.
+        Row category needs no plan entry -- applied inline at fetch time
+        (see get_momentum_or_grad/get_momentum_or_grad_list/
+        _get_effective_grad_by_group).
+        """
+        self._pre_norm_reduce_shape_groups: dict[
+            tuple[bool, str, tuple, float], list[tuple[torch.Tensor, int]]
+        ] = {}
+        self._pre_normed_grad_cache: dict[int, torch.Tensor] = {}
+        self._fsdp_group = None
+        if self.fsdp_enabled:
+            fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
+            if fsdp_mesh is not None:
+                self._fsdp_group = fsdp_mesh.get_group()
+
+        all_params = (
+            list(self.embed_params)
+            + list(self.ddp_params)
+            + list(self.fsdp_params)
+            + list(self.expert_params)
+        )
+        for p in all_params:
+            group_idx = self.parameters_to_groups[id(p)]
+            pre_norm = self.groups_pre_norm.get(group_idx, "identity")
+            if pre_norm == "identity":
+                continue
+            category = pre_norm_category(pre_norm)
+            if category not in ("row", "col", "mat"):
+                raise ValueError(
+                    f"Unknown pre_norm '{pre_norm}': category '{category}' "
+                    "must be 'row', 'col', or 'mat'."
+                )
+            local_shape = tuple(self._param_local_views[id(p)].shape)
+            if len(local_shape) < 2:
+                # row/col/mat all assume a matrix shape [rows, cols] where
+                # FSDP shards dim 0 (rows) and dim=-1 (cols) is a separate,
+                # unsharded axis. For a genuinely 1-D param (e.g. a bias
+                # vector, a real case -- see lmo()'s ndim==1 branch), dim=-1
+                # *is* dim 0 *is* the sharded dim, so row's "dim=-1 is never
+                # sharded" premise and col/mat's row-vs-column distinction
+                # both break down. Fail fast instead of silently computing
+                # a wrong reduction (e.g. reducing across stacked *different*
+                # params instead of within one).
+                raise ValueError(
+                    f"pre_norm='{pre_norm}' needs a >=2-D parameter (row vs "
+                    f"column/matrix axes aren't well-defined for a 1-D "
+                    f"tensor) -- got shape {local_shape}. Use pre_norm="
+                    f"'identity' for 1-D params (e.g. biases) for now."
+                )
+            if category == "row":
+                continue  # applied inline, no plan entry needed
+            sharded = _is_fsdp_row_sharded(p)
+            eps = self.groups_pre_norm_eps[group_idx]
+            key = (sharded, pre_norm, local_shape, eps)
+            self._pre_norm_reduce_shape_groups.setdefault(key, []).append(
+                (p, group_idx)
+            )
+
     @record_function("disco.prepare_ddp_lmo")
     def _prepare_ddp_lmo(
         self, ddp_params, workspace, tp_mesh=None, tp_world_size=1
@@ -1842,6 +1945,7 @@ class DiSCO(AbstractDiSCO):
                 params_bucket,
                 momentum,
                 nesterov,
+                group_idx,
                 gather_to_local=False,
                 to_local=False,
             )
@@ -1944,6 +2048,7 @@ class DiSCO(AbstractDiSCO):
             block_params,
             momentum,
             nesterov,
+            group_idx,
             to_local=True,
         )
 
@@ -2300,11 +2405,41 @@ class DiSCO(AbstractDiSCO):
             return x_local
         return x
 
+    def _apply_row_pre_norm(self, g, group_idx):
+        """
+        Applies row-category pre-norm directly to `g` (a DTensor, still
+        possibly row-sharded, or a plain Tensor) with zero communication --
+        dim=-1 is never the FSDP-sharded dimension, so this dispatches as a
+        local per-shard op. No-op for "identity" or col/mat (those go
+        through the batched _apply_reduce_pre_norm_pass instead).
+
+        Known limitation: if a param is TP-*column*-sharded (Shard(dim=1),
+        splitting dim=-1 across TP ranks -- see tp_axis's "col-parallel"
+        case), a local shard only has part of each row, so this would be
+        approximate. TP composition is out of scope for this pass (same
+        scoping decision as the FSDP+TP case for col/mat).
+        """
+        if g is None:
+            return g
+        pre_norm = self.groups_pre_norm.get(group_idx, "identity")
+        if pre_norm == "identity" or pre_norm_category(pre_norm) != "row":
+            return g
+        return PRE_NORM_ROW_FUNCTIONS[pre_norm](g, self.groups_pre_norm_eps[group_idx])
+
     def _get_effective_grad_by_group(self, p, group_idx, param_idx):
         """
         Fast path for effective grad retrieval in FSDP packing.
         Avoids state dict lookups and the generic helper call overhead.
         """
+        # pop, not get: each param is fetched at most once per step via a
+        # non-gather_to_local call, so releasing the cache entry immediately
+        # (rather than holding it until next step's cache reset) caps how
+        # long the extra pre-normed copy stays alive -- see _apply_reduce_
+        # pre_norm_pass's docstring for the memory-cost discussion.
+        cached = self._pre_normed_grad_cache.pop(id(p), None)
+        if cached is not None:
+            return cached
+
         g = p.grad
         if not p.requires_grad:
             p_name = (
@@ -2330,16 +2465,15 @@ class DiSCO(AbstractDiSCO):
         _, nesterov, momentum, _, _ = self.groups_info[group_idx]
         use_momentum = (not self.is_light) and (0.0 < momentum < 1.0)
         if not use_momentum:
-            return g
+            return self._apply_row_pre_norm(g, group_idx)
 
         buf = self._momentum_buffer_by_param_id.get(id(p))
         if buf is None:
             raise ValueError(
                 "Momentum buffer missing; ensure pre-pass ran before FSDP packing."
             )
-        if not nesterov:
-            return buf
-        return torch.lerp(buf, g, momentum)
+        g = buf if not nesterov else torch.lerp(buf, g, momentum)
+        return self._apply_row_pre_norm(g, group_idx)
 
     @record_function("disco.step")
     @torch.no_grad()
@@ -2364,8 +2498,11 @@ class DiSCO(AbstractDiSCO):
                 "splits_dim": group["splits_dim"],
             }
             self.groups_info[group_idx] = [lr, nesterov, momentum, wd, param_kwargs]
+            self.groups_pre_norm[group_idx] = group.get("pre_norm", "identity")
+            self.groups_pre_norm_eps[group_idx] = group["eps"]
 
         self.prepare_gradients_and_momentum()
+        self._apply_reduce_pre_norm_pass()
 
         fsdp_workspace = None
         if self.fsdp_params and self.fsdp_a2a_mode == "once":
@@ -2444,10 +2581,9 @@ class DiSCO(AbstractDiSCO):
 
         updates = []
         for p in scalar_params:
-            _, nesterov, momentum, _, _ = self.groups_info[
-                self.parameters_to_groups[id(p)]
-            ]
-            g = self.get_momentum_or_grad(p, momentum, nesterov)
+            group_idx = self.parameters_to_groups[id(p)]
+            _, nesterov, momentum, _, _ = self.groups_info[group_idx]
+            g = self.get_momentum_or_grad(p, momentum, nesterov, group_idx)
 
             if g is None:
                 updates.append(None)
@@ -2507,10 +2643,11 @@ class DiSCO(AbstractDiSCO):
         # Canonical params [0, 1] — per-param fetch (preserves TP edge-case handling)
         for i in range(min(2, len(embed_params))):
             p = embed_params[i]
-            _, nesterov, momentum, _, _ = self.groups_info[
-                self.parameters_to_groups[id(p)]
-            ]
-            g = self.get_momentum_or_grad(p, momentum, nesterov, gather_to_local=False)
+            group_idx = self.parameters_to_groups[id(p)]
+            _, nesterov, momentum, _, _ = self.groups_info[group_idx]
+            g = self.get_momentum_or_grad(
+                p, momentum, nesterov, group_idx, gather_to_local=False
+            )
             if g is not None and not self.fsdp_enabled and self.tp_enabled:
                 # Edge case: TP-only (no FSDP) — grad is Replicate, weight is sharded
                 original_placements = p.placements
@@ -2530,6 +2667,7 @@ class DiSCO(AbstractDiSCO):
                 params_in_group,
                 momentum,
                 nesterov,
+                gidx,
                 gather_to_local=False,
                 to_local=True,
             )
@@ -2600,13 +2738,12 @@ class DiSCO(AbstractDiSCO):
             norm_scratch: list = workspace["norm_scratch"]
 
             for i, (p, p_name) in enumerate(zip(embed_params, embed_param_names)):
-                lr, nesterov, momentum, wd, param_kwargs = self.groups_info[
-                    self.parameters_to_groups[id(p)]
-                ]
+                group_idx = self.parameters_to_groups[id(p)]
+                lr, nesterov, momentum, wd, param_kwargs = self.groups_info[group_idx]
 
                 # Gather full tensor for norm calculation
                 g = self.get_momentum_or_grad(
-                    p, momentum, nesterov, gather_to_local=True
+                    p, momentum, nesterov, group_idx, gather_to_local=True
                 )
                 u = self.lmo(g, **param_kwargs)
 
@@ -3903,12 +4040,158 @@ class DiSCO(AbstractDiSCO):
             torch._foreach_mul_(active_bufs, 1.0 - m)
             torch._foreach_add_(active_bufs, active_grads, alpha=m)
 
+    def _raw_effective_grad(self, p, group_idx):
+        """
+        grad, or momentum-blended buffer if momentum is in (0,1) -- no
+        pre-norm, no gather/dtype-cast. Shared by get_momentum_or_grad
+        (which adds row pre-norm + optional gather on top) and
+        _apply_reduce_pre_norm_pass (which adds col/mat pre-norm via the
+        batched all-reduce path). Looked up per-param (not once per shape
+        group) since a shape group can mix params from different groups
+        that happen to share the same pre_norm/shape/eps.
+        """
+        g = p.grad
+        if g is None or not p.requires_grad:
+            return None
+        _, nesterov, momentum, _, _ = self.groups_info[group_idx]
+        use_momentum = (not self.is_light) and (0.0 < momentum < 1.0)
+        if not use_momentum:
+            return g
+        buf = self._momentum_buffer_by_param_id.get(id(p))
+        if buf is None:
+            raise ValueError(
+                "Momentum buffer missing; ensure pre-pass ran before calling _raw_effective_grad."
+            )
+        return buf if not nesterov else torch.lerp(buf, g, momentum)
+
+    @record_function("disco.apply_reduce_pre_norm_pass")
+    def _apply_reduce_pre_norm_pass(self):
+        """
+        Col/mat pre-norm: computes the pre-normed effective gradient for
+        every param whose group's pre_norm is a col/mat variant, caching
+        results in self._pre_normed_grad_cache (keyed by id(p)) for
+        get_momentum_or_grad/get_momentum_or_grad_list/
+        _get_effective_grad_by_group to return directly. Row category needs
+        no pass -- applied inline in those 3 functions instead.
+
+        Batched by shape group (self._pre_norm_reduce_shape_groups, built
+        once at init): one torch.stack + one vectorized reduction per group
+        instead of a per-param Python loop, and every FSDP-sharded group's
+        partial sum-of-squares is packed into ONE buffer for a single
+        dist.all_reduce, regardless of how many groups/params exist.
+
+        Known limitation (TP composition is out of scope for this pass, per
+        the FSDP+TP scoping decision -- the same applies here to DDP+TP):
+        the `sharded=False` ("already full") branch below does a plain
+        `.to_local()` unwrap, not the TP-aware gather `_prepare_ddp_lmo`
+        uses for its own LMO input. A DDP or non-sharded-embed param that is
+        ALSO TP-sharded would see only its local TP shard here, not the
+        true full matrix -- col/mat pre-norm on such a param is
+        approximate, not solved in this pass.
+
+        Peak memory: for every col/mat param, `torch.stack` (into `stacked`)
+        and the apply step (into `normed`) each allocate a full copy the
+        same size as that param's local effective-gradient shard -- on top
+        of the original grad/momentum-buffer tensor, which stays alive too
+        (nothing here frees it). So a param going through this pass briefly
+        holds ~2-3x its shard size in memory rather than 1x, for however
+        long `group_raws`/`group_partials`/the cache entry stay referenced.
+        The 3 fetchers `.pop()` (not `.get()`) their cache entry, so a
+        param's `_pre_normed_grad_cache` entry is released the moment it's
+        consumed rather than lingering until next step's cache reset --
+        that bounds the cache's own contribution, but `stacked`/`group_raws`
+        for a whole shape group stay alive until every entry in that group
+        has been through Phase 2, so the transient 2-3x is real if every
+        parameter uses col/mat pre_norm. Row category has none of this
+        overhead (no stack, no cache, applied directly to the fetched
+        tensor).
+        """
+        self._pre_normed_grad_cache = {}
+        if not self._pre_norm_reduce_shape_groups:
+            return
+
+        group_raws: dict[tuple, torch.Tensor] = {}
+        group_entries: dict[tuple, list[tuple]] = {}
+        group_partials: dict[tuple, torch.Tensor] = {}
+
+        for key, entries in self._pre_norm_reduce_shape_groups.items():
+            sharded, pre_norm, _shape, eps = key
+            raws: list[torch.Tensor] = []
+            kept_entries: list[tuple] = []
+            for p, group_idx in entries:
+                g = self._raw_effective_grad(p, group_idx)
+                if g is None:
+                    continue
+                raws.append(g.to_local() if isinstance(g, DTensor) else g)
+                kept_entries.append((p, group_idx))
+            if not raws:
+                continue
+            stacked = torch.stack(raws)
+            if sharded:
+                group_raws[key] = stacked
+                group_entries[key] = kept_entries
+                group_partials[key] = PRE_NORM_PARTIAL_FUNCTIONS[pre_norm](stacked)
+            else:
+                # Already the full tensor (ddp/experts/non-sharded embed) --
+                # apply directly, no all-reduce needed.
+                normed = PRE_NORM_FULL_FUNCTIONS[pre_norm](stacked, eps)
+                for i, (p, _gidx) in enumerate(kept_entries):
+                    self._pre_normed_grad_cache[id(p)] = normed[i]
+
+        if group_partials:
+            # _pack_segments concatenates along dim 0 (torch.cat), so
+            # multi-dim / differently-shaped partials (col partials are
+            # [N, cols], mat partials are [N]) must be flattened first --
+            # reshaped back via partial.shape after the all-reduce below.
+            keys = list(group_partials.keys())
+            packed, offsets = _pack_segments(
+                [(str(i), group_partials[k].reshape(-1)) for i, k in enumerate(keys)]
+            )
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM, group=self._fsdp_group)
+            for i, key in enumerate(keys):
+                _sharded, pre_norm, _shape, eps = key
+                partial = group_partials[key]
+                reduced = packed[
+                    offsets[str(i)] : offsets[str(i)] + partial.numel()
+                ].view(partial.shape)
+                normed = PRE_NORM_SHARDED_APPLY_FUNCTIONS[pre_norm](
+                    group_raws[key], reduced, eps
+                )
+                for j, (p, _gidx) in enumerate(group_entries[key]):
+                    self._pre_normed_grad_cache[id(p)] = normed[j]
+
+    def _apply_full_pre_norm_if_needed(self, g, group_idx):
+        """
+        For gather_to_local=True callers: after gathering to the full
+        tensor, apply col/mat pre-norm fresh (no all-reduce needed once
+        fully materialized -- this is the only caller of this shape today,
+        step_embedding's norm-logging re-fetch, gated behind
+        need_to_calculate_norm, not the hot path). Row is already applied
+        earlier (works identically pre- or post-gather); identity is a
+        no-op.
+        """
+        pre_norm = self.groups_pre_norm.get(group_idx, "identity")
+        if pre_norm == "identity":
+            return g
+        if pre_norm_category(pre_norm) in ("col", "mat"):
+            return PRE_NORM_FULL_FUNCTIONS[pre_norm](
+                g, self.groups_pre_norm_eps[group_idx]
+            )
+        return g
+
     @record_function("disco.get_momentum_or_grad")
-    def get_momentum_or_grad(self, p, momentum, nesterov, gather_to_local=False):
+    def get_momentum_or_grad(
+        self, p, momentum, nesterov, group_idx, gather_to_local=False
+    ):
         """
         Retrieves the effective gradient for a parameter.
         Assumes the momentum buffer has already been updated in a pre-pass.
         """
+        if not gather_to_local:
+            cached = self._pre_normed_grad_cache.pop(id(p), None)
+            if cached is not None:
+                return cached
+
         g = p.grad
         if g is None or not p.requires_grad:
             return None
@@ -3923,8 +4206,11 @@ class DiSCO(AbstractDiSCO):
                 )
             g = buf if not nesterov else torch.lerp(buf, g, momentum)
 
+        g = self._apply_row_pre_norm(g, group_idx)
+
         if gather_to_local and isinstance(g, DTensor):
             g = g.redistribute(placements=[Replicate()] * g.device_mesh.ndim).to_local()
+            g = self._apply_full_pre_norm_if_needed(g, group_idx)
 
         return g
 
@@ -3934,6 +4220,7 @@ class DiSCO(AbstractDiSCO):
         params,
         momentum,
         nesterov,
+        group_idx,
         gather_to_local: bool = False,
         to_local: bool = False,
     ):
@@ -3945,6 +4232,12 @@ class DiSCO(AbstractDiSCO):
         use_momentum = (not self.is_light) and (0.0 < momentum < 1.0)
 
         for i, p in enumerate(params):
+            if not gather_to_local:
+                cached = self._pre_normed_grad_cache.pop(id(p), None)
+                if cached is not None:
+                    outputs[i] = cached
+                    continue
+
             g = p.grad
             if g is None or not p.requires_grad:
                 continue
@@ -3957,10 +4250,13 @@ class DiSCO(AbstractDiSCO):
                     )
                 g = buf if not nesterov else torch.lerp(buf, g, momentum)
 
+            g = self._apply_row_pre_norm(g, group_idx)
+
             if gather_to_local and isinstance(g, DTensor):
                 g = g.redistribute(
                     placements=[Replicate()] * g.device_mesh.ndim
                 ).to_local()
+                g = self._apply_full_pre_norm_if_needed(g, group_idx)
             elif to_local and isinstance(g, DTensor):
                 g = g.to_local()
             outputs[i] = g
