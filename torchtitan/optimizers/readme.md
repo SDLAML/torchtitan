@@ -15,10 +15,16 @@ tracking (a secondary concern layered on top) is covered at the end.
 - `disco.py` — the `DiSCO` optimizer itself; all parallelism-specific logic lives here.
 - `abstract_disco.py` — `AbstractDiSCO` base class: `lmo()`, `normalise_grad()` (the actual
   update-shaping math per `norm_factor`), and norm/gram tracking *state*
-  (`need_to_calculate_norm`, `norms_to_log`, `gram_metrics_to_log`, `norms_at_current_step`).
+  (`need_to_calculate_norm`, `norms_to_log`, `gram_level`/`gram_scalar_names`/`gram_vector_names`,
+  `norms_at_current_step`).
 - `norm_helper.py` / `gram_helper.py` — see "Norm/gram/spectrum tracking" below.
 - `pre_norm_helper.py` — see "Pre-norm: a stage before LMO" below.
 - `spectrum_logging.py` — turns raw `track_spectrum_*` tensors into W&B images / Parquet export.
+- `gram_vector_logging.py` — turns raw `track_gram_*` vector tensors into W&B atlas-grid images
+  (index vs. value line plots, one grid per gram metric name — copy-and-adapted from
+  `spectrum_logging.py`'s grid/layout machinery, kept as its own module so `spectrum_logging.py`
+  stays untouched) and/or a Parquet export (mirrors `spectrum_logging._export_spectrum`) — see
+  "Norm/gram/spectrum tracking" below.
 - `readme.md` — this file.
 
 ## Why parameter type matters here (not just "which mesh shards it")
@@ -180,32 +186,88 @@ Every path also optionally logs, per parameter, gated by a single flag
 
 - `track_update_*` — scalar norms (`norm_helper.calculate_norm`) of the update actually applied
   this step (`-lr * u`).
-- `track_param_*` — scalar norms of the weight **after** this step's update. In 3 of 4 paths
-  (`step_embedding`/`step_ddp`/`step_fsdp`) this is a cheap **derived pseudo-value**
-  (`_pseudo_post_update_weight(w, u, lr, wd)`, mirroring the real apply formula) rather than a
-  second real read, because the true pre-update `w` is needed in-scope for gram metrics (see
-  below) — `step_experts` is pre-update natively, a known, deliberately-unfixed inconsistency
-  across paths.
+- `track_param_*` — scalar norms of the weight **after** this step's update. All 4 paths use a
+  cheap **derived pseudo-value** (`pseudo_w = _pseudo_post_update_weight(w, u, lr, wd)`, mirroring
+  the real apply formula) rather than a second real read, because the true pre-update `w` is needed
+  in-scope for gram metrics (see below) — `step_experts` didn't compute this until it also needed
+  `pseudo_w` as gram's `W_after` (see "Norm/gram/spectrum tracking" → gram below); now all 4 paths
+  are consistent.
 - `track_spectrum_*` — raw singular-value vectors (`update`/`param`), consumed by
   `spectrum_logging.py`.
-- `track_gram_*` — functions of `(W, U)` pairs (`gram_helper.calculate_gram_metrics`), e.g.
-  alignment between a weight and its update. `gram_helper.GRAM_METRIC_FUNCTIONS` is **currently
-  empty** — pure plumbing, no formulas decided yet. Every call site calls
-  `calculate_gram_metrics` unconditionally (cheap when empty — no SVD, returns `{}` instantly) and
-  only branches on the result's truthiness where required (e.g. before `torch.stack(...)` for a
-  collective) — there is deliberately no separate "is gram active" flag anywhere.
+- `track_gram_*` — functions of `(W_before, V_raw, W_after)` triples (`gram_helper.
+  calculate_gram_metrics`): `W_before` is the pre-update weight, `V_raw` is the **raw** effective
+  grad/momentum (whatever's fed into `self.lmo()` -- see "V_raw is the raw moment, not the LMO
+  update" below), and `W_after` is `pseudo_w` (the same post-update approximation `track_param_*`
+  already uses, not a fresh real read). `U = W_after - W_before` (the exact realised displacement)
+  and `A = -U` are derived internally -- see `gram_helper.py`'s module docstring and
+  `gram_matrix.md` for the full formula catalogue and the "which tensor answers which question"
+  framing. Gated by a single cumulative `self.gram_level: int` (0 = off, no-op; 1/2/3 = increasingly
+  expensive, each level includes all lower levels), set alongside `norms_to_log` via
+  `calculate_norm_at_next_step(norms_to_log, gram_level)`, driven by `config.metrics.gram_level`
+  (mirrors `config.metrics.norms_to_log`/`log_norm_freq` exactly -- same cadence, no separate gate).
+  `calculate_gram_metrics` returns a mix of 0-d scalar and 1-d vector tensors (fixed key SET per
+  level, independent of parameter shape -- disco.py's DDP/FSDP/experts packing code relies on this;
+  ~121 keys at level 3, comparing 4 tensors -- `W_before`, `W_after`, `V_raw`, `U` -- pairwise).
+  Every call site calls `calculate_gram_metrics` unconditionally (cheap no-op at `gram_level=0` --
+  returns `{}` instantly) and only branches on the result's truthiness where required (e.g. before
+  `torch.stack(...)` for a collective) -- there is deliberately no separate "is gram active" flag
+  anywhere. Vector-valued entries get popped and rendered as W&B atlas-grid images (index vs. value
+  line plots, one grid per metric name, gated by `config.optimizer.enable_gram_plot`) and/or
+  exported to a Parquet file uploaded as a W&B Artifact (gated by
+  `config.optimizer.enable_gram_export`, mirrors `spectrum_logging._export_spectrum` exactly), by
+  `gram_vector_logging.py` before reaching a scalar logger (copy-and-adapted from the grid/layout
+  machinery `spectrum_logging.py` provides for `track_spectrum_*`, kept as a separate module -- see
+  that file's docstring for why). A small, opt-in set of metric names (currently just `V_R_raw`,
+  see `_MEAN_MIN_MAX_METRIC_NAMES`) also get 3 cheap derived scalars unconditionally
+  (`..._mean`/`..._min`/`..._max`, e.g. `track_gram_V_R_raw_mean/...`). Scalars otherwise need no
+  handling at all, they're already valid logger values.
 
-### W/U simultaneity (why 3 of 4 paths got reordered)
+### `V_raw` is the raw moment, not the LMO update
 
-`calculate_gram_metrics(W, U)` needs the full weight and its update simultaneously in scope.
-Historically `track_param_*` was computed *after* the real update was applied, so `U` was already
-out of scope. Fixed by reordering — moving the point where the real update gets applied to run
-*after* norm/gram calculation instead of before, in `step_embedding`, `step_ddp`, `step_fsdp`
-(`step_experts` already computed weight-norm pre-update, no change needed). Critically, **no
-collective changed** in any of these — only the order of two already-existing blocks. `U` needed a
-small amount of extra lifetime in some paths (`step_fsdp` needed a new `u_keepalive` list; `step_ddp`'s
-`local_updates` was already alive long enough) — "a bit more temporary memory held a little
-longer," not new communication.
+`calculate_gram_metrics(W_before, V_raw, W_after, ...)`'s `V_raw` argument is the **raw** effective
+grad/momentum -- the exact tensor about to be passed into `self.lmo()` -- not the LMO-processed
+update `u = self.lmo(...)` that every path already computes for the real parameter update. This
+matches the "study optimizer-state geometry" framing in `gram_matrix.md` (as opposed to "study
+weight dynamics", which is what the *realised displacement* `U = W_after - W_before` -- derived
+internally inside `gram_helper.py`, not the same `U` as `self.lmo()`'s `u` -- is for).
+
+Every path already computes the raw grad immediately before calling `self.lmo()`, so capturing it
+for gram is "keep one more reference alive a little longer", not new compute or communication --
+mirrors the existing `u_keepalive`/`pseudo_w` pattern (see "simultaneity" below) exactly, just one
+step earlier:
+- `step_embedding`: the raw grad `g` is already in scope right where `u = self.lmo(g, ...)` is
+  called, a few lines before the gram call -- no new variable needed, just pass `g` instead of `u`.
+- `step_ddp`: `lmo_inputs` (from `_prepare_ddp_lmo`, Phase A) already holds the raw per-owned-index
+  grad and is never mutated afterward -- reused directly at the later gram call site.
+- `step_experts`: a new `all_raw_grads` list, populated from `big_g` (captured right before
+  `self.lmo(big_g, ...)`) alongside the existing `all_updates` list.
+- `step_fsdp`: a new `g_keepalive` list, populated alongside `u_keepalive` in both the fast path
+  (aliases the step-persistent `full_g_bufs[bucket_idx]` workspace buffer -- free) and the slow path
+  (keeps a second reference to the freshly `torch.cat`'d `full_g`, which would otherwise be
+  discarded once the loop moves to the next bucket).
+
+Verified `AbstractDiSCO.lmo()` never mutates its input tensor in place (every backend, eager and
+Triton, only ever rebinds to new tensors or writes into separately-allocated `out=` buffers) --
+aliasing the raw-grad reference this way is safe; it will always reflect the true pre-LMO value.
+
+### `W_before`/`W_after`/`V_raw` simultaneity (why all 4 paths compute `pseudo_w`)
+
+`calculate_gram_metrics` needs the pre-update weight, its raw moment, and the post-update weight
+simultaneously in scope. Historically `track_param_*` was computed *after* the real update was
+applied, so the pre-update weight was already out of scope. Fixed by reordering — moving the point
+where the real update gets applied to run *after* norm/gram calculation instead of before, in
+`step_embedding`/`step_ddp`/`step_fsdp` (`step_experts` already computed weight-norm pre-update, no
+reordering needed there). Critically, **no collective changed** in any of these — only the order of
+two already-existing blocks. The update needed a small amount of extra lifetime in some paths
+(`step_fsdp` needed a new `u_keepalive` list, now also `g_keepalive`; `step_ddp`'s
+`local_updates`/`lmo_inputs` were already alive long enough) — "a bit more temporary memory held a
+little longer," not new communication.
+
+All 4 paths pass `pseudo_w = _pseudo_post_update_weight(w, u, lr, wd)` as gram's `W_after` (the same
+tensor already used for `track_param_*`). `step_experts` didn't compute `pseudo_w` at all until the
+3-tensor gram spec needed it — it used the raw pre-update `p_local[ep_idx]` for both weight-norm and
+gram directly. Fixed to fetch `lr`/`wd` once per block (`self.groups_info[self._expert_block_group_idx[block_idx]]`)
+and compute `pseudo_w` per-expert, same formula as the other 3 paths.
 
 **Real bug found and fixed here**: when first reordering `step_ddp`'s weight-norm loop, an
 `if u is None: continue` was copied from the neighboring update-norm loop. That's wrong for
@@ -230,13 +292,76 @@ method for the pattern.
 
 ### If you're adding a real gram metric formula
 
-1. Add it to `gram_helper.py` and register: `GRAM_METRIC_FUNCTIONS["my_metric"] = my_metric`. `W`/`U`
-   arrive already unwrapped (DTensor/Parameter → plain local tensor), diag-embedded if originally
-   1-D, transposed if requested — same contract as `norm_helper.NORM_FUNCTIONS`.
-2. No `disco.py` call-site changes needed — `self.gram_metrics_to_log` (built from
-   `GRAM_METRIC_FUNCTIONS.keys()`) picks it up automatically.
-3. No vector-valued ("spectrum-analog") gram output exists yet — only scalars are wired up; that's
-   new plumbing if a metric ever needs it.
-4. Decide what your formula should do with an all-zero `U` (the `step_ddp` zero-substitution case
-   above feeds a genuine zero update into `calculate_gram_metrics` when a param had no gradient) —
-   handle it explicitly rather than relying on incidental float behavior.
+`gram_helper.py` is a cumulative, per-level design (mirrors `norm_helper.fused_metrics`'s
+shared-computation pattern): `_build_gram_core` builds every self-/cross-Gram and correlation matrix
+once (`G_Wm`/`G_Wp`/`G_V`/`G_U`, `C_Wm`/`C_Wp`/`C_V`/`C_U`, `C_WV`/`C_WU`/`C_VA` — `Wm`/`Wp` = weight
+before/after, `V`/`U` = raw momentum / realised displacement), and
+`_level1_metrics`/`_level2_metrics`/`_level3_metrics` derive that level's metrics from shared state
+(level N is cumulative with levels < N). There's no per-metric registry (`GRAM_METRIC_FUNCTIONS` is
+gone).
+
+1. Add the computation inside the right `_level{1,2,3}_metrics` function (or extend `_GramCore`/
+   `_Level2Extras` if it needs new shared intermediates).
+2. Add its name to the matching level in `GRAM_SCALAR_NAMES_BY_LEVEL` (0-d output) or
+   `GRAM_VECTOR_NAMES_BY_LEVEL` (1-d output) — these two dicts are the source of truth for the
+   fixed, shape-independent key set `calculate_gram_metrics(..., level=L)` returns; every vector is
+   length `m` (see `gram_helper.py`'s module docstring — NOT `min(m, n)`, don't reuse
+   `norm_helper`'s spectrum-length tables for gram vectors). Naming convention:
+   `{tensor_prefix}_{field}` (`V`/`U`/`Wm`/`Wp` for the 4 self-Gram tensors, `VA`/`WV`/`WU` for the 3
+   cross-Gram pairs, `G_*`/`C_*` for eigenspectra, `K_V`/`K_U`/`J`/`Q_*` for level-3 whitened
+   quantities) — keep new metrics consistent with this so `gram_vector_logging.py`'s per-metric-name
+   atlas grids stay readable.
+3. No `disco.py` call-site changes needed for scalars. A **new vector-valued** metric needs its
+   contribution counted in the three `_precompute_*_gram_vector_metadata` methods' `n_vec =
+   len(self.gram_vector_names)` — already automatic, since those methods re-read
+   `self.gram_vector_names` fresh each time they run, but double check the offset math if you
+   change a vector's *length formula* rather than just adding another same-length vector.
+4. Decide what your formula should do when `W_after == W_before` (the `step_ddp` zero-gradient case
+   feeds `u = torch.zeros_like(w)`, so `pseudo_w == w`, hence `U_actual = 0` inside
+   `calculate_gram_metrics`) — verified all existing level 1-3 formulas degrade gracefully to
+   finite, `eps`-guarded values for this case (traced through by hand + covered in the standalone
+   verification script); handle any new formula's zero-input behavior explicitly rather than relying
+   on incidental float behavior.
+5. Vector metrics automatically get their own atlas grid (dense + MoE) via
+   `gram_vector_logging.py` — no changes needed there either, since it discovers grid names
+   dynamically from tracked key names (see that file's docstring).
+
+### Known limitation: gram tracking is disabled for `step_embedding` (large-vocab OOM)
+
+`gram_helper._gram(X) = X @ X.T` forms an `m x m` matrix, where `m` is the row-count of the
+prepped/transposed tensor -- fine for typical attention/FFN matrices (`m` ~ hidden_dim, thousands),
+but `step_embedding`'s `embed_params` also includes the `output`/lm_head weight
+(`[vocab_size, hidden_dim]`). `need_T = CONST_NAME_OF_EMBEDDING in p_name` only transposes for
+params literally named `"tok_embeddings"`, not `"output"`, so the lm_head weight's `m` stays at
+`vocab_size` instead of being reduced to `hidden_dim` -- at a ~200k vocab this is a
+`[200_000, 200_000]` fp32 matrix (~160GB), an immediate CUDA OOM (hit in practice, not
+hypothetical).
+
+**Current state**: the `calculate_gram_metrics` call in `step_embedding` is commented out
+(`gram_metrics = {}` unconditionally) until this is fixed properly. `step_ddp`/`step_fsdp`/
+`step_experts` are unaffected (never touch vocab-scale dimensions) and keep tracking gram normally.
+
+Two real fixes, not done yet:
+1. A size guard in `gram_helper.calculate_gram_metrics` (e.g. `if W_before.shape[0] >
+   _MAX_GRAM_M: return {}`, same "cheap no-op for ill-defined input" precedent as the existing
+   `m < 2` guard) — general, protects every call site against any future oversized-`m` case, not
+   just this one. Would let `tok_embeddings`'s gram tracking keep working (its `m` is already
+   correctly reduced to `hidden_dim` via `need_T`) while only skipping the lm_head weight.
+2. Fix `need_T` to also transpose for `"output"` (if that's semantically correct — needs checking
+   against how `norm_factor`'s embed/unembed row-wise treatments and `abstract_disco.py`'s
+   `fused_unembed_*` functions expect the axes oriented; this is unrelated pre-existing logic, not
+   something introduced by the gram work).
+
+### Known limitation: `all_gather` sends to every rank, only one needs it
+
+Every collective in this norm/gram/spectrum pipeline (`step_experts`'s single `all_gather_tensor`,
+`step_ddp`/`step_fsdp`'s Phase-D `all_gather_tensor` via `_pack_segments`) gathers to **all** ranks,
+but only the logging rank (`is_dp_rank_0` / FSDP-mesh rank 0) ever reads the result — every other
+rank receives (and immediately discards) the full per-rank payload for nothing. Switching to a
+root-only `dist.gather` would cut that wasted receive traffic without losing any fidelity (unlike
+reducing the logged data itself, which isn't an option once you want the full vectors — see
+`gram_vector_logging.py`'s docstring). Not done here: NCCL's support for plain `gather`-to-root is
+limited/version-dependent, and this same inefficiency predates the gram-vector work (it already
+applied to `track_spectrum_*`/scalar norms too) — fixing it is a genuine follow-up, not scoped into
+either pass, and would need verifying against whatever backend/PyTorch version is actually in use
+before landing.

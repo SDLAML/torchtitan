@@ -510,7 +510,7 @@ class MoE(Module):
         # Expert hidden dimension (replaces old moe_inter_dim)
         hidden_dim: int = 0
 
-        force_router_on_fp32: bool = False
+        force_router_on_fp32: bool = True
 
         norm_everywhere: bool = False
         norm_type: str | None = "np_rmsnorm"

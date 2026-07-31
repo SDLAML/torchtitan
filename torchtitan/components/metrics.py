@@ -316,6 +316,18 @@ class MetricsProcessor(Configurable):
         - "condition_number"
         """
 
+        gram_level: int = 0
+        """
+        Level of Gram-based weight/momentum-geometry metrics to compute and
+        log (see optimizers/gram_helper.py), gated by the same log_norm_freq
+        cadence as norms_to_log:
+        - 0: off (default; no-op, zero overhead).
+        - 1: cheap O(m^2) entrywise geometry metrics.
+        - 2: adds O(m^3) spectral metrics (cumulative with level 1).
+        - 3: adds whitened/generalised metrics, most numerically sensitive
+             (cumulative with levels 1-2).
+        """
+
         enable_tensorboard: bool = False
         """Whether to log metrics to TensorBoard"""
 

@@ -7,7 +7,7 @@
 import torch
 from torch.distributed.tensor import DTensor
 
-from .gram_helper import GRAM_METRIC_FUNCTIONS
+from . import gram_helper
 from .muon_utils import zeropower_backends
 from .norm_helper import NORM_FUNCTIONS
 
@@ -137,18 +137,31 @@ class AbstractDiSCO(torch.optim.Optimizer):
         # Norm tracking state
         self.need_to_calculate_norm: bool = False
         self.norms_to_log: list[str] = list(NORM_FUNCTIONS.keys())
-        # Gram metrics (functions of a weight AND its update, e.g. alignment)
-        # share the same need_to_calculate_norm gate -- no separate flag.
-        # GRAM_METRIC_FUNCTIONS is empty today, so this is a no-op until
-        # metrics are added (see optimizers/gram_helper.py).
-        self.gram_metrics_to_log: list[str] = list(GRAM_METRIC_FUNCTIONS.keys())
+        # Gram metrics (functions of a weight AND its raw effective
+        # grad/momentum, e.g. alignment) share the same need_to_calculate_norm
+        # gate -- no separate flag. A single cumulative level (0 = off, same
+        # no-op as before any formulas existed) drives both which metrics get
+        # computed and their fixed per-level key set -- see
+        # optimizers/gram_helper.py.
+        self.gram_level: int = 0
+        self.gram_scalar_names: list[str] = []
+        self.gram_vector_names: list[str] = []
         self.norms_at_current_step: dict[str, torch.Tensor] = {}
 
+    def _refresh_gram_names(self):
+        self.gram_scalar_names = gram_helper.gram_scalar_names(self.gram_level)
+        self.gram_vector_names = gram_helper.gram_vector_names(self.gram_level)
+
     # ----- Step norm tracking -----
-    def calculate_norm_at_next_step(self, norms_to_log: list[str] = None):
+    def calculate_norm_at_next_step(
+        self, norms_to_log: list[str] = None, gram_level: int | None = None
+    ):
         self.need_to_calculate_norm = True
         if norms_to_log is not None:
             self.norms_to_log = norms_to_log
+        if gram_level is not None:
+            self.gram_level = gram_level
+            self._refresh_gram_names()
         self.norms_at_current_step = {}
 
     def _is_logging_rank(self) -> bool:

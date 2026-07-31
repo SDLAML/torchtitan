@@ -32,6 +32,10 @@ from torchtitan.optimizers import (
     DiSCO,
     spectrum_logging,
 )
+from torchtitan.optimizers.gram_vector_logging import (
+    GramVectorLoggingConfig,
+    process_gram_vectors_for_logging,
+)
 from torchtitan.optimizers.spectrum_logging import process_norms_for_logging
 from torchtitan.tools.logging import logger
 
@@ -146,7 +150,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         takes effect when metrics.log_norm_freq > 0.
         """
 
-        enable_spectrum_export: bool = False
+        enable_spectrum_export: bool = True
         """
         Whether to export the full raw singular-value spectra (every tracked
         parameter, every norm-logging step) to a Parquet file uploaded as a
@@ -154,6 +158,23 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         the plot shows. Off by default: can be large for big MoE models (see
         optimizers/spectrum_logging.py). Only takes effect when
         metrics.log_norm_freq > 0.
+        """
+
+        enable_gram_plot: bool = True
+        """
+        Whether to render each tracked vector-valued gram metric as an
+        atlas-grid plot image for W&B (see optimizers/gram_vector_logging.py).
+        Only takes effect when metrics.gram_level > 0.
+        """
+
+        enable_gram_export: bool = False
+        """
+        Whether to export every tracked gram vector (every gram-tracking
+        step) to a Parquet file uploaded as a versioned W&B Artifact, for
+        offline/programmatic analysis beyond what the plot shows. Off by
+        default: can be large, there are far more distinct gram vector
+        metrics than spectrum has (see optimizers/gram_vector_logging.py).
+        Only takes effect when metrics.gram_level > 0.
         """
 
     optimizers: list[T]
@@ -214,11 +235,16 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
         self.preserve_lrs_when_loading = False
         self.norms_to_log: list[str] | None = None
+        self.gram_level: int = 0
         self.log_queue: queue.Queue | None = None
         self.log_thread: threading.Thread | None = None
         self.spectrum_logging_config = spectrum_logging.SpectrumLoggingConfig(
             enable_plot=config.enable_spectrum_plot,
             enable_export=config.enable_spectrum_export,
+        )
+        self.gram_vector_logging_config = GramVectorLoggingConfig(
+            enable_plot=config.enable_gram_plot,
+            enable_export=config.enable_gram_export,
         )
 
         for model in self.model_parts:
@@ -291,7 +317,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         for i, _ in enumerate(self.model_parts):
             optimizer = self.optimizers[i]
             if isinstance(optimizer, DiSCO):
-                optimizer.calculate_norm_at_next_step(self.norms_to_log)
+                optimizer.calculate_norm_at_next_step(
+                    self.norms_to_log, self.gram_level
+                )
 
     def get_parameter_norms(self, step: int):
         all_norms = {}
@@ -316,6 +344,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
                 # all_norms.update(
                 #     naive_param_norm.get_parameter_norms([model_part], [optimizer])
                 # )
+        all_norms = process_gram_vectors_for_logging(
+            all_norms, step=step, config=self.gram_vector_logging_config
+        )
         return process_norms_for_logging(
             all_norms,
             step=step,
@@ -395,6 +426,10 @@ class OptimizersInBackwardContainer(OptimizersContainer):
         self.spectrum_logging_config = spectrum_logging.SpectrumLoggingConfig(
             enable_plot=config.enable_spectrum_plot,
             enable_export=config.enable_spectrum_export,
+        )
+        self.gram_vector_logging_config = GramVectorLoggingConfig(
+            enable_plot=config.enable_gram_plot,
+            enable_export=config.enable_gram_export,
         )
 
         optim_dict = {}

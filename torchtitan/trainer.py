@@ -506,12 +506,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.optimizers.norms_to_log = norm_helper.get_norms_to_log(
             config.metrics.norms_to_log
         )
+        self.optimizers.gram_level = config.metrics.gram_level
         # enable_plot/enable_export live on OptimizersContainer.Config itself
         # (config.optimizer.*) and are already set by its __init__; only
         # export_dir depends on the top-level dump_folder, so patch that in.
         self.optimizers.spectrum_logging_config = (
             self.optimizers.spectrum_logging_config._replace(
                 export_dir=os.path.join(config.dump_folder, "spectrum_export")
+            )
+        )
+        self.optimizers.gram_vector_logging_config = (
+            self.optimizers.gram_vector_logging_config._replace(
+                export_dir=os.path.join(config.dump_folder, "gram_export")
             )
         )
 
