@@ -275,12 +275,12 @@ class DiSCO(AbstractDiSCO):
 
                 # 1) scalar branch identical to step()
                 if p.numel() == 1:
-                    assert (
-                        group["backend"] == "identity"
-                    ), "scale params must use identity backend"
-                    assert (
-                        group["norm_factor"] == "sign"
-                    ), "scale params must use sign norm factor"
+                    assert group["backend"] == "identity", (
+                        "scale params must use identity backend"
+                    )
+                    assert group["norm_factor"] == "sign", (
+                        "scale params must use sign norm factor"
+                    )
                     self.scale_params.append(p)
                     self.scale_param_names.append(p_name)
                     continue
@@ -1792,9 +1792,9 @@ class DiSCO(AbstractDiSCO):
         for k, g_local in enumerate(block_effective_grads):
             if g_local is None:
                 continue
-            assert (
-                g_local.ndim == 3
-            ), "Batching path assumes MoE expert weights are 3-D."
+            assert g_local.ndim == 3, (
+                "Batching path assumes MoE expert weights are 3-D."
+            )
             if g_local.shape[0] == 0:
                 continue
             if k >= len(dst_views_pre):
@@ -2238,6 +2238,7 @@ class DiSCO(AbstractDiSCO):
             self.step_embedding(
                 self.embed_params, self.embed_param_names, embed_workspace
             )
+            # dist.barrier()
 
         # Expert LMO launches are coordinated inside step_experts.
         if self.expert_params:
@@ -2941,13 +2942,13 @@ class DiSCO(AbstractDiSCO):
 
                 for norm_idx, norm_name in enumerate(self.norms_to_log):
                     idx = base + norm_idx
-                    final_norms[
-                        f"track_update_{norm_name}/{cleaned_p_name}"
-                    ] = gathered_update_norms[idx]
+                    final_norms[f"track_update_{norm_name}/{cleaned_p_name}"] = (
+                        gathered_update_norms[idx]
+                    )
                     if apply_on_weight and gathered_weight_norms is not None:
-                        final_norms[
-                            f"track_param_{norm_name}/{cleaned_p_name}"
-                        ] = gathered_weight_norms[idx]
+                        final_norms[f"track_param_{norm_name}/{cleaned_p_name}"] = (
+                            gathered_weight_norms[idx]
+                        )
 
         if self.is_dp_rank_0:
             self.norms_at_current_step.update(final_norms)
