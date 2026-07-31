@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
 from torchtitan.components.optimizer import OptimizersContainer
@@ -18,13 +19,12 @@ __all__ = ["EMAOptimizersContainer"]
 
 
 class _EMAParamOptimizer(Optimizer):
-    """One per model part, mirroring ``OptimizersContainer.optimizers: list[T]``.
+    """Holds ``state[p]["ema_params"]`` per parameter for one model part.
 
-    Never stepped as a real optimizer -- exists solely to hold
-    ``state[p]["ema_params"]`` per parameter, reusing ``torch.optim.Optimizer``'s
-    per-param state dict + DCP flatten machinery instead of a bespoke DTensor
-    state-dict format. Always built over the real parameter list even when EMA
-    is disabled; ``enable`` only controls whether the EMA tensor is allocated.
+    Never step()-ed; reuses ``Optimizer``'s per-param state dict and DCP
+    flatten machinery instead of a bespoke DTensor state-dict format.
+    Always built over the real params even when EMA is disabled --
+    ``enable`` only controls whether the EMA tensor is allocated.
     """
 
     def __init__(self, params: list[nn.Parameter], *, enable: bool) -> None:
@@ -42,47 +42,42 @@ class _EMAParamOptimizer(Optimizer):
 
 
 class EMAOptimizersContainer(OptimizersContainer):
-    """Pseudo-optimizer container maintaining an online EMA of model weights.
+    """Pseudo-optimizer maintaining an online EMA of model weights.
 
-    Subclasses ``OptimizersContainer`` like ``OptimizersInBackwardContainer``
-    does: override ``__init__``/``step()``/``zero_grad()``, reuse
-    ``state_dict()``/``load_state_dict()`` (with an ``enable`` short-circuit).
-    Never merged into ``Trainer.optimizers`` or passed to
-    ``LRSchedulersContainer`` -- it is a sibling object, always built and
-    wired unconditionally into ``CheckpointManager`` and into a
-    ``register_step_post_hook`` on the real optimizer; ``enable`` decides
-    whether that amounts to anything.
+    Subclasses ``OptimizersContainer`` to reuse its ``state_dict()``/
+    ``load_state_dict()`` (DCP-flattened, resharding-safe). Never merged
+    into ``Trainer.optimizers`` or ``LRSchedulersContainer`` -- it's a
+    sibling object, always built and wired into ``CheckpointManager`` and a
+    ``register_step_post_hook``; ``enable`` decides whether that amounts to
+    anything.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         enable: bool = False
-        """Whether EMA tracking is active. Always built regardless (so trainer.py
-        needs no conditional wiring), but holds no EMA tensors and contributes
-        nothing to the checkpoint when False."""
+        """Whether EMA tracking is active. Always built regardless (so
+        trainer.py needs no conditional wiring), but a no-op when False."""
 
         decay: float | None = None
-        """ema_params = decay * ema_params + (1 - decay) * param, applied once
-        per firing. If None (default), decay is instead computed dynamically
-        from half_life_fraction -- see below."""
+        """Fixed decay per firing: ema_params = decay * ema_params +
+        (1 - decay) * param. If None (default), computed dynamically from
+        half_life_fraction instead."""
 
         half_life_fraction: float = 0.05
-        """Used when decay is None: decay = 2 ** (-1 / (half_life_fraction * t)),
-        where t is the number of EMA updates fired so far (elapsed steps since
-        start_step, divided by update_every_n_steps). Keeps roughly the most
-        recent half_life_fraction share of updates dominant. Default 0.05
-        matches the common decay = 2 ** (-20 / t) rule of thumb."""
+        """Used when decay is None: decay = 2 ** (-1 / (half_life_fraction *
+        num_updates)). Keeps roughly the most recent half_life_fraction
+        share of updates dominant. 0.05 matches the common
+        decay = 2 ** (-20 / t) rule of thumb."""
 
         start_step: int = 0
-        """First training step (matching Trainer.step) at which EMA tracking
-        begins. Intentionally decoupled from the LR scheduler's WSD phases."""
+        """First Trainer.step at which EMA tracking begins. Decoupled from
+        the LR scheduler's WSD phases."""
 
         step_bias: int = 0
-        """Added to (current_step - start_step) when computing t (only relevant
-        when decay is None). A normal resume already gets correct continuity
-        for free since current_step is restored as usual; step_bias is only
-        for deliberately renumbering Trainer.step (e.g. a new training phase)
-        while wanting the EMA to keep aging as if uninterrupted."""
+        """Manual offset added when computing num_updates, for deliberately
+        renumbering Trainer.step (e.g. a new training phase) without
+        resetting EMA aging. A normal resume needs no bias -- current_step
+        already continues correctly on its own."""
 
         update_every_n_steps: int = 1
         """Only fire the EMA update every N real optimizer steps."""
@@ -100,9 +95,8 @@ class EMAOptimizersContainer(OptimizersContainer):
         self.update_every_n_steps = config.update_every_n_steps
         self.offload_to_cpu = config.offload_to_cpu
         self.model_parts = model_parts
-        # We override __init__ entirely rather than calling
-        # OptimizersContainer's, so attributes it would normally set (and that
-        # load_state_dict() reads) must be set explicitly here.
+        # __init__ is overridden entirely, so attributes OptimizersContainer
+        # would normally set (and load_state_dict() reads) must be set here.
         self.preserve_lrs_when_loading = False
         self.norms_to_log: list[str] | None = None
         self.log_queue = None
@@ -126,36 +120,38 @@ class EMAOptimizersContainer(OptimizersContainer):
         pass  # never called by the training loop; no-op for safety
 
     def step(self, current_step: int) -> None:
-        """Call directly with the trainer's global step count -- this object
-        is never merged into Trainer.optimizers, so there's no zero-arg/closure
-        step() convention to honor here."""
+        """Call directly with the trainer's global step -- never merged into
+        Trainer.optimizers, so there's no closure/zero-arg step() to honor."""
         if not self.enable or current_step < self.start_step:
             return
         elapsed = current_step - self.start_step
         if elapsed % self.update_every_n_steps != 0:
             return
-        # t counts EMA updates (firings), not raw steps -- the half-life
-        # formula in _decay_at is defined in terms of applications of decay,
-        # which only matches elapsed steps when update_every_n_steps == 1.
-        # Still stateless: firing count is a pure function of current_step.
-        # Clamped to >= 1 to avoid dividing by zero on the first firing.
-        t = max((elapsed + self.step_bias) // self.update_every_n_steps, 1)
-        self._update(t)
+        # num_updates counts firings, not raw steps (equal only when
+        # update_every_n_steps == 1) -- still stateless, a pure function of
+        # current_step. Clamped to >= 1 for the first firing.
+        num_updates = max((elapsed + self.step_bias) // self.update_every_n_steps, 1)
+        self._update(num_updates)
 
-    def _decay_at(self, t: int) -> float:
+    def _decay_at(self, num_updates: int) -> float:
         if self.decay is not None:
             return self.decay
-        return 2.0 ** (-1.0 / (self.half_life_fraction * t))
+        return 2.0 ** (-1.0 / (self.half_life_fraction * num_updates))
 
-    def _update(self, t: int) -> None:
-        decay = self._decay_at(t)
-        for ema_opt, model in zip(self.optimizers, self.model_parts):
+    def _update(self, num_updates: int) -> None:
+        decay = self._decay_at(num_updates)
+        for part_idx, (ema_opt, model) in enumerate(
+            zip(self.optimizers, self.model_parts)
+        ):
             params = [p for p in model.parameters() if p.requires_grad]
             if not params:
                 continue
             ema_params = [ema_opt.state[p]["ema_params"] for p in params]
             if self.offload_to_cpu:
-                self._update_offloaded(params, ema_params, decay)
+                # ema_params are pinned local-shard CPU tensors; localize
+                # params too so the foreach ops never mix DTensor with Tensor.
+                local_params = [self._local_view(p) for p in params]
+                self._update_offloaded(part_idx, local_params, ema_params, decay)
             elif torch.is_floating_point(ema_params[0]) or torch.is_complex(
                 ema_params[0]
             ):
@@ -166,11 +162,42 @@ class EMAOptimizersContainer(OptimizersContainer):
 
     # --- CPU offload path (GH200-optimized: async side-stream, pinned memory) ---
 
+    @staticmethod
+    def _local_view(t: torch.Tensor) -> torch.Tensor:
+        return t.to_local() if isinstance(t, DTensor) else t
+
     def _init_cpu_offload(self) -> None:
         self._offload_stream = torch.cuda.Stream()
         for ema_opt in self.optimizers:
-            for st in ema_opt.state.values():
-                st["ema_params"] = st["ema_params"].cpu().pin_memory()
+            for param_state in ema_opt.state.values():
+                param_state["ema_params"] = self._pin_local(param_state["ema_params"])
+
+    def _pin_local(self, tensor: torch.Tensor) -> torch.Tensor:
+        """DTensor has no pin_memory() dispatch support (NYI:
+        aten._pin_memory.default), so pin just the local shard."""
+        return self._local_view(tensor).cpu().pin_memory()
+
+    def _materialize_dtensor(
+        self, p: torch.Tensor, local: torch.Tensor
+    ) -> torch.Tensor:
+        """Inverse of ``_pin_local``: move the local shard back onto the
+        accelerator and rewrap it as a DTensor matching ``p``'s own
+        sharding, only for the duration of a checkpoint save/load -- this is
+        what DCP needs to (re)shard EMA state correctly across world sizes.
+        ``p`` is still the live DTensor param, so its spec is read directly
+        rather than cached. No collective communication:
+        ``from_local(run_check=False)`` only communicates to reconcile a
+        ``Replicate()`` placement, which FSDP2 params never use.
+        """
+        if not isinstance(p, DTensor):
+            return local
+        local_gpu = local.to(p.device, non_blocking=True)
+        return DTensor.from_local(
+            local_gpu,
+            device_mesh=p.device_mesh,
+            placements=p.placements,
+            run_check=False,
+        )
 
     def _get_scratch(self, key: int, params: list[torch.Tensor]) -> list[torch.Tensor]:
         scratch = self._offload_scratch.get(key)
@@ -186,12 +213,13 @@ class EMAOptimizersContainer(OptimizersContainer):
 
     def _update_offloaded(
         self,
+        scratch_key: int,
         params: list[torch.Tensor],
         ema_params: list[torch.Tensor],
         decay: float,
     ) -> None:
         self._maybe_wait_pending()
-        scratch = self._get_scratch(id(ema_params), params)
+        scratch = self._get_scratch(scratch_key, params)
         stream = self._offload_stream
         assert stream is not None
         stream.wait_stream(torch.cuda.current_stream())
@@ -201,27 +229,50 @@ class EMAOptimizersContainer(OptimizersContainer):
             torch._foreach_copy_(ema_params, scratch, non_blocking=True)  # D2H
             self._pending_event = torch.cuda.Event()
             self._pending_event.record(stream)
-        # Don't synchronize here -- the event is waited on lazily, next call
-        # or at state_dict() (checkpoint save).
+        # Waited on lazily -- next call, or at state_dict() (checkpoint save).
 
     # --- checkpointing ---
 
     def state_dict(self) -> dict[str, Any]:
         if not self.enable:
             return {}
-        if self.offload_to_cpu:
-            self._maybe_wait_pending()
-        return super().state_dict()
+        if not self.offload_to_cpu:
+            return super().state_dict()
+        # Materialize real DTensors for DCP, call through, then restore the
+        # pinned-CPU steady state so offload savings only lapse briefly.
+        self._maybe_wait_pending()
+        originals: dict[int, torch.Tensor] = {}
+        for ema_opt in self.optimizers:
+            for p, param_state in ema_opt.state.items():
+                originals[id(p)] = param_state["ema_params"]
+                param_state["ema_params"] = self._materialize_dtensor(
+                    p, param_state["ema_params"]
+                )
+        result = super().state_dict()
+        for ema_opt in self.optimizers:
+            for p, param_state in ema_opt.state.items():
+                param_state["ema_params"] = originals[id(p)]
+        return result
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         if not self.enable:
             return
         if not state_dict:
-            # Checkpoint had no EMA data (saved with EMA disabled, or predates
-            # this feature) -- cold-start from the just-loaded model weights,
-            # since our clone at __init__ predates CheckpointManager.load().
+            # Checkpoint had no EMA data (disabled at save time, or predates
+            # this feature) -- cold-start from the just-loaded model weights.
             for ema_opt, model in zip(self.optimizers, self.model_parts):
                 for p in (p for p in model.parameters() if p.requires_grad):
-                    ema_opt.state[p]["ema_params"].copy_(p.detach())
+                    source = p.detach()
+                    if self.offload_to_cpu:
+                        source = self._local_view(source)
+                    ema_opt.state[p]["ema_params"].copy_(source)
             return
+        # DCP calls our state_dict() above to build its load template, so it
+        # already receives real DTensors here too -- re-pin them afterward.
         super().load_state_dict(state_dict)
+        if self.offload_to_cpu:
+            for ema_opt in self.optimizers:
+                for param_state in ema_opt.state.values():
+                    param_state["ema_params"] = self._pin_local(
+                        param_state["ema_params"]
+                    )
