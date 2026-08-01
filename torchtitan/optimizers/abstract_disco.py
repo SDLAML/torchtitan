@@ -103,6 +103,32 @@ def fused_rmnp_row_norm(g: torch.Tensor, eps: float) -> torch.Tensor:
     return g_fp32.to(g.dtype)
 
 
+def fused_rmnp_row_norm_rms_rms(g: torch.Tensor, eps: float) -> torch.Tensor:
+    # Supports:
+    # 2D: [d_out, d_in]
+    # 3D: [n_experts, d_out, d_in]
+    ratio = (g.size(-2) / g.size(-1)) ** 0.5
+    g_fp32 = g.float()
+    row_l2_norm = g_fp32.norm(p=2, dim=-1, keepdim=True)
+    g_fp32 = g_fp32 / row_l2_norm.clamp_min(eps) * ratio
+    return g_fp32.to(g.dtype)
+
+
+def lr_by_1_over_sqrt_d_in(g: torch.Tensor) -> torch.Tensor:
+    ratio = (1 / g.size(-1)) ** 0.5
+    return g * ratio
+
+
+def lr_by_sqrt_d_in(g: torch.Tensor) -> torch.Tensor:
+    ratio = g.size(-1) ** 0.5
+    return g * ratio
+
+
+def lr_by_sqrt_d_out_over_sqrt_d_in(g: torch.Tensor) -> torch.Tensor:
+    ratio = (g.size(-2) / g.size(-1)) ** 0.5
+    return g * ratio
+
+
 # @torch.compile(dynamic=False, fullgraph=True)
 def fused_bias_rms(g: torch.Tensor, eps: float):
     g_fp32 = g.float()
@@ -196,6 +222,18 @@ class AbstractDiSCO(torch.optim.Optimizer):
 
         elif norm_factor == "rmnp_row_norm":
             g = fused_rmnp_row_norm(g, eps)
+
+        elif norm_factor == "rmnp_row_norm-rms-rms":
+            g = fused_rmnp_row_norm_rms_rms(g, eps)
+
+        elif norm_factor == "lr_by_1_over_sqrt_d_in":
+            g = lr_by_1_over_sqrt_d_in(g)
+
+        elif norm_factor == "lr_by_sqrt_d_in":
+            g = lr_by_sqrt_d_in(g)
+
+        elif norm_factor == "lr_by_sqrt_d_out_over_sqrt_d_in":
+            g = lr_by_sqrt_d_out_over_sqrt_d_in(g)
 
         elif norm_factor.startswith("embed"):
             # Handle 2-D and batched 3-D consistently
