@@ -91,27 +91,75 @@ def _gram(X: torch.Tensor) -> torch.Tensor:
     return X @ X.T
 
 
-def _row_normalise(X: torch.Tensor, eps: float) -> torch.Tensor:
-    return X / X.norm(dim=1, keepdim=True).clamp_min(eps)
+def _relative_floor(reference: torch.Tensor, eps_rel: float) -> torch.Tensor:
+    # Scale-relative floor for a denominator that's structurally unbounded
+    # relative to its numerator (can be exactly 0 while the numerator is
+    # positive -- e.g. perfectly orthogonal rows, or a rank-deficient Gram
+    # matrix) -- keeps the resulting *ratio* capped at a fixed,
+    # scale-independent ceiling (1 / eps_rel) instead of blowing up
+    # arbitrarily as the true denominator approaches 0. An absolute eps
+    # can't do this: it doesn't scale with the input, so it either swamps
+    # small-but-legitimate values (business-scale eps) or lets the ratio
+    # blow up unpredictably near 0 (any fixed small eps). Backstopped with
+    # an absolute machine-tiny floor for the fully-degenerate case where
+    # `reference` itself is exactly 0 (avoids a literal 0/0).
+    tiny = torch.finfo(reference.dtype).tiny
+    return (eps_rel * reference).clamp_min(tiny)
 
 
-def _corr(X: torch.Tensor, eps: float) -> torch.Tensor:
-    X_hat = _row_normalise(X, eps)
+def _row_normalise(X: torch.Tensor) -> torch.Tensor:
+    # Floor each row by its OWN norm only, never a whole-matrix reference:
+    # a matrix-wide floor under-normalises any row that's disproportionately
+    # smaller than the rest of the matrix (e.g. a near-dead neuron sitting
+    # alongside normal-scale rows), since the floor would then reflect the
+    # OTHER rows' scale, not this row's. A row's norm is either exactly 0
+    # (undefined direction) or some positive value that normalises
+    # correctly on its own terms regardless of other rows' scale, so a bare
+    # machine-tiny floor is both correct and sufficient.
+    norm = X.norm(dim=1, keepdim=True)
+    tiny = torch.finfo(X.dtype).tiny
+    normalised = X / norm.clamp_min(tiny)
+    return torch.where(norm > 0, normalised, torch.zeros_like(normalised))
+
+
+def _corr(X: torch.Tensor) -> torch.Tensor:
+    X_hat = _row_normalise(X)
     return X_hat @ X_hat.T
 
 
-def _cross_corr(X: torch.Tensor, Y: torch.Tensor, eps: float) -> torch.Tensor:
-    return _row_normalise(X, eps) @ _row_normalise(Y, eps).T
+def _cross_corr(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    return _row_normalise(X) @ _row_normalise(Y).T
 
 
 def _offdiag(A: torch.Tensor) -> torch.Tensor:
     return A - torch.diag_embed(torch.diagonal(A))
 
 
-def _row_dominance(A: torch.Tensor, m: int, eps: float) -> torch.Tensor:
-    diagonal = torch.diagonal(A)
-    off_mean = (A.abs().sum(dim=1) - diagonal.abs()) / max(m - 1, 1)
-    return diagonal.abs() / (off_mean + eps)
+def _dominance_ratio(diagonal: torch.Tensor, off_mean: torch.Tensor) -> torch.Tensor:
+    # diagonal / off_mean, meant to be scale-invariant (both are reductions
+    # of the same matrix) -- shared by _row_dominance and _cross_summary's
+    # specificity, which were the same formula duplicated inline.
+    eps_rel = torch.finfo(diagonal.dtype).eps
+    denominator = torch.maximum(off_mean, _relative_floor(diagonal, eps_rel))
+    result = torch.zeros_like(diagonal)
+    nonzero = diagonal > 0
+    result[nonzero] = diagonal[nonzero] / denominator[nonzero]
+    return result
+
+
+def _row_dominance(A: torch.Tensor, m: int) -> torch.Tensor:
+    # Sum the off-diagonal entries directly (mask the diagonal out first)
+    # rather than `row_sum - diagonal` -- the subtraction form suffers
+    # catastrophic cancellation exactly when the matrix is highly
+    # diagonal-dominant (the regime this metric is meant to detect):
+    # row_sum ~= diagonal there, so their difference loses most of its
+    # precision instead of correctly coming out small.
+    abs_A = A.abs()
+    diagonal = torch.diagonal(abs_A)
+    off_A = abs_A.clone()
+    off_A.fill_diagonal_(0)
+    off_mean = off_A.sum(dim=1) / max(m - 1, 1)
+    return _dominance_ratio(diagonal, off_mean)
 
 
 def _offdiag_stats(
@@ -123,11 +171,22 @@ def _offdiag_stats(
     return ax.mean(), x.square().mean().sqrt(), ax.max()
 
 
-def _cross_summary(C_XY: torch.Tensor, m: int, eps: float) -> dict[str, torch.Tensor]:
+def _cross_summary(C_XY: torch.Tensor, m: int) -> dict[str, torch.Tensor]:
     diagonal = torch.diagonal(C_XY)
-    off_mean = (C_XY.abs().sum(dim=1) - diagonal.abs()) / max(m - 1, 1)
-    specificity = diagonal.abs() / (off_mean + eps)
+    # Same off-diagonal-masking fix as _row_dominance -- avoid
+    # `row_sum - diagonal`'s catastrophic cancellation under high diagonal
+    # dominance.
+    abs_C = C_XY.abs()
+    off_C = abs_C.clone()
+    off_C.fill_diagonal_(0)
+    off_mean = off_C.sum(dim=1) / max(m - 1, 1)
+    specificity = _dominance_ratio(diagonal.abs(), off_mean)
     indices = torch.arange(m, device=C_XY.device)
+    # diagonal_energy_fraction's numerator is a strict energy subset of its
+    # denominator (diagonal^2 <= sum of all entries^2), so it's already
+    # bounded in [0, 1] -- a small absolute floor (not a relative one) is
+    # enough to avoid 0/0 without risking any blow-up.
+    tiny = torch.finfo(C_XY.dtype).tiny
     return {
         "diagonal": diagonal,
         "row_specificity": specificity,
@@ -138,35 +197,56 @@ def _cross_summary(C_XY: torch.Tensor, m: int, eps: float) -> dict[str, torch.Te
             (C_XY.abs().argmax(dim=0) == indices).to(C_XY.dtype).mean()
         ),
         "diagonal_energy_fraction": (
-            diagonal.square().sum() / (C_XY.square().sum() + eps)
+            diagonal.square().sum() / C_XY.square().sum().clamp_min(tiny)
         ),
     }
 
 
-def _matrix_cosine(A: torch.Tensor, B: torch.Tensor, eps: float) -> torch.Tensor:
-    return (A * B).sum() / (A.norm() * B.norm() + eps)
+def _matrix_cosine(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    # Cauchy-Schwarz bounds this in [-1, 1] regardless of A/B's scale, so a
+    # tiny absolute floor (not a relative one) is enough to avoid 0/0.
+    tiny = torch.finfo(A.dtype).tiny
+    return (A * B).sum() / (A.norm() * B.norm()).clamp_min(tiny)
 
 
-def _effective_rank(eigenvalues: torch.Tensor, eps: float) -> torch.Tensor:
+def _effective_rank(eigenvalues: torch.Tensor) -> torch.Tensor:
     values = eigenvalues.clamp_min(0)
-    probabilities = values / (values.sum() + eps)
-    entropy = -(probabilities * torch.log(probabilities + eps)).sum()
-    return torch.exp(entropy)
+    total = values.sum()
+    # The probability sum is bounded (each value <= the sum of all
+    # non-negative values), so a tiny absolute floor suffices here -- an
+    # absolute business-scale eps would otherwise stop `probabilities` from
+    # summing to ~1 whenever the whole spectrum is uniformly small,
+    # corrupting the entropy below. `xlogy` handles the p=0 entropy term
+    # exactly (0 * log(0) := 0 by definition) with no eps-in-the-log fudge
+    # needed, and without an eps distorting log(p) for small-but-positive p
+    # the way `log(p + eps)` would.
+    tiny = torch.finfo(values.dtype).tiny
+    probabilities = values / total.clamp_min(tiny)
+    entropy = -torch.xlogy(probabilities, probabilities).sum()
+    effective_rank = torch.exp(entropy)
+    # A fully zero spectrum spans no directions -- effective_rank should be
+    # 0, not exp(0)=1 (which the formula above would otherwise give: every
+    # probability is 0/tiny=0, xlogy(0,0)=0, so entropy=0).
+    return torch.where(total > 0, effective_rank, torch.zeros_like(effective_rank))
 
 
-def _spectral_summary(
-    eigenvalues: torch.Tensor, eps: float, topk: int
-) -> dict[str, torch.Tensor]:
+def _spectral_summary(eigenvalues: torch.Tensor, topk: int) -> dict[str, torch.Tensor]:
     # Expects descending-sorted, non-negative-clamped eigenvalues.
     eigenvalues = eigenvalues.clamp_min(0)
     total = eigenvalues.sum()
     k = min(topk, eigenvalues.numel())
+    eps_rel = torch.finfo(eigenvalues.dtype).eps
+    tiny = torch.finfo(eigenvalues.dtype).tiny
     return {
-        "effective_rank": _effective_rank(eigenvalues, eps),
+        "effective_rank": _effective_rank(eigenvalues),
         "largest": eigenvalues[0],
         "smallest": eigenvalues[-1],
-        "condition_regularized": eigenvalues[0] / (eigenvalues[-1] + eps),
-        "topk_energy_fraction": eigenvalues[:k].sum() / (total + eps),
+        # Condition number is genuinely unbounded (smallest eigenvalue can
+        # be exactly 0 for a rank-deficient matrix) -- same relative-floor
+        # treatment as row_dominance, not a tiny absolute floor.
+        "condition_regularized": eigenvalues[0]
+        / torch.maximum(eigenvalues[-1], _relative_floor(eigenvalues[0], eps_rel)),
+        "topk_energy_fraction": eigenvalues[:k].sum() / total.clamp_min(tiny),
     }
 
 
@@ -177,9 +257,22 @@ def _inverse_sqrt_from_eigh(
     eps: float,
 ) -> torch.Tensor:
     # Scale-relative floor (NOT a bare eps clamp) -- keeps this
-    # scale-invariant across params of very different magnitude.
-    floor = eps * matrix_scale.clamp_min(eps)
-    inv_sqrt_values = eigenvalues.clamp_min(floor).rsqrt()
+    # scale-invariant across params of very different magnitude. The old
+    # `matrix_scale.clamp_min(eps)` broke exactly that for matrix_scale <
+    # eps: clamping matrix_scale itself up to eps first made the floor
+    # collapse to a fixed eps^2 regardless of how much smaller matrix_scale
+    # actually was -- the same absolute-floor swamping bug fixed elsewhere
+    # in this file, hiding here too. Floor purely proportionally instead,
+    # backstopped only by machine-tiny for the literal matrix_scale == 0
+    # case.
+    tiny = torch.finfo(eigenvalues.dtype).tiny
+    scale = matrix_scale.clamp_min(0)
+    floor = (eps * scale).clamp_min(tiny)
+    # A fully zero-scale matrix has no direction to whiten relative to --
+    # define its inverse-sqrt as the zero matrix rather than an arbitrary
+    # huge value from flooring near-zero eigenvalues up to `tiny`.
+    active = (scale > 0).to(eigenvalues.dtype)
+    inv_sqrt_values = eigenvalues.clamp_min(floor).rsqrt() * active
     return (eigenvectors * inv_sqrt_values.unsqueeze(0)) @ eigenvectors.T
 
 
@@ -208,7 +301,7 @@ class _GramCore:
 
 
 def _build_gram_core(
-    W_before: torch.Tensor, V_raw: torch.Tensor, W_after: torch.Tensor, eps: float
+    W_before: torch.Tensor, V_raw: torch.Tensor, W_after: torch.Tensor
 ) -> _GramCore:
     m = W_before.shape[0]
     U_actual = W_after - W_before
@@ -221,14 +314,14 @@ def _build_gram_core(
         _gram(U_actual),
     )
     C_Wm, C_Wp, C_V, C_U = (
-        _corr(W_before, eps),
-        _corr(W_after, eps),
-        _corr(V_raw, eps),
-        _corr(U_actual, eps),
+        _corr(W_before),
+        _corr(W_after),
+        _corr(V_raw),
+        _corr(U_actual),
     )
-    C_WV = _cross_corr(W_before, V_raw, eps)
-    C_WU = _cross_corr(W_before, U_actual, eps)
-    C_VA = _cross_corr(V_raw, A_actual, eps)
+    C_WV = _cross_corr(W_before, V_raw)
+    C_WU = _cross_corr(W_before, U_actual)
+    C_VA = _cross_corr(V_raw, A_actual)
 
     delta_GW = G_Wp - G_Wm
     delta_CW = C_Wp - C_Wm
@@ -260,8 +353,15 @@ def _build_gram_core(
     )
 
 
-def _level1_metrics(core: _GramCore, eps: float) -> dict[str, torch.Tensor]:
+def _level1_metrics(core: _GramCore) -> dict[str, torch.Tensor]:
     m = core.m
+    # Cross-tensor ratios below (numerator/denominator from genuinely
+    # different tensors, e.g. update norm vs. weight norm) have no natural
+    # same-tensor relative reference -- a weight/momentum/etc. can be
+    # legitimately exactly 0, so full scale-invariance isn't achievable.
+    # Just avoid literal 0/0 with a tiny absolute floor, same as any other
+    # structurally-bounded-elsewhere ratio.
+    tiny = torch.finfo(core.W_before.dtype).tiny
 
     V_mean_abs, V_rms, V_max_abs = _offdiag_stats(core.C_V, m)
     U_mean_abs, U_rms, U_max_abs = _offdiag_stats(core.C_U, m)
@@ -282,35 +382,33 @@ def _level1_metrics(core: _GramCore, eps: float) -> dict[str, torch.Tensor]:
     # separate metric since it's trivially derivable from what's already
     # logged (same "drop what's a linear/simple transform of an
     # already-logged vector" rule as principal_angles_radians before).
-    VA = _cross_summary(core.C_VA, m, eps)
-    WV = _cross_summary(core.C_WV, m, eps)
-    WU = _cross_summary(core.C_WU, m, eps)
+    VA = _cross_summary(core.C_VA, m)
+    WV = _cross_summary(core.C_WV, m)
+    WU = _cross_summary(core.C_WU, m)
 
-    U_relative_step_fro = core.U_actual.norm() / (core.W_before.norm() + eps)
-    update_to_momentum_isotropy_ratio = U_rms / (V_rms + eps)
-    gram_geometry_alignment = _matrix_cosine(
-        _offdiag(core.C_V), _offdiag(core.C_U), eps
-    )
-    global_direction_alignment = _matrix_cosine(core.V_raw, core.A_actual, eps)
+    U_relative_step_fro = core.U_actual.norm() / core.W_before.norm().clamp_min(tiny)
+    update_to_momentum_isotropy_ratio = U_rms / V_rms.clamp_min(tiny)
+    gram_geometry_alignment = _matrix_cosine(_offdiag(core.C_V), _offdiag(core.C_U))
+    global_direction_alignment = _matrix_cosine(core.V_raw, core.A_actual)
 
-    gram_change_relative = core.delta_GW.norm() / (core.G_Wm.norm() + eps)
+    gram_change_relative = core.delta_GW.norm() / core.G_Wm.norm().clamp_min(tiny)
     correlation_change_per_row = core.delta_CW.norm() / (m**0.5)
     relational_change_fraction = _offdiag(core.delta_GW).square().sum() / (
-        core.delta_GW.square().sum() + eps
+        core.delta_GW.square().sum().clamp_min(tiny)
     )
-    gram_identity_residual = (core.delta_GW - core.reconstructed_delta_GW).norm() / (
-        core.delta_GW.norm() + eps
-    )
+    gram_identity_residual = (
+        core.delta_GW - core.reconstructed_delta_GW
+    ).norm() / core.delta_GW.norm().clamp_min(tiny)
 
     return {
-        "V_R_raw": _row_dominance(core.G_V, m, eps),
-        "V_R_cos": _row_dominance(core.C_V, m, eps),
-        "U_R_raw": _row_dominance(core.G_U, m, eps),
-        "U_R_cos": _row_dominance(core.C_U, m, eps),
-        "Wm_R_raw": _row_dominance(core.G_Wm, m, eps),
-        "Wm_R_cos": _row_dominance(core.C_Wm, m, eps),
-        "Wp_R_raw": _row_dominance(core.G_Wp, m, eps),
-        "Wp_R_cos": _row_dominance(core.C_Wp, m, eps),
+        "V_R_raw": _row_dominance(core.G_V, m),
+        "V_R_cos": _row_dominance(core.C_V, m),
+        "U_R_raw": _row_dominance(core.G_U, m),
+        "U_R_cos": _row_dominance(core.C_U, m),
+        "Wm_R_raw": _row_dominance(core.G_Wm, m),
+        "Wm_R_cos": _row_dominance(core.C_Wm, m),
+        "Wp_R_raw": _row_dominance(core.G_Wp, m),
+        "Wp_R_cos": _row_dominance(core.C_Wp, m),
         "VA_diagonal": VA["diagonal"],
         "VA_row_specificity": VA["row_specificity"],
         "WV_diagonal": WV["diagonal"],
@@ -371,7 +469,7 @@ class _Level2Extras:
 
 
 def _level2_metrics(
-    core: _GramCore, eps: float, topk: int
+    core: _GramCore, topk: int
 ) -> tuple[dict[str, torch.Tensor], _Level2Extras]:
     m = core.m
 
@@ -397,8 +495,12 @@ def _level2_metrics(
 
     q_V = torch.diagonal(UWm.T @ core.G_V @ UWm).clamp_min(0)
     q_U = torch.diagonal(UWm.T @ core.G_U @ UWm).clamp_min(0)
-    q_V_dist = q_V / (q_V.sum() + eps)
-    q_U_dist = q_U / (q_U.sum() + eps)
+    # Bounded distributions (each entry <= the sum of all non-negative
+    # entries) -- a tiny absolute floor suffices, same reasoning as
+    # _effective_rank's probabilities.
+    q_tiny = torch.finfo(q_V.dtype).tiny
+    q_V_dist = q_V / q_V.sum().clamp_min(q_tiny)
+    q_U_dist = q_U / q_U.sum().clamp_min(q_tiny)
 
     scalars: dict[str, torch.Tensor] = {}
     for prefix, eig in (
@@ -411,7 +513,7 @@ def _level2_metrics(
         ("C_V", cv),
         ("C_U", cu),
     ):
-        for name, val in _spectral_summary(eig, eps, topk).items():
+        for name, val in _spectral_summary(eig, topk).items():
             scalars[f"{prefix}_{name}"] = val
 
     scalars.update(
@@ -424,9 +526,7 @@ def _level2_metrics(
             "overlap_Wm_U": overlap(UWm, UU),
             "overlap_V_U": overlap(UV, UU),
             "overlap_Wm_Wp": overlap(UWm, UWp),
-            "G_W_effective_rank_delta": (
-                _effective_rank(gwp, eps) - _effective_rank(gwm, eps)
-            ),
+            "G_W_effective_rank_delta": (_effective_rank(gwp) - _effective_rank(gwm)),
         }
     )
 
@@ -474,6 +574,26 @@ def _level2_metrics(
     return {**scalars, **vectors}, extras
 
 
+def _log_rate_spread(rates: torch.Tensor) -> torch.Tensor:
+    # log(rates + eps) has the same absolute-eps swamping problem as
+    # everywhere else in this file: a genuine eigendirection the update
+    # doesn't touch at all gives rate == 0 exactly (not just floating-point
+    # noise), and if the OTHER rates are uniformly small too (a small
+    # update relative to the weight, a real training regime), an absolute
+    # eps makes every log(rate + eps) collapse toward the same log(eps)
+    # constant, corrupting the spread. Floor each rate relative to the
+    # largest rate instead -- unlike _row_normalise (where referencing
+    # other rows was wrong, since rows are logically independent), the
+    # rates being compared against each other via max_rate is exactly what
+    # "spread" means here, so this is the right reference.
+    eps_rel = torch.finfo(rates.dtype).eps
+    max_rate = rates.max()
+    floor = _relative_floor(max_rate, eps_rel)
+    log_rates = torch.log(torch.maximum(rates, floor))
+    spread = log_rates.std()
+    return torch.where(max_rate > 0, spread, torch.zeros_like(spread))
+
+
 def _level3_metrics(
     core: _GramCore, eps: float, extras: _Level2Extras
 ) -> dict[str, torch.Tensor]:
@@ -498,13 +618,17 @@ def _level3_metrics(
 
     K_V_rates = eig_KV.sqrt()
     K_U_rates = eig_KU.sqrt()
-    K_U_log_rate_spread = torch.log(K_U_rates + eps).std()
+    K_U_log_rate_spread = _log_rate_spread(K_U_rates)
 
-    norm_KV = eig_KV / (eig_KV.sum() + eps)
-    norm_KU = eig_KU / (eig_KU.sum() + eps)
+    # Bounded distributions/fractions (each entry, or each signed part, is
+    # <= the sum of all non-negative magnitudes) -- a tiny absolute floor
+    # suffices, same reasoning as _effective_rank's probabilities.
+    eig_tiny = torch.finfo(eig_KV.dtype).tiny
+    norm_KV = eig_KV / eig_KV.sum().clamp_min(eig_tiny)
+    norm_KU = eig_KU / eig_KU.sum().clamp_min(eig_tiny)
     relative_spectrum_l1_distance = (norm_KV - norm_KU).abs().sum()
 
-    J_abs_sum = eig_J.abs().sum() + eps
+    J_abs_sum = eig_J.abs().sum().clamp_min(torch.finfo(eig_J.dtype).tiny)
     J_positive_fraction = eig_J.clamp_min(0).sum() / J_abs_sum
     J_negative_fraction = (-eig_J.clamp_max(0)).sum() / J_abs_sum
 
@@ -702,11 +826,11 @@ def calculate_gram_metrics(
     if W_after.dtype in (torch.float16, torch.bfloat16):
         W_after = W_after.float()
 
-    core = _build_gram_core(W_before, V_raw, W_after, eps)
-    out: dict[str, torch.Tensor] = dict(_level1_metrics(core, eps))
+    core = _build_gram_core(W_before, V_raw, W_after)
+    out: dict[str, torch.Tensor] = dict(_level1_metrics(core))
     extras = None
     if level >= 2:
-        lvl2, extras = _level2_metrics(core, eps, topk)
+        lvl2, extras = _level2_metrics(core, topk)
         out.update(lvl2)
     if level >= 3:
         out.update(_level3_metrics(core, eps, extras))

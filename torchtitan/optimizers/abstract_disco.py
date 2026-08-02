@@ -223,7 +223,7 @@ class AbstractDiSCO(torch.optim.Optimizer):
         elif norm_factor == "rmnp_row_norm":
             g = fused_rmnp_row_norm(g, eps)
 
-        elif norm_factor == "rmnp_row_norm-rms-rms":
+        elif norm_factor == "rmnp_row_norm_rms_rms":
             g = fused_rmnp_row_norm_rms_rms(g, eps)
 
         elif norm_factor == "lr_by_1_over_sqrt_d_in":
