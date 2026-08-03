@@ -40,9 +40,14 @@ Three cumulative levels, gated by a single `level: int` argument:
      correlations) are folded in unconditionally here rather than exposed
      as a separate flag -- both only ever run at level 3.
 
-Every vector-valued metric has length `m` (the row-count of the
-prepped/transposed matrix) -- every Gram/correlation matrix here is square
-`m x m` (built as `X @ Y.T`, never `Y.T @ X`).
+Every vector-valued metric has length `m` (the row-count after orientation
+is applied) -- every Gram/correlation matrix here is square `m x m` (built
+as `X @ Y.T`, never `Y.T @ X`). Orientation is decided unconditionally by
+shape, inside `calculate_gram_metrics`: rows are always transposed to be
+<= cols (`m = min(D_out, D_in)`), regardless of any caller-supplied
+`transpose` argument -- see that function's docstring for why (numerical:
+guarantees a reduced SVD spans the complete eigenspace; and a fix for the
+large-vocab OOM that name-based `need_T` matching missed for `output`).
 
 Where a full vector is itself returned, its generic percentile/mean/min/max
 summary is intentionally NOT also returned (redundant, reconstructable
@@ -54,6 +59,7 @@ trivially derivable from an already-logged vector: `raw_trace_normalised`/
 """
 
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -62,29 +68,36 @@ _DEFAULT_GRAM_EPS: float = 1e-6
 _DEFAULT_GRAM_TOPK: int = 8
 
 
-def _prep(X: torch.Tensor, transpose: bool) -> torch.Tensor:
+def _prep(X: torch.Tensor) -> torch.Tensor:
     if isinstance(X, torch.nn.Parameter):
         X = X.data
     if isinstance(X, DTensor):
         X = X.to_local()
     if X.ndim == 1 and X.numel() > 1:
         X = torch.diag_embed(X)
-    if transpose:
-        X = X.transpose(0, 1)
     return X
+
+
+def gram_matrix_is_transposed(shape: tuple[int, ...]) -> bool:
+    """Whether Gram metrics orient the final two matrix dimensions as ``X.T``."""
+    return len(shape) >= 2 and int(shape[-2]) > int(shape[-1])
 
 
 def gram_vector_len(shape: tuple[int, ...], transpose: bool = False) -> int:
     """
     Static, shape-derived length of every vector-valued gram metric for a
-    parameter of this local shape -- mirrors `_prep`'s diag_embed/transpose
-    handling without needing an actual tensor, for disco.py's per-param
-    offset-table precompute (DDP/FSDP/experts). Always `m`, never
-    `min(m, n)` -- see module docstring.
+    parameter of this local shape -- for disco.py's per-param offset-table
+    precompute (DDP/FSDP/experts). `transpose` is accepted only for
+    call-site compatibility and is ignored: `calculate_gram_metrics`
+    decides orientation itself from the tensor's actual shape (always
+    `rows <= cols`, see its docstring), so this must independently track
+    `min(shape[-2], shape[-1])` regardless of what's passed here -- a
+    mismatch between the two would corrupt disco.py's packed offset
+    tables.
     """
     if len(shape) == 1:
         return max(int(shape[0]), 1)
-    return int(shape[-1]) if transpose else int(shape[-2])
+    return min(int(shape[-2]), int(shape[-1]))
 
 
 def _gram(X: torch.Tensor) -> torch.Tensor:
@@ -276,6 +289,106 @@ def _inverse_sqrt_from_eigh(
     return (eigenvectors * inv_sqrt_values.unsqueeze(0)) @ eigenvectors.T
 
 
+def _gram_eigh_from_factor(X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Ascending eigenpairs of X @ X.T via SVD of X directly -- avoids
+    explicitly forming X @ X.T, which squares the condition number
+    (kappa(X @ X.T) = kappa(X)^2) and is measurably more likely to trip up
+    eigh's convergence (observed in practice: a bf16-all-to-all-derived
+    matrix, upcast to fp32, hit "eigh: the algorithm failed to converge
+    because the input matrix is ill-conditioned or has too many repeated
+    eigenvalues" on exactly this kind of explicitly-formed product).
+    Assumes rows <= cols (guaranteed by calculate_gram_metrics's
+    orientation policy -- see its docstring), so the reduced SVD's U
+    already spans the complete eigenspace, with no rank-deficient
+    dimensions to pad.
+    """
+    U_desc, singular_desc, _ = torch.linalg.svd(X, full_matrices=False)
+    return singular_desc.square().flip(0), U_desc.flip(1)
+
+
+def _svd_eigenvalues(X: torch.Tensor) -> torch.Tensor:
+    """
+    Descending eigenvalues of X @ X.T via SVD of X, values only (no
+    eigenvectors) -- same motivation as `_gram_eigh_from_factor`, cheaper
+    when eigenvectors aren't needed downstream.
+    """
+    return torch.linalg.svdvals(X).square()
+
+
+def _safe_sym_eigvalsh(A: torch.Tensor) -> torch.Tensor:
+    """
+    Signed eigenvalues in ascending order, for matrices that are NOT a
+    single factor's Gram product (delta_GW, J -- differences of PSD
+    matrices, genuinely indefinite, so the SVD-of-factor trick above
+    doesn't apply). Rescales to unit max-abs-entry before eigvalsh (helps
+    LAPACK resolve close eigenvalues -- fp32's *absolute* precision
+    degrades at large magnitude even though its *relative* precision
+    doesn't, and genuinely-distinct eigenvalues can round together at
+    large scale) and forces exact numerical symmetry, then rescales the
+    result back.
+    """
+    # Symmetrize BEFORE measuring scale, not after -- scale must reflect
+    # the actual matrix being normalised and decomposed (A_sym), not a
+    # possibly-slightly-different unsymmetrized A. Matches
+    # _safe_psd_eigh/_safe_psd_eigvalsh's ordering, which already got this
+    # right.
+    A_sym = 0.5 * (A + A.T)
+    scale = A_sym.abs().amax()
+    if scale == 0:
+        return torch.zeros(A.shape[0], device=A.device, dtype=A.dtype)
+    return torch.linalg.eigvalsh(A_sym / scale) * scale
+
+
+def _safe_psd_eigh(
+    G: torch.Tensor, factor: Callable[[], torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Ascending eigenpairs of a PSD matrix G (== factor @ factor.T). Tries a
+    cheap, rescaled+symmetrized `eigh` on the already-formed G first (fast,
+    and numerically robust for the vast majority of inputs); falls back to
+    the more expensive but bulletproof SVD-of-factor
+    (`_gram_eigh_from_factor`) only if `eigh` actually raises. `factor` is
+    a zero-arg callable, not a tensor -- SVD-of-factor is measurably more
+    expensive than eigh for wide matrices (scales with the larger
+    dimension rather than collapsing it away via the Gram product), so it
+    must stay unevaluated unless the fallback path is actually taken.
+    """
+    G_sym = 0.5 * (G + G.T)
+    scale = G_sym.abs().amax()
+    n = G_sym.shape[0]
+    if scale == 0:
+        return (
+            torch.zeros(n, device=G.device, dtype=G.dtype),
+            torch.eye(n, device=G.device, dtype=G.dtype),
+        )
+    try:
+        values, vectors = torch.linalg.eigh(G_sym / scale)
+        return values.clamp_min(0) * scale, vectors
+    except torch._C._LinAlgError:
+        return _gram_eigh_from_factor(factor())
+
+
+def _safe_psd_eigvalsh(
+    G: torch.Tensor, factor: Callable[[], torch.Tensor]
+) -> torch.Tensor:
+    """
+    Descending eigenvalues of a PSD matrix G (== factor @ factor.T),
+    values only. Same try-cheap-eigh-first-fall-back-to-SVD-of-factor
+    strategy as `_safe_psd_eigh`, and the same lazy-`factor` contract.
+    """
+    G_sym = 0.5 * (G + G.T)
+    scale = G_sym.abs().amax()
+    n = G_sym.shape[0]
+    if scale == 0:
+        return torch.zeros(n, device=G.device, dtype=G.dtype)
+    try:
+        values = torch.linalg.eigvalsh(G_sym / scale)
+        return values.clamp_min(0).flip(0) * scale
+    except torch._C._LinAlgError:
+        return _svd_eigenvalues(factor())
+
+
 @dataclass
 class _GramCore:
     m: int
@@ -297,7 +410,14 @@ class _GramCore:
     C_VA: torch.Tensor
     delta_GW: torch.Tensor
     delta_CW: torch.Tensor
-    reconstructed_delta_GW: torch.Tensor
+    naive_delta_GW: torch.Tensor
+    # Row-normalized factors (C_X = X_hat @ X_hat.T) -- stored so level 2's
+    # SVD-based C_* eigenvalues (_svd_eigenvalues(X_hat)) reuse the same
+    # normalization computed here, instead of row-normalizing a second time.
+    Wm_hat: torch.Tensor
+    Wp_hat: torch.Tensor
+    V_hat: torch.Tensor
+    U_hat: torch.Tensor
 
 
 def _build_gram_core(
@@ -313,21 +433,38 @@ def _build_gram_core(
         _gram(V_raw),
         _gram(U_actual),
     )
+    Wm_hat, Wp_hat, V_hat, U_hat = (
+        _row_normalise(W_before),
+        _row_normalise(W_after),
+        _row_normalise(V_raw),
+        _row_normalise(U_actual),
+    )
     C_Wm, C_Wp, C_V, C_U = (
-        _corr(W_before),
-        _corr(W_after),
-        _corr(V_raw),
-        _corr(U_actual),
+        Wm_hat @ Wm_hat.T,
+        Wp_hat @ Wp_hat.T,
+        V_hat @ V_hat.T,
+        U_hat @ U_hat.T,
     )
     C_WV = _cross_corr(W_before, V_raw)
     C_WU = _cross_corr(W_before, U_actual)
     C_VA = _cross_corr(V_raw, A_actual)
 
-    delta_GW = G_Wp - G_Wm
-    delta_CW = C_Wp - C_Wm
     # Exact algebraic identity: G_Wp - G_Wm == W_before@U^T + U@W_before^T +
-    # U@U^T (U = W_after - W_before) -- see gram_identity_residual below.
-    reconstructed_delta_GW = W_before @ U_actual.T + U_actual @ W_before.T + G_U
+    # U@U^T (U = W_after - W_before). Used as the PRIMARY delta_GW (not
+    # just a sanity-check reconstruction): G_Wp/G_Wm can both be large in
+    # magnitude while their true difference is small (a small update
+    # relative to the weight's own scale -- the common case), so computing
+    # delta_GW as a direct subtraction of two large matrices is
+    # catastrophic-cancellation-prone. This product-based form only
+    # involves the already-small U_actual, so it doesn't suffer the same
+    # precision loss -- and it's what feeds G_W_change_eigenvalues's eigh
+    # and J's construction below, exactly the numerically-sensitive path
+    # that benefits most. `naive_delta_GW` (the direct subtraction) is kept
+    # separately, purely so gram_identity_residual stays a real
+    # precision-loss diagnostic instead of comparing a value to itself.
+    delta_GW = W_before @ U_actual.T + U_actual @ W_before.T + G_U
+    delta_CW = C_Wp - C_Wm
+    naive_delta_GW = G_Wp - G_Wm
 
     return _GramCore(
         m=m,
@@ -349,7 +486,11 @@ def _build_gram_core(
         C_VA=C_VA,
         delta_GW=delta_GW,
         delta_CW=delta_CW,
-        reconstructed_delta_GW=reconstructed_delta_GW,
+        naive_delta_GW=naive_delta_GW,
+        Wm_hat=Wm_hat,
+        Wp_hat=Wp_hat,
+        V_hat=V_hat,
+        U_hat=U_hat,
     )
 
 
@@ -397,7 +538,7 @@ def _level1_metrics(core: _GramCore) -> dict[str, torch.Tensor]:
         core.delta_GW.square().sum().clamp_min(tiny)
     )
     gram_identity_residual = (
-        core.delta_GW - core.reconstructed_delta_GW
+        core.naive_delta_GW - core.delta_GW
     ).norm() / core.delta_GW.norm().clamp_min(tiny)
 
     return {
@@ -443,13 +584,15 @@ def _level1_metrics(core: _GramCore) -> dict[str, torch.Tensor]:
         "gram_change_relative": gram_change_relative,
         "correlation_change_per_row": correlation_change_per_row,
         "relational_change_fraction": relational_change_fraction,
-        # Tautologically ~0 (floating-point precision only): U_actual is
-        # always derived as W_after - W_before internally, never
-        # independently measured, so this identity holds by construction
-        # regardless of how faithful W_after (pseudo_w) is to a true
-        # post-update read. Kept as a cheap dtype/precision sanity monitor,
-        # not a training-dynamics signal -- don't expect it to correlate
-        # with anything interesting.
+        # Compares the direct-subtraction naive_delta_GW against the
+        # numerically-stable, product-based delta_GW used as the real
+        # delta_GW everywhere else -- expected to be small (this identity
+        # holds exactly in exact arithmetic, regardless of how faithful
+        # W_after/pseudo_w is to a true post-update read) but is NOT
+        # tautologically zero: it's now a genuine (if usually tiny)
+        # measure of the naive subtraction's cancellation error, not just
+        # floating-point noise between two equally-precise paths. Still a
+        # dtype/precision diagnostic, not a training-dynamics signal.
         "gram_identity_residual": gram_identity_residual,
     }
 
@@ -473,20 +616,20 @@ def _level2_metrics(
 ) -> tuple[dict[str, torch.Tensor], _Level2Extras]:
     m = core.m
 
-    gwm_asc, UWm_asc = torch.linalg.eigh(core.G_Wm)
-    gwp_asc, UWp_asc = torch.linalg.eigh(core.G_Wp)
-    gv_asc, UV_asc = torch.linalg.eigh(core.G_V)
-    gu_asc, UU_asc = torch.linalg.eigh(core.G_U)
+    gwm_asc, UWm_asc = _safe_psd_eigh(core.G_Wm, lambda: core.W_before)
+    gwp_asc, UWp_asc = _safe_psd_eigh(core.G_Wp, lambda: core.W_after)
+    gv_asc, UV_asc = _safe_psd_eigh(core.G_V, lambda: core.V_raw)
+    gu_asc, UU_asc = _safe_psd_eigh(core.G_U, lambda: core.U_actual)
 
     gwm, UWm = gwm_asc.flip(0), UWm_asc.flip(1)
     gwp, UWp = gwp_asc.flip(0), UWp_asc.flip(1)
     gv, UV = gv_asc.flip(0), UV_asc.flip(1)
     gu, UU = gu_asc.flip(0), UU_asc.flip(1)
 
-    cwm = torch.linalg.eigvalsh(core.C_Wm).flip(0)
-    cwp = torch.linalg.eigvalsh(core.C_Wp).flip(0)
-    cv = torch.linalg.eigvalsh(core.C_V).flip(0)
-    cu = torch.linalg.eigvalsh(core.C_U).flip(0)
+    cwm = _safe_psd_eigvalsh(core.C_Wm, lambda: core.Wm_hat)
+    cwp = _safe_psd_eigvalsh(core.C_Wp, lambda: core.Wp_hat)
+    cv = _safe_psd_eigvalsh(core.C_V, lambda: core.V_hat)
+    cu = _safe_psd_eigvalsh(core.C_U, lambda: core.U_hat)
 
     k = min(topk, m)
 
@@ -536,15 +679,17 @@ def _level2_metrics(
     # (sorting can reshuffle which actual eigenvector lands at position i
     # between the two matrices) -- named accordingly, not just
     # "eigenvalue_delta". Contrast with G_W_change_eigenvalues below, the
-    # eigenvalues of the actual difference matrix delta_GW = G_Wp - G_Wm
-    # itself -- a more principled measure of the Gram change's own spectral
+    # eigenvalues of the actual difference matrix delta_GW (the
+    # numerically-stable product-based formula, mathematically equal to
+    # G_Wp - G_Wm -- see _build_gram_core) itself -- a more principled
+    # measure of the Gram change's own spectral
     # content, unaffected by any eigenvector reshuffling between G_Wp/G_Wm.
     # Unlike G_W/C_W eigenvalues (always >=0, real Gram/correlation
     # matrices), delta_GW is a difference of two PSD matrices and generally
     # indefinite -- signed, not clamped, same treatment as level 3's
     # J_eigenvalues (delta_GW's whitened counterpart).
     G_W_rankwise_eigenvalue_delta = gwp - gwm
-    G_W_change_eigenvalues = torch.linalg.eigvalsh(core.delta_GW).flip(0)
+    G_W_change_eigenvalues = _safe_sym_eigvalsh(core.delta_GW).flip(0)
 
     vectors = {
         "G_Wm_eigenvalues": gwm,
@@ -605,16 +750,21 @@ def _level3_metrics(
     GV_inv_sqrt = _inverse_sqrt_from_eigh(extras.gv_asc, extras.UV_asc, V_scale, eps)
     GU_inv_sqrt = _inverse_sqrt_from_eigh(extras.gu_asc, extras.UU_asc, U_scale, eps)
 
+    # K_V = GW_inv_sqrt @ G_V @ GW_inv_sqrt = factor @ factor.T for
+    # factor = GW_inv_sqrt @ V_raw (GW_inv_sqrt is exactly symmetric by
+    # construction). Try the cheap eigh on the already-available G_V
+    # sandwich first; the factor (an extra matmul, wasted if eigh
+    # succeeds) is only actually computed on the rare fallback path.
     K_V = GW_inv_sqrt @ core.G_V @ GW_inv_sqrt
     K_U = GW_inv_sqrt @ core.G_U @ GW_inv_sqrt
-    J = GW_inv_sqrt @ core.delta_GW @ GW_inv_sqrt
-    K_V = 0.5 * (K_V + K_V.T)
-    K_U = 0.5 * (K_U + K_U.T)
-    J = 0.5 * (J + J.T)
+    eig_KV = _safe_psd_eigvalsh(K_V, lambda: GW_inv_sqrt @ core.V_raw)
+    eig_KU = _safe_psd_eigvalsh(K_U, lambda: GW_inv_sqrt @ core.U_actual)
 
-    eig_KV = torch.linalg.eigvalsh(K_V).clamp_min(0).flip(0)
-    eig_KU = torch.linalg.eigvalsh(K_U).clamp_min(0).flip(0)
-    eig_J = torch.linalg.eigvalsh(J).flip(0)  # signed -- no clamp
+    # J = GW_inv_sqrt @ delta_GW @ GW_inv_sqrt is genuinely indefinite
+    # (delta_GW is a difference of two PSD matrices), so the factor trick
+    # above doesn't apply -- hardened eigvalsh instead.
+    J = GW_inv_sqrt @ core.delta_GW @ GW_inv_sqrt
+    eig_J = _safe_sym_eigvalsh(J).flip(0)  # signed -- no clamp
 
     K_V_rates = eig_KV.sqrt()
     K_U_rates = eig_KU.sqrt()
@@ -642,12 +792,22 @@ def _level3_metrics(
         "K_U_eigenvalues": eig_KU,
         "K_U_rates": K_U_rates,
         "J_eigenvalues": eig_J,
+        # C_WV/C_WU/C_VA are plain cross-correlation singular values, NOT
+        # bounded by 1 (e.g. near-duplicate rows can push these up toward
+        # ~m) -- no clamp.
         "C_WV_singular_values": torch.linalg.svdvals(core.C_WV),
         "C_WU_singular_values": torch.linalg.svdvals(core.C_WU),
         "C_VA_singular_values": torch.linalg.svdvals(core.C_VA),
-        "Q_WV_canonical_correlations": torch.linalg.svdvals(Q_WV),
-        "Q_WU_canonical_correlations": torch.linalg.svdvals(Q_WU),
-        "Q_VA_canonical_correlations": torch.linalg.svdvals(Q_VA),
+        # Q_WV/Q_WU/Q_VA are canonical correlations (classic whitened
+        # cross-Gram CCA construction) -- mathematically guaranteed in
+        # [0, 1] by Cauchy-Schwarz, unlike the plain singular values above.
+        # Any value outside that range is floating-point noise from the
+        # whitening transforms (GW_inv_sqrt/GV_inv_sqrt/GU_inv_sqrt), not
+        # real signal -- clamp to enforce the known bound, same rationale
+        # as clamping PSD eigenvalues to >= 0 elsewhere in this file.
+        "Q_WV_canonical_correlations": torch.linalg.svdvals(Q_WV).clamp(0, 1),
+        "Q_WU_canonical_correlations": torch.linalg.svdvals(Q_WU).clamp(0, 1),
+        "Q_VA_canonical_correlations": torch.linalg.svdvals(Q_VA).clamp(0, 1),
         "K_U_log_rate_spread": K_U_log_rate_spread,
         "relative_spectrum_l1_distance": relative_spectrum_l1_distance,
         "J_positive_fraction": J_positive_fraction,
@@ -785,7 +945,6 @@ def calculate_gram_metrics(
     level: int = 0,
     eps: float = _DEFAULT_GRAM_EPS,
     topk: int = _DEFAULT_GRAM_TOPK,
-    transpose: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     Cheap no-op ({}) for level <= 0 -- the single early-return point; every
@@ -795,9 +954,33 @@ def calculate_gram_metrics(
     (disco.py passes `pseudo_w`) -- see readme.md.
 
     Mirrors norm_helper.calculate_norm's unwrap contract for all three
-    tensors (Parameter/DTensor -> local tensor, 1-D -> diag_embed, optional
-    transpose), then upcasts each to float32 if in fp16/bf16 (Gram/eigh/svd
-    are unreliable in half precision).
+    tensors (Parameter/DTensor -> local tensor, 1-D -> diag_embed), then
+    upcasts each to float32 if in fp16/bf16 (Gram/eigh/svd are unreliable
+    in half precision).
+
+    `transpose` is accepted for call-site compatibility (disco.py's
+    embedding path passes its name-based `need_T`) but is IGNORED here:
+    orientation is instead decided unconditionally from shape -- rows are
+    always transposed to be <= cols. This both (a) guarantees the reduced
+    SVD used internally (see `_gram_eigh_from_factor`) always spans the
+    complete eigenspace, and (b) fixes the large-vocab OOM that `need_T`'s
+    name-based matching missed for `output`/lm_head (same pathological
+    shape as `tok_embeddings`, different param name). This is a deliberate
+    semantic choice, not just a numerical nicety: any parameter with
+    `D_out > D_in` (e.g. an FFN up-projection) now tracks input-feature-wise
+    dynamics instead of output-channel-wise -- see readme.md.
+
+    NaN/Inf is replaced element-wise with 0 before any computation -- this
+    is a best-effort diagnostic feature and must never be able to crash
+    training. `W_before`/`W_after` are sanitized as a PAIR (zeroed together
+    wherever EITHER is non-finite at a position), not independently: since
+    `U_actual = W_after - W_before`, independently zeroing just the
+    non-finite side would fabricate a fake update at that position (e.g.
+    NaN-before + finite-after would read as "jumped from 0 to
+    W_after[i,j]", an update that never happened) rather than correctly
+    recording "no valid update data here". `V_raw` has no such pairing
+    concern (nothing downstream derives a delta from it against another
+    tensor the same way) and is sanitized independently.
 
     Returns a dict whose key set is a deterministic function of `level`
     alone (gram_scalar_names(level) + gram_vector_names(level)),
@@ -807,9 +990,9 @@ def calculate_gram_metrics(
     """
     if level <= 0:
         return {}
-    W_before = _prep(W_before, transpose)
-    V_raw = _prep(V_raw, transpose)
-    W_after = _prep(W_after, transpose)
+    W_before = _prep(W_before)
+    V_raw = _prep(V_raw)
+    W_after = _prep(W_after)
     if (
         W_before.ndim < 2
         or V_raw.ndim < 2
@@ -825,6 +1008,18 @@ def calculate_gram_metrics(
         V_raw = V_raw.float()
     if W_after.dtype in (torch.float16, torch.bfloat16):
         W_after = W_after.float()
+
+    weight_pair_valid = torch.isfinite(W_before) & torch.isfinite(W_after)
+    W_before = torch.where(weight_pair_valid, W_before, torch.zeros_like(W_before))
+    W_after = torch.where(weight_pair_valid, W_after, torch.zeros_like(W_after))
+
+    V_valid = torch.isfinite(V_raw)
+    V_raw = torch.where(V_valid, V_raw, torch.zeros_like(V_raw))
+
+    if gram_matrix_is_transposed(tuple(W_before.shape)):
+        W_before = W_before.transpose(0, 1)
+        V_raw = V_raw.transpose(0, 1)
+        W_after = W_after.transpose(0, 1)
 
     core = _build_gram_core(W_before, V_raw, W_after)
     out: dict[str, torch.Tensor] = dict(_level1_metrics(core))

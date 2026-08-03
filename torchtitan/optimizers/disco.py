@@ -171,6 +171,15 @@ def calculate_shard_shape(shape, rank, world_size):
     return (dim0, *shape[1:])
 
 
+def _gram_log_param_name(cleaned_name: str, shape: tuple[int, ...]) -> str:
+    """Mark parameter names whose Gram metrics use the transposed orientation."""
+    return (
+        f"{cleaned_name}.T"
+        if gram_helper.gram_matrix_is_transposed(shape)
+        else cleaned_name
+    )
+
+
 def parse_env_var():
     debug_mode = os.environ.get("DISCO_DEBUG_MODE", "0") == "1"
     persistent_cache_enabled = (
@@ -2921,10 +2930,11 @@ class DiSCO(AbstractDiSCO):
                 # "output" too) -- see readme.md.
                 gram_metrics = {}
                 # gram_metrics = calculate_gram_metrics(
-                #     p, g, pseudo_w, level=self.gram_level, transpose=need_T
+                #     p, g, pseudo_w, level=self.gram_level, # transpose=need_T
                 # )
 
                 cleaned_p_name = remove_orig_mod_and_weight_for_p_name(p_name)
+                gram_p_name = _gram_log_param_name(cleaned_p_name, tuple(p.shape))
                 for norm_name in self.norms_to_log:
                     final_norms[
                         f"track_update_{norm_name}/{cleaned_p_name}"
@@ -2933,7 +2943,7 @@ class DiSCO(AbstractDiSCO):
                         norm_name
                     ]
                 for gram_name, val in gram_metrics.items():
-                    final_norms[f"track_gram_{gram_name}/{cleaned_p_name}"] = val
+                    final_norms[f"track_gram_{gram_name}/{gram_p_name}"] = val
                 # This path already operates on fully-materialized local tensors
                 # (no FSDP/EP sharding survives to this point), so the spectrum is
                 # already complete locally — no extra collective is needed.
@@ -3128,7 +3138,7 @@ class DiSCO(AbstractDiSCO):
                             g_raw[ep_idx],
                             pseudo_w,
                             level=self.gram_level,
-                            transpose=transpose,
+                            # transpose=transpose,
                         )
                         for name in self.gram_scalar_names:
                             norms_of_gram.append(gram_metrics[name])
@@ -3243,11 +3253,14 @@ class DiSCO(AbstractDiSCO):
                     cleaned_name = remove_orig_mod_and_weight_for_p_name(
                         expert_param_names[p]
                     )
+                    gram_param_name = _gram_log_param_name(
+                        cleaned_name, tuple(expert_params[p].shape)
+                    )
                     gram_name = gram_names[g]
                     rank_base = r * per_rank_total
 
                     key_gram = (
-                        f"track_gram_{gram_name}/ep_{actual_ep_idx}/{cleaned_name}"
+                        f"track_gram_{gram_name}/ep_{actual_ep_idx}/{gram_param_name}"
                     )
                     final_norms[key_gram] = gathered[
                         rank_base + gram_scalar_offset + rem
@@ -3273,6 +3286,10 @@ class DiSCO(AbstractDiSCO):
                             cleaned_name = remove_orig_mod_and_weight_for_p_name(
                                 block_names[p_idx]
                             )
+                            gram_param_name = _gram_log_param_name(
+                                cleaned_name,
+                                tuple(expert_params[start + p_idx].shape),
+                            )
                             rank_base = r * per_rank_total
                             local_off = block_base_vec + rem * K_block_vec * n_vec
                             for vi, vname in enumerate(self.gram_vector_names):
@@ -3282,9 +3299,13 @@ class DiSCO(AbstractDiSCO):
                                     + local_off
                                     + vi * K_block_vec
                                 )
-                                final_norms[
-                                    f"track_gram_{vname}/ep_{actual_ep_idx}/{cleaned_name}"
-                                ] = gathered[v_start : v_start + K_block_vec]
+                                gram_key = (
+                                    f"track_gram_{vname}/ep_{actual_ep_idx}/"
+                                    f"{gram_param_name}"
+                                )
+                                final_norms[gram_key] = gathered[
+                                    v_start : v_start + K_block_vec
+                                ]
 
                 if update_spectrum_flat is not None:
                     for block_idx, (start, end) in enumerate(blocks):
@@ -3718,11 +3739,14 @@ class DiSCO(AbstractDiSCO):
                         rank_base + w_base + k
                     ]
                 if "gram" in offsets:
+                    gram_param_name = _gram_log_param_name(
+                        cleaned, tuple(ddp_params[param_idx].shape)
+                    )
                     gram_base = offsets["gram"] + owner_bucket * num_gram_types
                     for gk, gram_name in enumerate(self.gram_scalar_names):
-                        final_norms[f"track_gram_{gram_name}/{cleaned}"] = gathered[
-                            rank_base + gram_base + gk
-                        ]
+                        final_norms[
+                            f"track_gram_{gram_name}/{gram_param_name}"
+                        ] = gathered[rank_base + gram_base + gk]
 
             if "gram_vec" in offsets:
                 gram_vec_lens = (
@@ -3745,10 +3769,13 @@ class DiSCO(AbstractDiSCO):
                         v_start = (
                             rank_base + offsets["gram_vec"] + rank_offsets[owner_bucket]
                         )
+                        gram_param_name = _gram_log_param_name(
+                            cleaned, tuple(ddp_params[param_idx].shape)
+                        )
                         for vname in self.gram_vector_names:
-                            final_norms[f"track_gram_{vname}/{cleaned}"] = gathered[
-                                v_start : v_start + length
-                            ]
+                            final_norms[
+                                f"track_gram_{vname}/{gram_param_name}"
+                            ] = gathered[v_start : v_start + length]
                             v_start += length
 
             if "upd_spec" in offsets:
@@ -3856,10 +3883,13 @@ class DiSCO(AbstractDiSCO):
                         ] = gathered[rank_base + w_base + norm_idx]
 
                 if "gram" in offsets:
+                    gram_param_name = _gram_log_param_name(
+                        cleaned_p_name, tuple(self.fsdp_params[param_idx].shape)
+                    )
                     gram_base = offsets["gram"] + bucket_idx_on_owner * num_gram_types
                     for gram_idx, gram_name in enumerate(self.gram_scalar_names):
                         final_norms[
-                            f"track_gram_{gram_name}/{cleaned_p_name}"
+                            f"track_gram_{gram_name}/{gram_param_name}"
                         ] = gathered[rank_base + gram_base + gram_idx]
 
             if "gram_vec" in offsets:
@@ -3874,8 +3904,11 @@ class DiSCO(AbstractDiSCO):
                     v_start = (
                         rank_base + offsets["gram_vec"] + rank_offsets[owner_bucket]
                     )
+                    gram_param_name = _gram_log_param_name(
+                        cleaned_p_name, tuple(self.fsdp_params[param_idx].shape)
+                    )
                     for vname in self.gram_vector_names:
-                        final_norms[f"track_gram_{vname}/{cleaned_p_name}"] = gathered[
+                        final_norms[f"track_gram_{vname}/{gram_param_name}"] = gathered[
                             v_start : v_start + length
                         ]
                         v_start += length

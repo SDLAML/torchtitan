@@ -143,14 +143,14 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         - more info: https://pytorch.org/docs/stable/optim.html
         """
 
-        enable_spectrum_plot: bool = True
+        enable_spectrum_plot: bool = False
         """
         Whether to render each tracked parameter's singular-value spectrum as
         a plot image for W&B (see optimizers/spectrum_logging.py). Only
         takes effect when metrics.log_norm_freq > 0.
         """
 
-        enable_spectrum_export: bool = True
+        enable_spectrum_export: bool = False
         """
         Whether to export the full raw singular-value spectra (every tracked
         parameter, every norm-logging step) to a Parquet file uploaded as a
@@ -160,7 +160,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         metrics.log_norm_freq > 0.
         """
 
-        enable_gram_plot: bool = True
+        enable_gram_plot: bool = False
         """
         Whether to render each tracked vector-valued gram metric as an
         atlas-grid plot image for W&B (see optimizers/gram_vector_logging.py).
