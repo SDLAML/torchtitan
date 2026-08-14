@@ -6,9 +6,11 @@
 
 import argparse
 import importlib
+import io
 import json
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, is_dataclass, replace as dc_replace
 from pathlib import Path
 from typing import get_args
@@ -16,8 +18,86 @@ from typing import get_args
 import torch
 import torch.distributed.checkpoint as dcp
 from huggingface_hub import save_torch_state_dict
+from torch.distributed._shard._utils import narrow_tensor_by_index
+from torch.distributed.checkpoint.filesystem import FileSystemReader
+from torch.distributed.checkpoint.planner import LoadItemType
+from torch.futures import Future
 from torchtitan.components.checkpoint import ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
+
+
+class ParallelFileSystemReader(FileSystemReader):
+    """FileSystemReader that reads shard files concurrently.
+
+    torch's stock FileSystemReader.read_data (as of the torch version
+    installed here) reads DCP shard files strictly one at a time, one tensor
+    read_item at a time, in the calling thread -- no thread pool. For a
+    checkpoint sharded into hundreds of files (one per training rank), that
+    serializes what should be an I/O-bound operation onto a single core,
+    even though loading a checkpoint for HF conversion needs no GPU/compute
+    and the host typically has dozens of idle cores. This subclass keeps
+    torch's exact per-item read/deserialize logic but fans the per-file work
+    out across a thread pool, since each file (and each tensor within it) is
+    read and committed independently.
+    """
+
+    def __init__(self, path, thread_count: int = 16):
+        super().__init__(path)
+        self.thread_count = max(1, thread_count)
+
+    def read_data(self, plan, planner):
+        per_file: dict[str, list] = {}
+        for read_item in plan.items:
+            item_md = self.storage_data[read_item.storage_index]
+            per_file.setdefault(item_md.relative_path, []).append(read_item)
+
+        def _read_one_file(relative_path, reqs) -> None:
+            new_path = self.fs.concat_path(self.path, relative_path)
+            with self.fs.create_stream(new_path, "rb") as stream:
+                for req in reqs:
+                    item_md = self.storage_data[req.storage_index]
+                    file_slice = self._slice_file(stream, item_md)
+                    transform_from = self.transforms.transform_load_stream(
+                        req,
+                        item_md.transform_descriptors or (),
+                        file_slice,
+                    )
+
+                    if req.type == LoadItemType.BYTE_IO:
+                        read_bytes = io.BytesIO(transform_from.read(-1))
+                        read_bytes.seek(0)
+                        planner.load_bytes(req, read_bytes)
+                    else:
+                        if transform_from.seekable():
+                            seekable = transform_from
+                        else:
+                            seekable = io.BytesIO(transform_from.read(-1))
+                            seekable.seek(0)
+
+                        tensor = torch.load(
+                            seekable, map_location="cpu", weights_only=True
+                        )
+                        tensor = narrow_tensor_by_index(
+                            tensor, req.storage_offsets, req.lengths
+                        )
+                        target_tensor = planner.resolve_tensor(req).detach()
+                        assert target_tensor.size() == tensor.size(), (
+                            f"req {req.storage_index} mismatch sizes "
+                            f"{target_tensor.size()} vs {tensor.size()}"
+                        )
+                        target_tensor.copy_(tensor)
+                        planner.commit_tensor(req, target_tensor)
+
+        # Clamp to the number of files this plan actually touches -- far more
+        # pool threads than files (e.g. 64 threads for a 4-shard checkpoint)
+        # has been observed to hang.
+        num_workers = min(self.thread_count, len(per_file))
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            list(pool.map(lambda kv: _read_one_file(*kv), per_file.items()))
+
+        fut: Future = Future()
+        fut.set_result(None)
+        return fut
 
 
 def _normalize_layer_pattern_for_validation(pattern):
@@ -237,8 +317,23 @@ def _checkpoint_has_prefix(input_dir: Path, prefix: str) -> bool:
         return False
 
 
+def set_init_fn_type(config):
+    for name in dir(config):
+        if name.startswith("_"):
+            continue
+
+        value = getattr(config, name)
+
+        if "init_fn_type" in name:
+            setattr(config, name, "normal")
+            print(f"Set {name} = normal")
+
+        elif type(value).__name__ == "Config":
+            set_init_fn_type(value)
+
+
 def _load_ema_state_dict(
-    actual_model, input_dir: Path
+    actual_model, input_dir: Path, read_threads: int = 16
 ) -> "dict[str, torch.Tensor] | None":
     """Load the EMA weights for ``actual_model`` from a DCP checkpoint.
 
@@ -255,7 +350,10 @@ def _load_ema_state_dict(
     ema_container = EMAOptimizersContainer.Config(enable=True).build(
         model_parts=[actual_model]
     )
-    dcp.load({"ema_optimizer": ema_container}, checkpoint_id=str(input_dir))
+    dcp.load(
+        {"ema_optimizer": ema_container},
+        storage_reader=ParallelFileSystemReader(input_dir, thread_count=read_threads),
+    )
 
     ema_opt = ema_container.optimizers[0]
     ema_state_dict = {}
@@ -331,6 +429,7 @@ def convert_to_hf(
     export_dtype: str,
     job_config: "Path | None" = None,
     ema_output: "Path | None" = None,
+    read_threads: int = 16,
 ):
     """Convert a DCP checkpoint to HuggingFace safetensors format.
 
@@ -357,11 +456,19 @@ def convert_to_hf(
 
     # 2. Build empty model on CPU
     model_config = model_spec.model
+
+    set_init_fn_type(model_config)
+    # for field in fields(model_config):
+    #     value = getattr(model_config, field.name)
+    #     print(f" {field.name} = {value}")
+    # return
+
     with torch.device("cpu"):
         actual_model = model_config.build()
     model_config = getattr(actual_model, "config", model_config)
     model = ModelWrapper(actual_model)
 
+    print(" Model is build, now loading the state")
     # 3. Create state dict adapter (new API: model_config, not model_args)
     assert model_spec.state_dict_adapter is not None, (
         "state_dict_adapter is required for HF checkpoint conversion. "
@@ -371,8 +478,12 @@ def convert_to_hf(
 
     # 4. Load DCP checkpoint into empty state dict
     state_dict = model._get_state_dict()
-    dcp.load(state_dict, checkpoint_id=str(input_dir))
+    dcp.load(
+        state_dict,
+        storage_reader=ParallelFileSystemReader(input_dir, thread_count=read_threads),
+    )
 
+    print(" DCP is load, now write to local")
     # 5-7. Convert native → HF state dict, apply export dtype, write safetensors
     target_dtype = TORCH_DTYPE_MAP[export_dtype]
     _export_hf_weights(state_dict, sd_adapter, target_dtype, output_dir)
@@ -400,7 +511,7 @@ def convert_to_hf(
 
     # 9. Optionally also export EMA weights
     if ema_output is not None:
-        ema_state_dict = _load_ema_state_dict(actual_model, input_dir)
+        ema_state_dict = _load_ema_state_dict(actual_model, input_dir, read_threads)
         if ema_state_dict is None:
             print(
                 f"[WARNING] --ema_output was given but the checkpoint at {input_dir} "
@@ -408,6 +519,16 @@ def convert_to_hf(
                 "this checkpoint predates EMA support). Skipping EMA export."
             )
         else:
+            # EMA only tracks gradient-trained nn.Parameters (see
+            # _load_ema_state_dict), so it never includes buffers such as the
+            # MoE routing `expert_bias` (a torchtitan register_buffer, updated
+            # by a non-gradient heuristic rather than the optimizer/EMA).
+            # Backfill those from the already-loaded main state_dict -- as
+            # their live (non-averaged) value, since EMA doesn't apply to
+            # them -- so the EMA export is a complete, loadable checkpoint
+            # rather than silently missing keys like expert_bias.
+            for key, tensor in state_dict.items():
+                ema_state_dict.setdefault(key, tensor)
             _export_hf_weights(ema_state_dict, sd_adapter, target_dtype, ema_output)
             _copy_hf_assets(output_dir, ema_output)
             print(f"EMA weights saved to {ema_output}")
@@ -471,6 +592,15 @@ if __name__ == "__main__":
         "during training, or it predates EMA support), prints a warning and "
         "skips the EMA export rather than failing.",
     )
+    parser.add_argument(
+        "--read_threads",
+        type=int,
+        default=min(32, os.cpu_count() or 16),
+        help="Number of threads used to read DCP checkpoint shard files in "
+        "parallel (default: min(32, cpu_count)). This step is CPU/disk I/O "
+        "bound, not GPU bound; the default torch DCP reader reads shard "
+        "files one at a time on a single thread.",
+    )
     args = parser.parse_args()
 
     convert_to_hf(
@@ -482,4 +612,5 @@ if __name__ == "__main__":
         args.export_dtype,
         args.job_config,
         args.ema_output,
+        args.read_threads,
     )
