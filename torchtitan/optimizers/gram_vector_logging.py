@@ -148,9 +148,25 @@ def _parse_gram_short_name(short_name: str) -> tuple[str, int | None, int, str]:
     "V_R_raw", "WU_diagonal") instead of "update"/"param", giving one grid
     per metric name:
     - "V_R_raw/layers.9.attention.wq"        -> ("V_R_raw", None, 9, "WQ")
+    - "V_R_raw/layers.9.feed_forward.w1.T"   -> ("V_R_raw", None, 9, "W1.T")
     - "V_R_raw/ep_3/layers.9.moe.experts.w1" -> ("V_R_raw", 3, 9, "W1")
     - "V_R_raw/tok_embeddings"                -> ("V_R_raw", None, _EMBED_ROW, "EMBED")
-    - "V_R_raw/output"                        -> ("V_R_raw", None, _LM_HEAD_ROW, "LM_HEAD")
+    - "V_R_raw/output.T"                      -> ("V_R_raw", None, _LM_HEAD_ROW, "LM_HEAD.T")
+
+    A trailing ".T" on the param name (disco.py's `_gram_log_param_name`
+    marks parameters gram_helper transposed this way -- see
+    `gram_helper.gram_matrix_is_transposed`) is stripped BEFORE row/embed
+    routing, so e.g. "output.T" still correctly routes to the LM_HEAD row
+    instead of falling through to `_OTHER_ROW`, then re-appended to the
+    weight_type label. Re-appending (not discarding) matters: without it,
+    every transposed weight type collapses to the literal string "T"
+    (`"w1.T".split(".")[-1] == "T"`, same for w2/w3/wq/etc.), so ALL
+    transposed weight types for a given row silently collide in the same
+    `(row, "T")` grid cell and overwrite each other -- a transposed matrix
+    measures a genuinely different orientation/dynamic (see
+    gram_helper.py's orientation-policy docstring) and must not be pooled
+    with non-transposed weights of a different type just because they
+    share the "T" label.
     """
     parts = short_name.split("/")
     metric_name = parts[0]
@@ -162,14 +178,19 @@ def _parse_gram_short_name(short_name: str) -> tuple[str, int | None, int, str]:
         rest = rest[1:]
 
     name = ".".join(rest)
+    transposed_suffix = ""
+    if name.endswith(".T"):
+        name = name[: -len(".T")]
+        transposed_suffix = ".T"
+
     if name == "tok_embeddings":
-        return metric_name, expert_idx, _EMBED_ROW, "EMBED"
+        return metric_name, expert_idx, _EMBED_ROW, "EMBED" + transposed_suffix
     if name == "output":
-        return metric_name, expert_idx, _LM_HEAD_ROW, "LM_HEAD"
+        return metric_name, expert_idx, _LM_HEAD_ROW, "LM_HEAD" + transposed_suffix
 
     dotted = name.split(".")
     row = int(dotted[1]) if dotted[0] == "layers" else _OTHER_ROW
-    weight_type = dotted[-1].upper()
+    weight_type = dotted[-1].upper() + transposed_suffix
     return metric_name, expert_idx, row, weight_type
 
 

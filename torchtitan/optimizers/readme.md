@@ -326,31 +326,47 @@ gone).
    `gram_vector_logging.py` — no changes needed there either, since it discovers grid names
    dynamically from tracked key names (see that file's docstring).
 
-### Known limitation: gram tracking is disabled for `step_embedding` (large-vocab OOM)
+### `step_embedding` gram tracking: large-vocab OOM fixed, cost-gated behind `DISCO_TRACK_EMBED_GRAM`
 
-`gram_helper._gram(X) = X @ X.T` forms an `m x m` matrix, where `m` is the row-count of the
-prepped/transposed tensor -- fine for typical attention/FFN matrices (`m` ~ hidden_dim, thousands),
-but `step_embedding`'s `embed_params` also includes the `output`/lm_head weight
-(`[vocab_size, hidden_dim]`). `need_T = CONST_NAME_OF_EMBEDDING in p_name` only transposes for
-params literally named `"tok_embeddings"`, not `"output"`, so the lm_head weight's `m` stays at
-`vocab_size` instead of being reduced to `hidden_dim` -- at a ~200k vocab this is a
-`[200_000, 200_000]` fp32 matrix (~160GB), an immediate CUDA OOM (hit in practice, not
-hypothetical).
+`gram_helper._gram(X) = X @ X.T` forms an `m x m` matrix, where `m` is the row-count after
+orientation. `step_embedding`'s `embed_params` includes the `output`/lm_head weight
+(`[vocab_size, hidden_dim]`) alongside `tok_embeddings` (same shape) -- previously, `need_T =
+CONST_NAME_OF_EMBEDDING in p_name` only transposed for params literally named `"tok_embeddings"`,
+not `"output"`, so the lm_head weight's `m` stayed at `vocab_size` instead of being reduced to
+`hidden_dim` -- at a ~200k vocab this was a `[200_000, 200_000]` fp32 matrix (~160GB), an immediate
+CUDA OOM (hit in practice, not hypothetical).
 
-**Current state**: the `calculate_gram_metrics` call in `step_embedding` is commented out
-(`gram_metrics = {}` unconditionally) until this is fixed properly. `step_ddp`/`step_fsdp`/
-`step_experts` are unaffected (never touch vocab-scale dimensions) and keep tracking gram normally.
+**Fixed**: `calculate_gram_metrics` now decides orientation unconditionally from shape (`rows <=
+cols`, ignoring any caller-supplied `transpose`/`need_T` -- see `gram_helper.py`'s module docstring
+and `calculate_gram_metrics`'s own docstring), so both `tok_embeddings` and `output` always get
+`m = hidden_dim`, never `vocab_size`. This is a deliberate, session-wide semantic choice (not
+special-cased for embeddings): any parameter with `D_out > D_in` gets the same treatment, e.g. FFN
+up-projections now track input-feature-wise dynamics instead of output-channel-wise.
 
-Two real fixes, not done yet:
-1. A size guard in `gram_helper.calculate_gram_metrics` (e.g. `if W_before.shape[0] >
-   _MAX_GRAM_M: return {}`, same "cheap no-op for ill-defined input" precedent as the existing
-   `m < 2` guard) — general, protects every call site against any future oversized-`m` case, not
-   just this one. Would let `tok_embeddings`'s gram tracking keep working (its `m` is already
-   correctly reduced to `hidden_dim` via `need_T`) while only skipping the lm_head weight.
-2. Fix `need_T` to also transpose for `"output"` (if that's semantically correct — needs checking
-   against how `norm_factor`'s embed/unembed row-wise treatments and `abstract_disco.py`'s
-   `fused_unembed_*` functions expect the axes oriented; this is unrelated pre-existing logic, not
-   something introduced by the gram work).
+**Still gated, though, on cost rather than correctness**: `tok_embeddings`/`output`'s gram
+computation remains far more expensive than any other tracked param, even without the OOM --
+`_build_gram_core` materializes several full-size `[hidden_dim, vocab_size]` copies (row-normalized
+factors, `U_actual`, `A_actual`), which at a ~200k vocab and multi-thousand hidden dim is on the
+order of tens of GB of transient memory and multiple seconds of forced-fp32 GEMM (the small
+`[hidden, hidden]` Gram matrix itself is cheap; building it from the full-size factors is not) --
+*per parameter, per logging event*, for exactly these two parameters. `calculate_norm_at_next_step`
+already lets you tune `gram_level` (and hence gram tracking's cost) per step; `DISCO_TRACK_EMBED_GRAM`
+(default `"1"`, or set `optimizer.track_embed_gram = False` directly at runtime) is a second,
+independent switch specifically for these two expensive params, so you can e.g. run `gram_level > 0`
+every step for cheap layers while only enabling embed/output gram at sparse checkpoints. `step_ddp`/
+`step_fsdp`/`step_experts` are unaffected either way (never touch vocab-scale dimensions).
+
+One conceptual note worth keeping in mind when reading `tok_embeddings`'s (as opposed to `output`'s)
+gram metrics: `tok_embeddings` is a lookup table, not a jointly-computed Linear layer -- each row's
+gradient depends only on whether that token appeared in the batch, with no forward-pass coupling
+between different vocab rows. Transposing doesn't change that underlying gradient structure, but it
+does change what the resulting `[hidden, hidden]` Gram matrix answers: `G[a, b] = Σ_j
+tok_embeddings[j, a] · tok_embeddings[j, b]`, summed over the whole vocabulary, asks about
+correlation/redundancy *between hidden dimensions* across the embedding table (a real, studied
+quantity -- embedding anisotropy/dimension collapse), not "is this output channel dominant" in the
+sense the same metric name means for e.g. `attention.wq`. `output`/lm_head doesn't have this caveat
+-- it's a genuine jointly-computed Linear layer, so its transposed (input-feature-wise) reading is
+exactly as valid as any other `D_out > D_in` layer's.
 
 ### Known limitation: `all_gather` sends to every rank, only one needs it
 

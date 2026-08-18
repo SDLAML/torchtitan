@@ -43,6 +43,7 @@ CONST_NAME_OF_EMBEDDING = "tok_embeddings"
 # DISCO_DEBUG_MODE = "0"
 # DISCO_ENABLE_PERSISTENT_CACHE = "1"
 # DISCO_FSDP_A2A_MODE = "once"
+# DISCO_TRACK_EMBED_GRAM = "1"
 
 
 class ParamType(Enum):
@@ -192,10 +193,21 @@ def parse_env_var():
             f"Unknown DISCO_FSDP_A2A_MODE={a2a_mode}. Supported: once, bucket"
         )
 
+    # tok_embeddings/output's gram metrics are far more expensive than any
+    # other tracked param (their full [vocab_size, hidden_dim] matrices --
+    # tens of GB and several seconds of fp32 GEMM at large vocab sizes --
+    # dwarf every other layer's gram cost, even though the resulting Gram
+    # matrix itself is small; see readme.md) -- a separate switch from
+    # `gram_level` so it can be turned off independently (e.g. gram_level>0
+    # for cheap layers every step, embed/output gram only at sparse
+    # checkpoints) without disabling gram tracking everywhere else.
+    track_embed_gram = os.environ.get("DISCO_TRACK_EMBED_GRAM", "1") == "1"
+
     env_vars = {
         "debug_mode": debug_mode,
         "persistent_cache_enabled": persistent_cache_enabled,
         "a2a_mode": a2a_mode,
+        "track_embed_gram": track_embed_gram,
     }
     return env_vars
 
@@ -224,6 +236,11 @@ class DiSCO(AbstractDiSCO):
         debug_mode = env_vars["debug_mode"]
         self.persistent_cache_enabled = env_vars["persistent_cache_enabled"]
         self.fsdp_a2a_mode = env_vars["a2a_mode"]
+        # Plain attribute (like persistent_cache_enabled/fsdp_a2a_mode above),
+        # not a dedicated setter -- flip it directly at runtime
+        # (`optimizer.track_embed_gram = False`) if you want to turn embed/
+        # output gram off for some steps without touching gram_level.
+        self.track_embed_gram = env_vars["track_embed_gram"]
 
         # Initialize base optimizer and common state
         self.log_parameters_types = True
@@ -1222,10 +1239,11 @@ class DiSCO(AbstractDiSCO):
         """
         Static per-block gram-vector length/offset table, mirroring the
         spectrum table in `_precompute_experts_metadata` -- uniform per rank
-        (ep_per_rank is uniform across ranks, no pad-to-max needed) -- but
-        using `gram_helper.gram_vector_len` (== loc.shape[1], NOT
-        min(loc.shape[1], loc.shape[2])) and scaled by the number of
-        vector-valued gram metrics at the current level. Callable
+        (ep_per_rank is uniform across ranks, no pad-to-max needed) -- using
+        `gram_helper.gram_vector_len` (== min(loc.shape[1], loc.shape[2]),
+        since `calculate_gram_metrics` always orients rows <= cols -- see
+        gram_helper.py's orientation-policy docstring) and scaled by the
+        number of vector-valued gram metrics at the current level. Callable
         independently of the rest of `_precompute_experts_metadata` (reuses
         its already-built `_expert_blocks`/`_expert_ep_per_rank`), so it can
         be cheaply re-run whenever `self.gram_level` changes without redoing
@@ -1242,7 +1260,9 @@ class DiSCO(AbstractDiSCO):
             block_params = self.expert_params[start:end]
             if block_params:
                 loc = self._get_param_local_view(block_params[0])
-                self._expert_gram_vec_len_per_block.append(int(loc.shape[1]))
+                self._expert_gram_vec_len_per_block.append(
+                    gram_helper.gram_vector_len((int(loc.shape[1]), int(loc.shape[2])))
+                )
             else:
                 self._expert_gram_vec_len_per_block.append(0)
         running = 0
@@ -2917,21 +2937,22 @@ class DiSCO(AbstractDiSCO):
                 wnorm = calculate_norm(pseudo_w, self.norms_to_log, transpose=need_T)
                 w_spectrum = wnorm.pop("spectrum")
 
-                # TEMPORARILY DISABLED: embed_params includes the
-                # output/lm_head weight, shape [vocab_size, hidden_dim] --
-                # for large-vocab models (e.g. ~200k), _gram(X) = X @ X.T
-                # forms a [vocab_size, vocab_size] matrix (~160GB in fp32 at
-                # 200k), causing an immediate OOM. `need_T` only transposes
-                # for params named "tok_embeddings" (CONST_NAME_OF_EMBEDDING),
-                # not "output", so the lm_head weight's row count `m` stays
-                # at vocab_size instead of being reduced to hidden_dim.
-                # Re-enable once this is fixed properly (e.g. a size guard in
-                # gram_helper.calculate_gram_metrics, or fixing `need_T` for
-                # "output" too) -- see readme.md.
-                gram_metrics = {}
-                # gram_metrics = calculate_gram_metrics(
-                #     p, g, pseudo_w, level=self.gram_level, # transpose=need_T
-                # )
+                # embed_params includes the output/lm_head weight, shape
+                # [vocab_size, hidden_dim] -- calculate_gram_metrics now
+                # always orients rows <= cols internally (see
+                # gram_helper.py's orientation-policy docstring), so this no
+                # longer OOMs (previously formed a [vocab_size, vocab_size]
+                # matrix, since `need_T` only transposed by param name, not
+                # by shape). It's still far more expensive than any other
+                # tracked param, though -- tens of GB and several seconds of
+                # fp32 GEMM at large vocab sizes -- so it's independently
+                # gated by `track_embed_gram` (DISCO_TRACK_EMBED_GRAM),
+                # separate from gram_level, see readme.md.
+                gram_metrics = (
+                    calculate_gram_metrics(p, g, pseudo_w, level=self.gram_level)
+                    if self.track_embed_gram
+                    else {}
+                )
 
                 cleaned_p_name = remove_orig_mod_and_weight_for_p_name(p_name)
                 gram_p_name = _gram_log_param_name(cleaned_p_name, tuple(p.shape))
