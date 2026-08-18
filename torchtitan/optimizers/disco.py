@@ -346,7 +346,38 @@ class DiSCO(AbstractDiSCO):
         # build once now
         self._build_param_lists()
 
+    def _ensure_default_param_state(self):
+        """
+        Lazy-init the per-param `self.state[p]` keys every trainable param
+        needs (`momentum_buffer`, `radial_state`), backfilling whichever one
+        is missing. Called both from `_build_param_lists` (fresh/first init)
+        and from `load_state_dict` (post-restore) -- the latter matters for
+        any load path that doesn't go through DCP's strict key-matching
+        (which already fails a checkpoint missing a key outright before this
+        would ever run), e.g. a direct/manual `load_state_dict()` call with
+        a hand-built or partial state dict.
+        """
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                if "momentum_buffer" not in self.state[p]:
+                    self.state[p]["momentum_buffer"] = torch.zeros_like(p)
+                # Radial-dynamics accumulator state (raw_A2/angular_A1/
+                # angular_A2/R1 -- see radial_helper.py), stored the same
+                # way as momentum_buffer so it's automatically checkpoint
+                # -persistent via the default state_dict()/load_state_dict().
+                # 3-D (expert) params get one accumulator set PER expert
+                # index, since each expert has its own W_before/W_after.
+                if "radial_state" not in self.state[p]:
+                    accum_shape = (p.shape[0],) if p.ndim == 3 else ()
+                    self.state[p]["radial_state"] = new_radial_state(
+                        p.device, shape=accum_shape
+                    )
+
     def _build_param_lists(self):
+        self._ensure_default_param_state()
+
         # clear
         self.scale_params.clear()
         self.scale_param_names.clear()
@@ -373,22 +404,6 @@ class DiSCO(AbstractDiSCO):
                 if not p.requires_grad:
                     # ignore the non-trainable parameters
                     continue
-
-                # Initialize the momentum buffer if it's the first time.
-                if "momentum_buffer" not in self.state[p]:
-                    self.state[p]["momentum_buffer"] = torch.zeros_like(p)
-
-                # Radial-dynamics accumulator state (raw_A2/angular_A1/
-                # angular_A2/R1 -- see radial_helper.py), stored the same
-                # way as momentum_buffer so it's automatically checkpoint
-                # -persistent via the default state_dict()/load_state_dict().
-                # 3-D (expert) params get one accumulator set PER expert
-                # index, since each expert has its own W_before/W_after.
-                if "radial_state" not in self.state[p]:
-                    accum_shape = (p.shape[0],) if p.ndim == 3 else ()
-                    self.state[p]["radial_state"] = new_radial_state(
-                        p.device, shape=accum_shape
-                    )
 
                 # 1) scalar branch identical to step()
                 if p.numel() == 1:
@@ -492,8 +507,94 @@ class DiSCO(AbstractDiSCO):
         self._precompute_ddp_gram_vector_metadata()
         self._gram_level_at_last_vector_precompute = self.gram_level
 
+    # Param-group keys that come from the run's config (norm_helper/gram_helper
+    # setup), not from optimizer state -- see load_state_dict below.
+    _CONFIG_ONLY_GROUP_KEYS = (
+        "eps",
+        "norm_factor",
+        "backend",
+        "backend_steps",
+        "splits_into",
+        "splits_dim",
+        "pre_norm",
+    )
+
+    def load_state_dict(self, state_dict):
+        """
+        Two independent fixes over the plain torch.optim.Optimizer.load_state_dict:
+
+        1. Config-vs-checkpoint precedence: torch's base load_state_dict
+           overwrites every param_group key (other than "params") with
+           whatever was saved in the checkpoint, including
+           _CONFIG_ONLY_GROUP_KEYS -- values that come from this run's config
+           (norm_factor/backend/eps/etc.), not from training. If the user
+           changes one of those between runs (e.g. switching backend or
+           norm_factor) and then resumes, the checkpoint would silently
+           revert it. Snapshot them before the base call and restore them
+           after, warning on any mismatch so a deliberate config change is
+           visible rather than silently discarded.
+
+        2. Fast-lookup cache refresh: verified (see radial_helper/disco.py
+           session notes) that in TorchTitan's actual dcp.load() resume path,
+           OptimizersContainer.state_dict() returns self.state[p]'s tensors
+           by reference (torch.optim.Optimizer.state_dict() never clones),
+           and DCP fills them in place before load_state_dict ever runs --
+           so _momentum_buffer_by_param_id/_radial_state_by_param_id stay
+           valid without any rebuild in that path. This refresh is
+           defense-in-depth for any load path that bypasses DCP's in-place
+           fill (e.g. a direct/manual load_state_dict call with a
+           hand-built or detached state dict) -- cheap, and
+           _ensure_default_param_state's lazy-init guards make it safe even
+           if such a dict is missing a key.
+
+           Note this does NOT help an old checkpoint (saved before
+           radial_state existed) resume through the normal dcp.load() path:
+           DCP's default LoadPlanner has allow_partial_load=False, so it
+           raises "Missing key in checkpoint state_dict: ...radial_state"
+           during its own planning phase, before load_state_dict (this
+           method included) ever runs. Loading model-only (optimizer state
+           excluded entirely, e.g. --checkpoint.initial_load_in_hf /
+           initial_load_model_only) sidesteps that, at the cost of ALL
+           optimizer state (fresh momentum too, not just radial_state) --
+           there is no way to keep momentum while dropping only radial_state
+           short of relaxing allow_partial_load checkpoint-wide.
+        """
+        # "pre_norm" is optional elsewhere (group.get("pre_norm", "identity")
+        # at _build_param_lists/step()), so it isn't guaranteed to be a key
+        # on every group -- match that default here rather than a bare
+        # group[k], which would KeyError on a group that omits it.
+        pre_load = [
+            {
+                k: group.get(k, "identity") if k == "pre_norm" else group[k]
+                for k in self._CONFIG_ONLY_GROUP_KEYS
+            }
+            for group in self.param_groups
+        ]
+
+        super().load_state_dict(state_dict)
+
+        for group_idx, (group, config_kwargs) in enumerate(
+            zip(self.param_groups, pre_load)
+        ):
+            for key, config_val in config_kwargs.items():
+                checkpoint_val = (
+                    group.get(key, "identity") if key == "pre_norm" else group[key]
+                )
+                if checkpoint_val != config_val:
+                    logger.warning(
+                        f"[DiSCO] group_idx {group_idx}: checkpoint's "
+                        f"'{key}'={checkpoint_val!r} differs from config's "
+                        f"{key}={config_val!r}; keeping config value."
+                    )
+                group[key] = config_val
+
+        self._ensure_default_param_state()
+        self._precompute_runtime_caches()
+        self._precompute_momentum_bufs()
+
     # ------------------------------------------------------------------
-    # Pre-compute helpers (called once from _build_param_lists at init)
+    # Pre-compute helpers (called from _build_param_lists, at __init__ and
+    # again after every load_state_dict -- see the override above)
     # ------------------------------------------------------------------
 
     def _precompute_runtime_caches(self):

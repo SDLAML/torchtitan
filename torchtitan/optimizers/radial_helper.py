@@ -66,6 +66,11 @@ RADIAL_METRIC_NAMES: list[str] = [
 
 _ACCUMULATOR_NAMES: tuple[str, ...] = ("raw_A2", "angular_A1", "angular_A2", "R1")
 
+# a_t below this fraction of r_t is treated as a degenerate (no real update)
+# step -- see the valid_wu comment in calculate_radial_metrics for why a
+# relative floor is needed instead of a bare a_t > 0 check.
+_REL_DEGENERACY_EPS = 1e-6
+
 
 def new_radial_state(
     device: torch.device,
@@ -118,7 +123,18 @@ def calculate_radial_metrics(
     r_next = W_after.norm()
     a_t = U.norm()
 
-    valid_wu = (r_t > 0) & (a_t > 0)
+    # Relative (not absolute/exact-zero) floor on a_t: an update whose
+    # magnitude is numerically negligible compared to the weight's own
+    # scale (e.g. a near-zero-lr step at the tail of a decay schedule)
+    # should report the same deterministic degenerate sentinel regardless
+    # of which parallelism strategy computed it. `a_t > 0` alone only
+    # catches the literal-zero case -- below this relative threshold, a_t
+    # is dominated by ordinary floating-point reduction-order noise (e.g.
+    # DDP's all-reduce vs FSDP's all-gather summing gradients in a
+    # different order), which radial_cosine/radial_ratio (both divide by
+    # a_t or a_t^2) amplify into large, run-to-run-inconsistent swings
+    # even though the underlying update is physically negligible.
+    valid_wu = (r_t > 0) & (a_t > _REL_DEGENERACY_EPS * r_t)
     valid_ww = (r_t > 0) & (r_next > 0)
 
     relative_step = a_t / r_t.clamp_min(tiny)
@@ -142,13 +158,13 @@ def calculate_radial_metrics(
     # identity: place q_t at (r_t, 0); the step lands W_t+1 at
     # (r_t + a_t*c_t, a_t*sqrt(1-c_t^2)), whose angle from the x-axis is
     # exactly this atan2 expression -- just computed via a more numerically
-    # robust path. Gated on `valid_ww` (matching angle_from_cos below, not
-    # a separate `valid_wu`) -- checked case-by-case that both gates give
-    # the identical final value in every combination of r_t/a_t/r_next
-    # being zero or positive (whenever they'd disagree on the gate itself,
-    # atan2's own inputs already collapse to the same result either way),
-    # so this is purely about keeping the two sanity-check twins sharing
-    # one validity domain, not a behavior difference.
+    # robust path. Gated on `valid_ww` (matching angle_from_cos below), not
+    # `valid_wu` -- deliberately NOT the relative-degeneracy floor above:
+    # unlike radial_cosine/radial_ratio, atan2's inputs (a_t*tangent_fraction,
+    # r_t + a_t*radial_cosine) stay well-conditioned as a_t -> 0 (numerator
+    # -> 0, denominator -> r_t > 0), so `angle` doesn't inherit the
+    # near-zero-a_t noise-amplification these other metrics have, and
+    # doesn't need the same protection.
     angle_raw = torch.atan2(a_t * tangent_fraction, r_t + a_t * radial_cosine)
     angle = torch.where(valid_ww, angle_raw, torch.zeros_like(angle_raw))
 
@@ -169,13 +185,21 @@ def calculate_radial_metrics(
     # degenerate-case guard needed, unlike radial_cosine).
     radial_first_order = 2.0 * dot_wu
     radial_second_order = a_t * a_t
-    # Deliberately NOT given the relative-floor treatment used for
-    # genuinely-unbounded ratios elsewhere in gram_helper.py: this ratio
-    # is *supposed* to swing large or small depending on which regime
-    # dominates (that's its whole diagnostic purpose) -- a bare tiny floor
-    # (avoiding literal 0/0 when a_t == 0, i.e. no update this step) is
-    # correct here, not a bug to fix.
-    radial_ratio = radial_first_order.abs() / radial_second_order.clamp_min(tiny)
+    # Away from the degenerate regime, radial_ratio is deliberately NOT
+    # given a relative-floor treatment the way genuinely-unbounded ratios
+    # elsewhere in gram_helper.py are: it's *supposed* to swing large or
+    # small depending on which regime dominates (that's its whole
+    # diagnostic purpose). But when the step itself is degenerate (a_t
+    # negligible vs r_t -- see valid_wu above), both radial_first_order and
+    # radial_second_order are individually noise-dominated, and dividing
+    # noise by noise-squared is pure amplification, not signal -- gate it
+    # to the same deterministic 0 sentinel as radial_cosine so it doesn't
+    # report large, run-to-run-inconsistent swings on a step where nothing
+    # meaningful happened.
+    radial_ratio_raw = radial_first_order.abs() / radial_second_order.clamp_min(tiny)
+    radial_ratio = torch.where(
+        valid_wu, radial_ratio_raw, torch.zeros_like(radial_ratio_raw)
+    )
 
     raw_A2 = state["raw_A2"].clone()
     angular_A1 = state["angular_A1"].clone()

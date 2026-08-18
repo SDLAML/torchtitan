@@ -400,11 +400,54 @@ derivative blows up near `cos=1`, so small angles (most training steps) lose pre
 the underlying 2D-trigonometry identity), so the `arccos` version is kept too, as `angle_from_cos`, purely
 as an independent sanity check -- not fed into the accumulators.
 
+**Relative-degeneracy floor on `radial_cosine`/`tangent_fraction`/`radial_ratio`:** these divide by
+`a_t` or `a_t^2`, so once the actual update is numerically negligible relative to the weight's own
+scale -- e.g. a near-zero-lr step at the tail of a decay schedule -- the division is noise divided by
+noise, and that noise floor is genuinely different between DDP and FSDP (different collectives: DDP's
+all-reduce vs FSDP's all-gather sum gradients in a different order, and floating-point summation isn't
+associative). Observed in practice as those 3 metrics disagreeing hugely between a DDP run and an FSDP
+run specifically at a near-zero-lr step, while `radial_first_order` (no division, `2*dot_wu`) only
+differed slightly, and `angle`/`angle_from_cos` didn't disagree at all -- atan2's inputs stay
+well-conditioned as `a_t -> 0` (numerator `-> 0`, denominator `-> r_t > 0`), so `angle` doesn't inherit
+this instability the way a division by `a_t` does. Fixed by widening `valid_wu` from a bare `a_t > 0`
+to `a_t > 1e-6 * r_t` (`radial_helper._REL_DEGENERACY_EPS`) -- a step below that relative threshold now
+deterministically reports the same degenerate sentinel (`radial_cosine=0`, `tangent_fraction=1`,
+`radial_ratio=0`) regardless of which parallelism strategy computed it, while a genuinely small-but-real
+step (e.g. `relative_step ~ 1e-3`) is well above the threshold and reports real signal, unclamped.
+
 `alpha_fit`/`tau_fit` (fitting the angle-decay power law `theta_t = C*(t+tau)^-alpha` from the logged
 `(t, angle)` history) is a deliberately deferred, offline/analysis-time follow-up, not optimizer
 state: unlike everything above (a genuine O(1)-per-call update), fitting this needs some bounded
 history of past angles and periodic (not per-step) nonlinear refitting to stay cheap at scale, and
 `tau` enters the fit nonlinearly, so there's no simple closed-form running update for it.
+
+**Checkpoint compatibility:** resuming from a checkpoint saved *before* `radial_state` existed
+crashes. TorchTitan's checkpoint load goes through `torch.distributed.checkpoint`'s default
+`LoadPlanner`, which has `allow_partial_load=False`; since `radial_state` is always present in the
+live optimizer's `state_dict()` skeleton (lazy-inited unconditionally in `_build_param_lists`), an old
+checkpoint missing that key raises `RuntimeError: Missing key in checkpoint state_dict: ...` during
+DCP's own planning phase -- before `DiSCO.load_state_dict` ever runs, so nothing on the optimizer side
+can catch or work around it. A model-only load (optimizer state excluded entirely, e.g.
+`--checkpoint.initial_load_in_hf` / `initial_load_model_only`) sidesteps this, at the cost of *all*
+optimizer state (fresh momentum too, not just `radial_state`) -- there's no way to keep momentum while
+dropping only `radial_state` short of relaxing `allow_partial_load` checkpoint-wide, which was
+deliberately not done here since that would also silently paper over genuinely missing keys elsewhere.
+
+**`DiSCO.load_state_dict` override** (`disco.py`) exists for two reasons, unrelated to the crash above:
+1. `torch.optim.Optimizer.load_state_dict` overwrites every param_group key (besides `"params"`) with
+   whatever the checkpoint saved, including config-derived keys (`eps`/`norm_factor`/`backend`/etc.,
+   see `_CONFIG_ONLY_GROUP_KEYS`) that come from this run's config, not from training -- so resuming
+   after a deliberate config change (e.g. switching `norm_factor`) would otherwise silently revert it.
+   The override snapshots those keys before the base call and restores them after, warning on any
+   mismatch.
+2. `_momentum_buffer_by_param_id`/`_radial_state_by_param_id` (built once, normally at `__init__`) are
+   refreshed afterward. This turned out to be defense-in-depth rather than a fix for an active bug: in
+   TorchTitan's actual `dcp.load()` resume path, `OptimizersContainer.state_dict()` returns
+   `self.state[p]`'s tensors *by reference* (`Optimizer.state_dict()` never clones), and DCP fills them
+   in place before `load_state_dict` ever runs -- confirmed via an actual `dcp.save`/`dcp.load`
+   round-trip, not just by reading source. So the caches stay valid on their own in that path; the
+   refresh only matters for a load path that bypasses DCP's in-place fill (e.g. a direct/manual
+   `load_state_dict()` call with a hand-built or detached state dict).
 
 ### Known limitation: `all_gather` sends to every rank, only one needs it
 
