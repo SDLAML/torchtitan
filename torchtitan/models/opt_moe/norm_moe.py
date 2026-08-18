@@ -118,12 +118,12 @@ class GroupedExperts(nn.Module):
         self.act_fn = build_activation(activation_type)
 
         if norm_everywhere:
-            assert (
-                norm_type is not None
-            ), "`norm_type` needs to be passed when `norm_everywhere=True`"
-            assert (
-                norm_eps is not None
-            ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            assert norm_type is not None, (
+                "`norm_type` needs to be passed when `norm_everywhere=True`"
+            )
+            assert norm_eps is not None, (
+                "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            )
             self.mid_norm = build_norm(norm_type, dim=hidden_dim, eps=norm_eps)
         else:
             self.mid_norm = nn.Identity()
@@ -652,10 +652,12 @@ class MoE(Module):
         # TODO: Activation Checkpointing has the side effect of double counting tokens_per_expert --
         #       first in the forward pass, and then in the backward pass. However, this has no
         #       effect on the expert bias update thanks to the torch.sign() operator.
-        with torch.no_grad():
-            self.tokens_per_expert.add_(num_tokens_per_expert)
-            self.router_entropy.add_(experts_entropy)
-            self.acc_fwd_times.add_(1)
+
+        if self.training:
+            with torch.no_grad():
+                self.tokens_per_expert.add_(num_tokens_per_expert)
+                self.router_entropy.add_(experts_entropy)
+                self.acc_fwd_times.add_(1)
 
         # top_scores_experts_sorted and token_indices_experts_sorted shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
