@@ -368,6 +368,44 @@ sense the same metric name means for e.g. `attention.wq`. `output`/lm_head doesn
 -- it's a genuine jointly-computed Linear layer, so its transposed (input-feature-wise) reading is
 exactly as valid as any other `D_out > D_in` layer's.
 
+### Radial-dynamics metrics (`radial_helper.py`) -- always-on, independent of gram/norm config
+
+A third tracked-metric family, alongside norm/spectrum and gram, living in its own module
+(`radial_helper.py`). Unlike gram (row-wise Gram-matrix framework, needs `V_raw`, gated behind
+`gram_level`), radial metrics ask a different, simpler question: how does a weight's *whole-tensor*
+norm and direction evolve step to step. Every metric is a single Frobenius-norm-scale scalar (never a
+row-wise vector), computed from just `W_before`/`W_after` (the same pair already used as gram's
+`W_before`/`W_after`) -- cheap enough that `calculate_radial_metrics` is called **unconditionally**
+whenever any per-param logging fires at all, independent of `gram_level` and `norms_to_log`'s
+contents, at all 4 `step_*` call sites (including `step_embedding`, ungated by
+`track_embed_gram` -- radial's cost is O(1) scalars, not O(vocab_size) Gram matrices).
+
+Four running accumulators (`raw_A2`, `angular_A1`, `angular_A2`, `R1`) track the parameter's
+cumulative history and persist across checkpoint save/restore -- stored in
+`self.state[p]["radial_state"]` (the same place `momentum_buffer` lives), included automatically in
+`torch.optim.Optimizer`'s default `state_dict()`/`load_state_dict()`, no extra plumbing. 3-D (expert)
+params get one accumulator set *per expert index* (each expert has its own `W_before`/`W_after`
+pair), shape `(num_local_experts,)`.
+
+Two things worth knowing if you're reading the formulas or extending this:
+- `R2(t)` (from the "radial error" identity below) is exactly the same running sum as `raw_A2` --
+  only one accumulator is kept, not two.
+- `relative_step` is the same formula as `gram_helper.py`'s `U_relative_step_fro`. Not an accidental
+  duplicate -- this one is unconditional, that one is gated behind `gram_level`.
+
+The canonical `angle` (angle between consecutive weight directions `q_t`/`q_t+1`) is computed via
+`atan2(a_t*tangent_fraction, r_t + a_t*radial_cosine)`, not `arccos(<q_t, q_t+1>)` -- `arccos`'s
+derivative blows up near `cos=1`, so small angles (most training steps) lose precision in fp32;
+`atan2` doesn't have that issue. Both formulas compute the exact same geometric quantity (verified via
+the underlying 2D-trigonometry identity), so the `arccos` version is kept too, as `angle_from_cos`, purely
+as an independent sanity check -- not fed into the accumulators.
+
+`alpha_fit`/`tau_fit` (fitting the angle-decay power law `theta_t = C*(t+tau)^-alpha` from the logged
+`(t, angle)` history) is a deliberately deferred, offline/analysis-time follow-up, not optimizer
+state: unlike everything above (a genuine O(1)-per-call update), fitting this needs some bounded
+history of past angles and periodic (not per-step) nonlinear refitting to stay cheap at scale, and
+`tau` enters the fit nonlinearly, so there's no simple closed-form running update for it.
+
 ### Known limitation: `all_gather` sends to every rank, only one needs it
 
 Every collective in this norm/gram/spectrum pipeline (`step_experts`'s single `all_gather_tensor`,

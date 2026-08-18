@@ -29,6 +29,11 @@ from .pre_norm_helper import (
     PRE_NORM_ROW_FUNCTIONS,
     PRE_NORM_SHARDED_APPLY_FUNCTIONS,
 )
+from .radial_helper import (
+    calculate_radial_metrics,
+    new_radial_state,
+    RADIAL_METRIC_NAMES,
+)
 from .utils import remove_orig_mod_and_weight_for_p_name
 
 __all__ = [
@@ -135,7 +140,7 @@ def _pseudo_post_update_weight(w, u, lr, wd):
 
 
 def _pack_segments(
-    segments: list[tuple[str, torch.Tensor | None]]
+    segments: list[tuple[str, torch.Tensor | None]],
 ) -> tuple[torch.Tensor, dict[str, int]]:
     """Concatenate present (non-None) segments into one flat buffer for a
     single collective, instead of one all_gather per segment. Returns the
@@ -373,6 +378,18 @@ class DiSCO(AbstractDiSCO):
                 if "momentum_buffer" not in self.state[p]:
                     self.state[p]["momentum_buffer"] = torch.zeros_like(p)
 
+                # Radial-dynamics accumulator state (raw_A2/angular_A1/
+                # angular_A2/R1 -- see radial_helper.py), stored the same
+                # way as momentum_buffer so it's automatically checkpoint
+                # -persistent via the default state_dict()/load_state_dict().
+                # 3-D (expert) params get one accumulator set PER expert
+                # index, since each expert has its own W_before/W_after.
+                if "radial_state" not in self.state[p]:
+                    accum_shape = (p.shape[0],) if p.ndim == 3 else ()
+                    self.state[p]["radial_state"] = new_radial_state(
+                        p.device, shape=accum_shape
+                    )
+
                 # 1) scalar branch identical to step()
                 if p.numel() == 1:
                     assert (
@@ -486,6 +503,7 @@ class DiSCO(AbstractDiSCO):
         """
         self._param_local_views: dict[int, torch.Tensor] = {}
         self._momentum_buffer_by_param_id: dict[int, torch.Tensor] = {}
+        self._radial_state_by_param_id: dict[int, dict[str, torch.Tensor]] = {}
         self._zero_scalar: torch.Tensor | None = None
         self._padding_norms: dict[str, torch.Tensor] | None = None
 
@@ -500,6 +518,7 @@ class DiSCO(AbstractDiSCO):
                     self._momentum_buffer_by_param_id[pid] = self.state[p][
                         "momentum_buffer"
                     ]
+                    self._radial_state_by_param_id[pid] = self.state[p]["radial_state"]
 
     def _precompute_update_slicing(self):
         """
@@ -2903,6 +2922,12 @@ class DiSCO(AbstractDiSCO):
             norm_scratch: list = workspace["norm_scratch"]
 
             for i, (p, p_name) in enumerate(zip(embed_params, embed_param_names)):
+                # `p` gets reassigned to `p.full_tensor()` below (needed for
+                # norm/gram on the full tensor) -- capture the ORIGINAL
+                # Parameter's id now, since _radial_state_by_param_id is
+                # keyed by that (built once in _precompute_runtime_caches),
+                # not by whatever `p` refers to after the reassignment.
+                original_pid = id(p)
                 group_idx = self.parameters_to_groups[id(p)]
                 lr, nesterov, momentum, wd, param_kwargs = self.groups_info[group_idx]
 
@@ -2953,6 +2978,13 @@ class DiSCO(AbstractDiSCO):
                     if self.track_embed_gram
                     else {}
                 )
+                # Whole-tensor radial-dynamics metrics -- always computed,
+                # independent of gram_level/norms_to_log (see
+                # radial_helper.py); reuses the exact (p, pseudo_w) pair
+                # already used as gram's (W_before, W_after).
+                radial_metrics = calculate_radial_metrics(
+                    p, pseudo_w, self._radial_state_by_param_id[original_pid]
+                )
 
                 cleaned_p_name = remove_orig_mod_and_weight_for_p_name(p_name)
                 gram_p_name = _gram_log_param_name(cleaned_p_name, tuple(p.shape))
@@ -2965,6 +2997,8 @@ class DiSCO(AbstractDiSCO):
                     ]
                 for gram_name, val in gram_metrics.items():
                     final_norms[f"track_gram_{gram_name}/{gram_p_name}"] = val
+                for radial_name, val in radial_metrics.items():
+                    final_norms[f"track_radial_{radial_name}/{cleaned_p_name}"] = val
                 # This path already operates on fully-materialized local tensors
                 # (no FSDP/EP sharding survives to this point), so the spectrum is
                 # already complete locally — no extra collective is needed.
@@ -3000,6 +3034,9 @@ class DiSCO(AbstractDiSCO):
         need_to_calculate_norm = self.need_to_calculate_norm
 
         norms_of_update, norms_of_weight, norms_of_gram, final_norms = [], [], [], {}
+        # Radial-dynamics metrics (radial_helper.py) -- always computed,
+        # independent of gram_level.
+        norms_of_radial = []
 
         device = expert_params[0].device
         fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
@@ -3170,6 +3207,24 @@ class DiSCO(AbstractDiSCO):
                                 gram_vec_flat[voff : voff + K_block_vec].copy_(
                                     gram_metrics[vname]
                                 )
+
+                        # `p` is never reassigned in this loop (only the
+                        # derived `p_local` is), so id(p) is safe to use
+                        # directly -- unlike step_embedding/step_ddp/
+                        # step_fsdp, which reassign their weight variable in
+                        # place and need to capture the id beforehand.
+                        # Per-expert accumulator state: radial_state's
+                        # tensors are shaped (num_local_experts,) for 3-D
+                        # expert params (see the lazy-init above), so index
+                        # by ep_idx to get this expert's own 0-d views.
+                        radial_state_for_p = self._radial_state_by_param_id[id(p)]
+                        radial_metrics = calculate_radial_metrics(
+                            p_local[ep_idx],
+                            pseudo_w,
+                            {k: v[ep_idx] for k, v in radial_state_for_p.items()},
+                        )
+                        for name in RADIAL_METRIC_NAMES:
+                            norms_of_radial.append(radial_metrics[name])
                         local_pos += 1
 
         if not skip_update:
@@ -3192,17 +3247,30 @@ class DiSCO(AbstractDiSCO):
             if pad_needed_gram > 0:
                 norms_of_gram.extend([padding_norms] * pad_needed_gram)
 
+            # Radial metrics are unconditional (R = len(RADIAL_METRIC_NAMES)
+            # is a plain constant, never 0) -- but still need the same
+            # padding as gram: a param with no update this step (u is None)
+            # skips its whole per-expert loop above, contributing zero
+            # entries, same reason gram/update/weight norms need padding.
+            R = len(RADIAL_METRIC_NAMES)
+            expected_total_radial = len(expert_params) * ep_per_rank * R
+            pad_needed_radial = expected_total_radial - len(norms_of_radial)
+            if pad_needed_radial > 0:
+                norms_of_radial.extend([padding_norms] * pad_needed_radial)
+
             # Single flat per-rank buffer: [scalar update norms, scalar weight
-            # norms, gram scalars, gram vectors, spectrum update, spectrum
-            # weight] — one collective for everything in this step, instead
-            # of a separate all_gather per block/kind (all pieces are fully
-            # computed above with no ordering dependency between them).
+            # norms, gram scalars, radial scalars, gram vectors, spectrum
+            # update, spectrum weight] — one collective for everything in
+            # this step, instead of a separate all_gather per block/kind
+            # (all pieces are fully computed above with no ordering
+            # dependency between them).
             local_parts = [
                 torch.stack(norms_of_update).float().to(device),
                 torch.stack(norms_of_weight).float().to(device),
             ]
             if norms_of_gram:
                 local_parts.append(torch.stack(norms_of_gram).float().to(device))
+            local_parts.append(torch.stack(norms_of_radial).float().to(device))
             if gram_vec_flat is not None:
                 local_parts.append(gram_vec_flat)
             if update_spectrum_flat is not None:
@@ -3226,7 +3294,8 @@ class DiSCO(AbstractDiSCO):
 
                 weight_scalar_offset = expected_total
                 gram_scalar_offset = 2 * expected_total
-                gram_vec_offset = 2 * expected_total + expected_total_gram
+                radial_scalar_offset = 2 * expected_total + expected_total_gram
+                gram_vec_offset = radial_scalar_offset + expected_total_radial
                 spectrum_offset = gram_vec_offset + (
                     self._expert_gram_vec_total_size if gram_vec_flat is not None else 0
                 )
@@ -3285,6 +3354,32 @@ class DiSCO(AbstractDiSCO):
                     )
                     final_norms[key_gram] = gathered[
                         rank_base + gram_scalar_offset + rem
+                    ]
+
+                # Same layout as the gram-scalar loop above, but unconditional
+                # (block_radial is never 0, no gram_level gate).
+                radial_names = RADIAL_METRIC_NAMES
+                block_radial = P * E * R
+                for idx in range(world_size * block_radial):
+                    r, rem = divmod(idx, block_radial)  # producing rank
+                    p, rem2 = divmod(rem, E * R)  # parameter index
+                    e, rk = divmod(rem2, R)  # expert, radial-metric indices
+
+                    actual_ep_idx = e + r * E
+                    if actual_ep_idx >= expert_params[0].shape[0]:
+                        continue  # skip pure padding slots
+
+                    cleaned_name = remove_orig_mod_and_weight_for_p_name(
+                        expert_param_names[p]
+                    )
+                    radial_name = radial_names[rk]
+                    rank_base = r * per_rank_total
+
+                    key_radial = (
+                        f"track_radial_{radial_name}/ep_{actual_ep_idx}/{cleaned_name}"
+                    )
+                    final_norms[key_radial] = gathered[
+                        rank_base + radial_scalar_offset + rem
                     ]
 
                 if gram_vec_flat is not None:
@@ -3374,6 +3469,11 @@ class DiSCO(AbstractDiSCO):
 
         need_to_calculate_norm = self.need_to_calculate_norm
         num_gram_types = len(self.gram_scalar_names)
+        # Radial-dynamics metrics (radial_helper.py) are always computed
+        # whenever any per-param logging fires, independent of gram_level
+        # -- a fixed-size list, same for every param regardless of shape,
+        # so (unlike gram's vectors) no per-param length table is needed.
+        num_radial_types = len(RADIAL_METRIC_NAMES)
 
         # --- distributed groups ---
         dp_replicate_mesh = (
@@ -3522,6 +3622,23 @@ class DiSCO(AbstractDiSCO):
                 )
                 workspace["gram_norm_local_flat"] = gram_norm_local_flat
             gram_norm_local_flat.zero_()
+
+        # Radial-dynamics metrics: same fixed-stride pattern as
+        # gram_norm_local_flat above, but unconditional (no gram_level
+        # gate -- num_radial_types is a plain constant, never 0).
+        radial_local_flat = None
+        if need_to_calculate_norm:
+            required_radial_elems = total_buckets * num_radial_types
+            radial_local_flat = workspace.get("radial_local_flat")
+            if (
+                radial_local_flat is None
+                or radial_local_flat.numel() != required_radial_elems
+            ):
+                radial_local_flat = torch.empty(
+                    required_radial_elems, dtype=torch.float32, device=device
+                )
+                workspace["radial_local_flat"] = radial_local_flat
+            radial_local_flat.zero_()
 
         # Singular-value spectrum: a separate flat buffer padded to the largest
         # per-rank total across all ranks (`_ddp_spectrum_max_total`), since
@@ -3688,6 +3805,21 @@ class DiSCO(AbstractDiSCO):
                             gram_vec_local_flat[off : off + vec.numel()].copy_(vec)
                             off += vec.numel()
 
+                if radial_local_flat is not None:
+                    radial_metrics = calculate_radial_metrics(
+                        w,
+                        pseudo_w,
+                        self._radial_state_by_param_id[id(ddp_params[my_idx])],
+                    )
+                    radial_base = owner_bucket * num_radial_types
+                    radial_local_flat[
+                        radial_base : radial_base + num_radial_types
+                    ].copy_(
+                        torch.stack(
+                            [radial_metrics[name] for name in RADIAL_METRIC_NAMES]
+                        )
+                    )
+
         # -------- Phase C: apply once (pre-cast + grouped foreach apply) --------
         if not skip_update:
             apply_updates = self._prepare_ddp_apply_updates(
@@ -3715,6 +3847,7 @@ class DiSCO(AbstractDiSCO):
                 ("w", w_norm_local_flat),
                 ("gram", gram_norm_local_flat),
                 ("gram_vec", gram_vec_local_flat),
+                ("radial", radial_local_flat),
                 ("upd_spec", upd_spectrum_local_flat),
                 ("w_spec", w_spectrum_local_flat),
             ]
@@ -3768,6 +3901,12 @@ class DiSCO(AbstractDiSCO):
                         final_norms[
                             f"track_gram_{gram_name}/{gram_param_name}"
                         ] = gathered[rank_base + gram_base + gk]
+                if "radial" in offsets:
+                    radial_base = offsets["radial"] + owner_bucket * num_radial_types
+                    for rk, radial_name in enumerate(RADIAL_METRIC_NAMES):
+                        final_norms[f"track_radial_{radial_name}/{cleaned}"] = gathered[
+                            rank_base + radial_base + rk
+                        ]
 
             if "gram_vec" in offsets:
                 gram_vec_lens = (
@@ -3849,22 +3988,29 @@ class DiSCO(AbstractDiSCO):
         total_buckets,
         norms_of_gram=None,
         gram_vec_local_flat=None,
+        norms_of_radial=None,
     ):
         """
-        Gathers FSDP norm/gram/spectrum tensors from all ranks and logs them
-        on rank 0. One collective for everything this step (scalar
-        update/weight/gram norms, fixed stride `total_buckets * num_types`,
-        plus both spectrum halves and gram vectors, variable per-param length
-        padded per-rank to `_fsdp_spectrum_max_total`/`_fsdp_gram_vec_max_total`
-        -- see `_precompute_fsdp_metadata`/`_precompute_fsdp_gram_vector_
-        metadata`), instead of a separate all_gather per segment -- same
-        "single flat buffer" pattern `step_experts`/`step_ddp`'s Phase D use.
+        Gathers FSDP norm/gram/radial/spectrum tensors from all ranks and
+        logs them on rank 0. One collective for everything this step (scalar
+        update/weight/gram/radial norms, fixed stride `total_buckets *
+        num_types`, plus both spectrum halves and gram vectors, variable
+        per-param length padded per-rank to `_fsdp_spectrum_max_total`/
+        `_fsdp_gram_vec_max_total` -- see `_precompute_fsdp_metadata`/
+        `_precompute_fsdp_gram_vector_metadata`), instead of a separate
+        all_gather per segment -- same "single flat buffer" pattern
+        `step_experts`/`step_ddp`'s Phase D use.
         """
         upd = torch.stack(norms_of_update).float().to(device)
         w = torch.stack(norms_of_weight).float().to(device) if norms_of_weight else None
         # norms_of_gram stays empty whenever gram_level==0 (see
         # gram_helper.py) -- no separate "is gram active" flag needed here.
         gram = torch.stack(norms_of_gram).float().to(device) if norms_of_gram else None
+        # norms_of_radial is never empty (radial metrics are unconditional,
+        # unlike gram) -- same fixed-stride list-of-padding-entries pattern.
+        radial = (
+            torch.stack(norms_of_radial).float().to(device) if norms_of_radial else None
+        )
 
         local_buf, offsets = _pack_segments(
             [
@@ -3872,6 +4018,7 @@ class DiSCO(AbstractDiSCO):
                 ("w", w),
                 ("gram", gram),
                 ("gram_vec", gram_vec_local_flat),
+                ("radial", radial),
                 ("upd_spec", upd_spectrum_local_flat),
                 ("w_spec", w_spectrum_local_flat),
             ]
@@ -3883,6 +4030,7 @@ class DiSCO(AbstractDiSCO):
         if self.is_dp_rank_0:
             num_norm_types = len(self.norms_to_log)
             num_gram_types = len(self.gram_scalar_names)
+            num_radial_types = len(RADIAL_METRIC_NAMES)
             cleaned_names = [
                 remove_orig_mod_and_weight_for_p_name(pn) for pn in fsdp_param_names
             ]
@@ -3912,6 +4060,14 @@ class DiSCO(AbstractDiSCO):
                         final_norms[
                             f"track_gram_{gram_name}/{gram_param_name}"
                         ] = gathered[rank_base + gram_base + gram_idx]
+                if "radial" in offsets:
+                    radial_base = (
+                        offsets["radial"] + bucket_idx_on_owner * num_radial_types
+                    )
+                    for radial_idx, radial_name in enumerate(RADIAL_METRIC_NAMES):
+                        final_norms[
+                            f"track_radial_{radial_name}/{cleaned_p_name}"
+                        ] = gathered[rank_base + radial_base + radial_idx]
 
             if "gram_vec" in offsets:
                 for param_idx, cleaned_p_name in enumerate(cleaned_names):
@@ -3989,6 +4145,7 @@ class DiSCO(AbstractDiSCO):
 
         global_updates = [None] * len(fsdp_params)
         norms_of_update, norms_of_weight, norms_of_gram = [], [], []
+        norms_of_radial = []
         padding_norms = self._get_cached_padding_norms(device)
         # Empty whenever gram_level==0 (see gram_helper.py) -- no separate
         # "is gram active" flag needed, callers just check truthiness of
@@ -3996,6 +4153,13 @@ class DiSCO(AbstractDiSCO):
         gram_padding = {
             name: self._get_cached_zero_scalar(device)
             for name in self.gram_scalar_names
+        }
+        # Radial-dynamics metrics (radial_helper.py) -- always computed,
+        # independent of gram_level, same list-of-padding-entries pattern
+        # as gram_padding above (non-owned buckets get zero placeholders
+        # so norms_of_radial stays the same length on every rank).
+        radial_padding = {
+            name: self._get_cached_zero_scalar(device) for name in RADIAL_METRIC_NAMES
         }
 
         # Use pre-computed total_buckets from init.
@@ -4388,11 +4552,23 @@ class DiSCO(AbstractDiSCO):
                             vec = gram_metrics[vname]
                             gram_vec_local_flat[off : off + vec.numel()].copy_(vec)
                             off += vec.numel()
+
+                    owned_param = fsdp_params[start_idx + rank]
+                    radial_metrics = calculate_radial_metrics(
+                        full_weight,
+                        pseudo_w,
+                        self._radial_state_by_param_id[id(owned_param)],
+                    )
+                    radial_values = [
+                        radial_metrics[name] for name in RADIAL_METRIC_NAMES
+                    ]
                 else:
                     w_norms = padding_norms
                     gram_scalar_values = list(gram_padding.values())
+                    radial_values = list(radial_padding.values())
                 norms_of_weight.extend(w_norms.values())
                 norms_of_gram.extend(gram_scalar_values)
+                norms_of_radial.extend(radial_values)
 
         # Single vectorised apply. Runs AFTER weight-norm/gram calculation
         # above (moved from before it) so the full-weight reads above see
@@ -4419,6 +4595,7 @@ class DiSCO(AbstractDiSCO):
                 total_buckets,
                 norms_of_gram=norms_of_gram,
                 gram_vec_local_flat=gram_vec_local_flat,
+                norms_of_radial=norms_of_radial,
             )
 
         if dp_replicate_mesh is not None:
