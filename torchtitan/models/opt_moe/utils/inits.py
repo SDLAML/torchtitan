@@ -295,6 +295,9 @@ def setup_residual_scale(residual_scale: str, n_layers: int):
         case "identity":
             block_scale = 1.0
             identity_scale = 1.0
+        case "no_residuals":
+            block_scale = 1.0
+            identity_scale = 0.0
         case _:
             raise ValueError(f"Invalid residual_scale: {residual_scale}")
     return block_scale, identity_scale

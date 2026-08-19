@@ -499,6 +499,33 @@ moe_opt_moe_configs = {
             backend="cos_sin",
         ),
     ),
+    "synth-proxy-1layer-si": OPTMoEModel.Config(
+        n_layers=1,
+        dim=256,
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=1,
+            feed_forward=FeedForward.Config(
+                hidden_dim=1024,
+                norm_everywhere=True,
+                norm_eps=1e-30,
+                activation_type="relu",
+            ),
+            attention=GatedNormSWAttention.Config(
+                n_heads=4,
+                n_kv_heads=4,
+                head_dim=64,
+                qk_norm=True,
+                norm_everywhere=True,
+                norm_eps=1e-30,
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=64,
+            max_seq_len=4096,
+            theta=10000.0,
+            backend="cos_sin",
+        ),
+    ),
     "synth-proxy-1layer": OPTMoEModel.Config(
         n_layers=1,
         dim=256,
