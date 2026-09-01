@@ -6,45 +6,78 @@
 
 """
 Whole-tensor "radial dynamics" metrics -- how a weight's norm and direction
-evolve under training. Unlike gram_helper.py's row-wise Gram-matrix
-framework (which needs the raw momentum/gradient `V_raw` and is gated
-behind `gram_level`), these only need the weight before/after this step's
-update (`W_before`, `W_after` -- disco.py passes the same `pseudo_w`
-already used as gram's `W_after`) and are all whole-tensor Frobenius-norm
--scale scalars, never a row-wise vector -- cheap enough to always compute
-whenever any per-param logging fires at all, independent of `gram_level`
-and `norms_to_log`.
+evolve under training.
 
-Notation:
+The original metrics in this file use Frobenius geometry and only need the
+weight before/after this step's update (`W_before`, `W_after` -- disco.py
+passes the same `pseudo_w` already used as gram's `W_after`). They are
+whole-tensor scalar metrics and are independent of `gram_level` and
+`norms_to_log`.
+
+Notation for the Frobenius metrics:
   W_t    = W_before, the weight before this step's update.
   W_t+1  = W_after, the weight after (disco.py's `pseudo_w` approximation).
   dW_t   = W_after - W_before, the realised displacement.
-  r_t    = ||W_t||  (Frobenius norm -- "radius").
-  a_t    = ||dW_t|| (Frobenius norm -- "raw step").
-  q_t    = W_t / r_t,  v_t = dW_t / a_t  (unit directions).
-  c_t    = <q_t, v_t>  ("radial_cosine" -- is the step outward-radial or
-           tangential relative to the weight's own direction).
+  r_t    = ||W_t||_F  (Frobenius "radius").
+  a_t    = ||dW_t||_F (Frobenius raw step).
+  q_t    = W_t / r_t,  v_t = dW_t / a_t.
+  c_t    = <q_t, v_t> ("radial_cosine").
 
 Four running accumulators (`raw_A2`, `angular_A1`, `angular_A2`, `R1`)
-persist across steps in the caller-supplied `state` dict, mutated in
-place -- disco.py stores the canonical values in
-`self.state[p]["radial_state"]` (the same place `momentum_buffer` lives),
-so they survive checkpoint save/restore via the optimizer's default
-`state_dict()`/`load_state_dict()` with no extra plumbing. `R2(t)` from
-the "radial error" formula is exactly the same running sum as `raw_A2` --
-one accumulator serves both, so `R2` is not separately stored.
-`relative_step` here is the same formula as gram_helper.py's
-`U_relative_step_fro` -- expected, not an accidental duplicate: this one
-is unconditional, that one is gated behind `gram_level`.
+persist across steps in the caller-supplied `state` dict, mutated in place.
+`R2(t)` from the radial-error formula is the same running sum as `raw_A2`,
+so no separate `R2` accumulator is stored.
 
-`alpha_fit`/`tau_fit` (fitting the angle-decay power law
-`theta_t = C * (t + tau)^-alpha`) is a deliberately deferred follow-up --
-it needs bounded/subsampled history storage and periodic (not per-step)
-refitting to actually stay cheap at scale, unlike everything here, which
-is a genuine O(1)-per-call update.
+In addition, this module can compute update radiality in several induced
+operator-norm geometries for 2-D matrix weights.  For a primal matrix norm
+N and realised displacement U = W_after - W_before, the quantity is
+
+    <D_{N*}(W_before), U / N(U)>,
+
+where D_{N*}(W_before) is a norming covector of W_before.  It lies in
+[-1, 1] away from degenerate cases and measures the signed first-order
+alignment of the update with a selected outward normal of the N-unit ball.
+
+Supported geometries:
+  * "rms_to_rms": RMS -> RMS induced operator norm.
+  * "rms_to_inf": RMS -> l_infinity induced operator norm.
+  * "l1_to_rms":  l1  -> RMS induced operator norm.
+
+All three are enabled by default, but callers can pass a subset through
+`update_radiality_geometries`.  Disabled, non-applicable (non-2-D), or
+degenerate dual-geometry metrics are returned as NaN rather than 0, because
+0 has the meaning "tangent/aligned orthogonally" for a valid geometry.  A
+geometry is degenerate when N(W_before) = 0 or when
+N(U) <= `_REL_DEGENERACY_EPS` * N(W_before).
+
+Important cost note: the exact RMS -> RMS metric requires an SVD of the
+current weight plus an operator norm of the update, so unlike the original
+Frobenius scalar metrics it is not a cheap O(1)-style reduction.  The
+RMS -> inf and l1 -> RMS metrics only require row/column L2 reductions.
+
+At non-smooth points (e.g. repeated top singular values or ties between
+maximal row/column norms), the norming covector is not unique.  The
+implementation returns one valid selection: PyTorch's SVD selection for
+RMS -> RMS, and the first argmax row/column for the max-row/max-column
+geometries.
 """
 
+from collections.abc import Iterable
+
 import torch
+
+
+UPDATE_RADIALITY_GEOMETRIES: tuple[str, ...] = (
+    "rms_to_rms",
+    "rms_to_inf",
+    "l1_to_rms",
+)
+
+_UPDATE_RADIALITY_METRIC_BY_GEOMETRY: dict[str, str] = {
+    "rms_to_rms": "update_radiality_rms_to_rms",
+    "rms_to_inf": "update_radiality_rms_to_inf",
+    "l1_to_rms": "update_radiality_l1_to_rms",
+}
 
 RADIAL_METRIC_NAMES: list[str] = [
     "radius",
@@ -62,13 +95,16 @@ RADIAL_METRIC_NAMES: list[str] = [
     "angular_A2",
     "R1",
     "E_radial",
+    "update_radiality_rms_to_rms",
+    "update_radiality_rms_to_inf",
+    "update_radiality_l1_to_rms",
 ]
 
 _ACCUMULATOR_NAMES: tuple[str, ...] = ("raw_A2", "angular_A1", "angular_A2", "R1")
 
-# a_t below this fraction of r_t is treated as a degenerate (no real update)
-# step -- see the valid_wu comment in calculate_radial_metrics for why a
-# relative floor is needed instead of a bare a_t > 0 check.
+# An update whose norm is below this fraction of the current weight norm is
+# treated as degenerate.  The comparison is performed in the corresponding
+# geometry; fixed dimension-normalisation constants cancel on both sides.
 _REL_DEGENERACY_EPS = 1e-6
 
 
@@ -77,17 +113,191 @@ def new_radial_state(
     dtype: torch.dtype = torch.float32,
     shape: tuple[int, ...] = (),
 ) -> dict[str, torch.Tensor]:
-    """Fresh, zero-initialized accumulator state. `shape=()` (the default)
-    for a single tracked tensor; `shape=(num_local_experts,)` for expert
-    params, where each expert index needs its own independent accumulators
-    (each has its own `W_before`/`W_after` pair) -- index into the result
-    per-expert (e.g. `state["raw_A2"][ep_idx]`) when calling
-    `calculate_radial_metrics`, which mutates whatever 0-d view it's given
-    in place."""
+    """Fresh, zero-initialized accumulator state.
+
+    `shape=()` (the default) is for a single tracked tensor;
+    `shape=(num_local_experts,)` is for expert params, where each expert
+    index needs its own independent accumulators.  Index into the result
+    per expert (for example `state["raw_A2"][ep_idx]`) when calling
+    `calculate_radial_metrics`; the passed 0-d views are mutated in place.
+    """
     return {
         name: torch.zeros(shape, device=device, dtype=dtype)
         for name in _ACCUMULATOR_NAMES
     }
+
+
+def _validate_update_radiality_geometries(
+    geometries: Iterable[str] | str | None,
+) -> tuple[str, ...]:
+    if geometries is None:
+        return UPDATE_RADIALITY_GEOMETRIES
+    if isinstance(geometries, str):
+        geometries = (geometries,)
+
+    selected = tuple(dict.fromkeys(geometries))
+    for geometry in selected:
+        if geometry not in UPDATE_RADIALITY_GEOMETRIES:
+            supported = ", ".join(UPDATE_RADIALITY_GEOMETRIES)
+            raise ValueError(
+                f"Unknown update-radiality geometry {geometry!r}. "
+                f"Supported geometries: {supported}."
+            )
+    return selected
+
+
+def _update_radiality_rms_to_rms(
+    W: torch.Tensor,
+    U: torch.Tensor,
+) -> torch.Tensor:
+    """RMS -> RMS radiality.
+
+    For W in R^{d_out x d_in},
+
+        N(W) = sqrt(d_in / d_out) * ||W||_op.
+
+    A norming covector is
+
+        D_{N*}(W) = sqrt(d_in / d_out) * u1 v1^T,
+
+    for a leading singular-vector pair (u1, v1).  Since the same dimension
+    factor appears in N(U), it cancels in
+
+        <D_{N*}(W), U / N(U)>
+          = u1^T U v1 / ||U||_op.
+
+    Returns NaN when ||W||_op = 0 or when ||U||_op is at most
+    `_REL_DEGENERACY_EPS` times ||W||_op.
+    """
+    tiny = torch.finfo(W.dtype).tiny
+
+    Uw, Sw, Vhw = torch.linalg.svd(W, full_matrices=False, driver="gesvd")
+    sigma_w = Sw[0]
+    u1 = Uw[:, 0]
+    v1 = Vhw[0, :]
+
+    sigma_u = torch.linalg.matrix_norm(U, ord=2)
+    radial_component = u1 @ (U @ v1)
+    radiality = radial_component / sigma_u.clamp_min(tiny)
+    valid = (sigma_w > 0) & (sigma_u > _REL_DEGENERACY_EPS * sigma_w)
+
+    return torch.where(valid, radiality, torch.full_like(radiality, float("nan")))
+
+
+def _update_radiality_rms_to_inf(
+    W: torch.Tensor,
+    U: torch.Tensor,
+) -> torch.Tensor:
+    """RMS -> l_infinity radiality.
+
+    The induced norm is
+
+        N(W) = sqrt(d_in) * max_i ||row_i(W)||_2.
+
+    If i* is an index of a largest-L2 row of W, one valid norming covector
+    has only row i* non-zero and that row points along row_i*(W).  The
+    sqrt(d_in) scale cancels against N(U), giving
+
+        radiality =
+            <row_i*(W), row_i*(U)>
+            / (||row_i*(W)||_2 * max_j ||row_j(U)||_2).
+
+    At ties, torch.argmax selects the first maximal row; this is one valid
+    subgradient selection at that non-smooth point.
+
+    Returns NaN when the largest row norm of W is zero or when the largest
+    row norm of U is at most `_REL_DEGENERACY_EPS` times that of W.
+    """
+    tiny = torch.finfo(W.dtype).tiny
+
+    row_norms_w = torch.linalg.vector_norm(W, ord=2, dim=1)
+    row_norms_u = torch.linalg.vector_norm(U, ord=2, dim=1)
+
+    max_row_w, row_idx = torch.max(row_norms_w, dim=0)
+    max_row_u = torch.max(row_norms_u)
+
+    row_w = W[row_idx, :]
+    row_u = U[row_idx, :]
+    radial_component = torch.dot(row_w, row_u)
+    denominator = (max_row_w * max_row_u).clamp_min(tiny)
+    radiality = radial_component / denominator
+    valid = (max_row_w > 0) & (
+        max_row_u > _REL_DEGENERACY_EPS * max_row_w
+    )
+
+    return torch.where(valid, radiality, torch.full_like(radiality, float("nan")))
+
+
+def _update_radiality_l1_to_rms(
+    W: torch.Tensor,
+    U: torch.Tensor,
+) -> torch.Tensor:
+    """l1 -> RMS radiality.
+
+    l1 -> RMS induced operator norm is
+
+        N(W) = max_j ||col_j(W)||_RMS
+             = (1 / sqrt(d_out)) * max_j ||col_j(W)||_2.
+
+    If j* is an index of a largest-L2 column of W, a norming covector for
+    the dual geometry concentrates on column j*.  The 1/sqrt(d_out) scale
+    cancels against N(U), giving
+
+        radiality =
+            <col_j*(W), col_j*(U)>
+            / (||col_j*(W)||_2 * max_k ||col_k(U)||_2).
+
+    Note that this norming covector is intentionally different from the
+    primal dualization map for a gradient, which independently
+    normalizes every gradient column.  Here W is used to select a norming
+    covector of the *dual* norm because the target quantity is radial
+    alignment of a primal update.
+
+    At ties, torch.argmax selects the first maximal column.
+
+    Returns NaN when the largest column norm of W is zero or when the largest
+    column norm of U is at most `_REL_DEGENERACY_EPS` times that of W.
+    """
+    tiny = torch.finfo(W.dtype).tiny
+
+    col_norms_w = torch.linalg.vector_norm(W, ord=2, dim=0)
+    col_norms_u = torch.linalg.vector_norm(U, ord=2, dim=0)
+
+    max_col_w, col_idx = torch.max(col_norms_w, dim=0)
+    max_col_u = torch.max(col_norms_u)
+
+    col_w = W[:, col_idx]
+    col_u = U[:, col_idx]
+    radial_component = torch.dot(col_w, col_u)
+    denominator = (max_col_w * max_col_u).clamp_min(tiny)
+    radiality = radial_component / denominator
+    valid = (max_col_w > 0) & (
+        max_col_u > _REL_DEGENERACY_EPS * max_col_w
+    )
+
+    return torch.where(valid, radiality, torch.full_like(radiality, float("nan")))
+
+
+def _calculate_update_radialities(
+    W: torch.Tensor,
+    U: torch.Tensor,
+    geometries: tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    """Compute radialities from an already-prepared weight and update."""
+    result: dict[str, torch.Tensor] = {}
+    for geometry in geometries:
+        if geometry == "rms_to_rms":
+            value = _update_radiality_rms_to_rms(W, U)
+        elif geometry == "rms_to_inf":
+            value = _update_radiality_rms_to_inf(W, U)
+        elif geometry == "l1_to_rms":
+            value = _update_radiality_l1_to_rms(W, U)
+        else:
+            raise AssertionError(f"Unhandled update-radiality geometry: {geometry}")
+
+        result[_UPDATE_RADIALITY_METRIC_BY_GEOMETRY[geometry]] = value
+
+    return result
 
 
 @torch.no_grad()
@@ -95,16 +305,21 @@ def calculate_radial_metrics(
     W_before: torch.Tensor,
     W_after: torch.Tensor,
     state: dict[str, torch.Tensor],
+    update_radiality_geometries: Iterable[str] | str | None = None,
 ) -> dict[str, torch.Tensor]:
-    """
-    Returns all of `RADIAL_METRIC_NAMES` as a flat dict of 0-d tensors.
+    """Return all of `RADIAL_METRIC_NAMES` as a flat dict of 0-d tensors.
 
-    `state` holds the 4 running accumulators (`raw_A2`, `angular_A1`,
-    `angular_A2`, `R1`), mutated in place: this call's `raw_A2`/
-    `angular_A1`/`angular_A2`/`R1`/`E_radial` outputs reflect `Sum_{i<t}`
-    (i.e. NOT including this step's own contribution -- the correct
-    semantics for these "history so far" metrics), then `state` is updated
-    afterward so the NEXT call sees this step's contribution included.
+    `state` holds the four running Frobenius accumulators (`raw_A2`,
+    `angular_A1`, `angular_A2`, `R1`), mutated in place.  This call's
+    accumulator outputs reflect Sum_{i<t} (they do NOT include the current
+    step), then `state` is updated so the next call sees this step.
+
+    `update_radiality_geometries` controls which 2-D dual-geometry metrics
+    are actually computed. `None` means all supported geometries; pass an
+    empty tuple to disable them all. Geometry names must exactly match
+    `UPDATE_RADIALITY_GEOMETRIES`. The output schema stays fixed:
+    disabled geometries, non-2-D tensors, zero weights, and updates satisfying
+    N(U) <= `_REL_DEGENERACY_EPS` * N(W_before) receive NaN sentinels.
     """
     if isinstance(W_before, torch.nn.Parameter):
         W_before = W_before.data
@@ -114,6 +329,14 @@ def calculate_radial_metrics(
         W_before = W_before.float()
     if W_after.dtype in (torch.float16, torch.bfloat16):
         W_after = W_after.float()
+
+    if W_before.shape != W_after.shape:
+        raise ValueError("W_before and W_after must have identical shapes.")
+
+    if W_before.dtype != W_after.dtype:
+        common_dtype = torch.promote_types(W_before.dtype, W_after.dtype)
+        W_before = W_before.to(dtype=common_dtype)
+        W_after = W_after.to(dtype=common_dtype)
 
     dtype = W_before.dtype
     tiny = torch.finfo(dtype).tiny
@@ -125,15 +348,8 @@ def calculate_radial_metrics(
 
     # Relative (not absolute/exact-zero) floor on a_t: an update whose
     # magnitude is numerically negligible compared to the weight's own
-    # scale (e.g. a near-zero-lr step at the tail of a decay schedule)
-    # should report the same deterministic degenerate sentinel regardless
-    # of which parallelism strategy computed it. `a_t > 0` alone only
-    # catches the literal-zero case -- below this relative threshold, a_t
-    # is dominated by ordinary floating-point reduction-order noise (e.g.
-    # DDP's all-reduce vs FSDP's all-gather summing gradients in a
-    # different order), which radial_cosine/radial_ratio (both divide by
-    # a_t or a_t^2) amplify into large, run-to-run-inconsistent swings
-    # even though the underlying update is physically negligible.
+    # scale should report the same deterministic degenerate sentinel across
+    # parallelism/reduction-order variants.
     valid_wu = (r_t > 0) & (a_t > _REL_DEGENERACY_EPS * r_t)
     valid_ww = (r_t > 0) & (r_next > 0)
 
@@ -141,72 +357,55 @@ def calculate_radial_metrics(
 
     dot_wu = (W_before * U).sum()
     radial_cosine_raw = (dot_wu / (r_t * a_t).clamp_min(tiny)).clamp(-1.0, 1.0)
-    # Explicit degenerate-case sentinel (0, an undefined angle) rather than
-    # letting the tiny floor alone produce an arbitrary non-zero value --
-    # same convention as _row_normalise/_effective_rank's torch.where
-    # guards in gram_helper.py.
     radial_cosine = torch.where(
         valid_wu, radial_cosine_raw, torch.zeros_like(radial_cosine_raw)
     )
     tangent_fraction = (1.0 - radial_cosine * radial_cosine).clamp_min(0.0).sqrt()
 
-    # Canonical angle via atan2, not acos: acos's derivative blows up near
-    # cos=1, so small angles (the common case most training steps) lose
-    # precision in fp32 -- nearby small angles round to indistinguishable
-    # cosine values. atan2 doesn't have this issue. Mathematically the same
-    # quantity as arccos(<q_t, q_t+1>) -- verified via the 2D-trigonometry
-    # identity: place q_t at (r_t, 0); the step lands W_t+1 at
-    # (r_t + a_t*c_t, a_t*sqrt(1-c_t^2)), whose angle from the x-axis is
-    # exactly this atan2 expression -- just computed via a more numerically
-    # robust path. Gated on `valid_ww` (matching angle_from_cos below), not
-    # `valid_wu` -- deliberately NOT the relative-degeneracy floor above:
-    # unlike radial_cosine/radial_ratio, atan2's inputs (a_t*tangent_fraction,
-    # r_t + a_t*radial_cosine) stay well-conditioned as a_t -> 0 (numerator
-    # -> 0, denominator -> r_t > 0), so `angle` doesn't inherit the
-    # near-zero-a_t noise-amplification these other metrics have, and
-    # doesn't need the same protection.
+    # Canonical angle via atan2, not acos.  This is numerically better for
+    # the small angles common in training.
     angle_raw = torch.atan2(a_t * tangent_fraction, r_t + a_t * radial_cosine)
     angle = torch.where(valid_ww, angle_raw, torch.zeros_like(angle_raw))
 
-    # Independent sanity check against `angle` above (same quantity, via
-    # the acos formula instead of atan2) -- not fed into the accumulators,
-    # kept purely to catch a geometry/implementation bug if it ever
-    # meaningfully diverges from `angle`.
+    # Independent sanity check against `angle` via the direct acos formula.
     dot_ww = (W_before * W_after).sum()
     cos_angle = (dot_ww / (r_t * r_next).clamp_min(tiny)).clamp(-1.0, 1.0)
     angle_from_cos = torch.where(
         valid_ww, torch.arccos(cos_angle), torch.zeros_like(cos_angle)
     )
 
-    # Algebraically == 2*a_t*r_t*radial_cosine (c_t = dot_wu/(r_t*a_t)),
-    # but computed directly from the dot product already at hand: avoids a
-    # divide-then-remultiply round trip, and stays well-defined even when
-    # r_t or a_t is exactly 0 (dot_wu is 0 there too, no separate
-    # degenerate-case guard needed, unlike radial_cosine).
+    # ||W + U||_F^2 - ||W||_F^2 = 2 <W, U>_F + ||U||_F^2.
     radial_first_order = 2.0 * dot_wu
     radial_second_order = a_t * a_t
-    # Away from the degenerate regime, radial_ratio is deliberately NOT
-    # given a relative-floor treatment the way genuinely-unbounded ratios
-    # elsewhere in gram_helper.py are: it's *supposed* to swing large or
-    # small depending on which regime dominates (that's its whole
-    # diagnostic purpose). But when the step itself is degenerate (a_t
-    # negligible vs r_t -- see valid_wu above), both radial_first_order and
-    # radial_second_order are individually noise-dominated, and dividing
-    # noise by noise-squared is pure amplification, not signal -- gate it
-    # to the same deterministic 0 sentinel as radial_cosine so it doesn't
-    # report large, run-to-run-inconsistent swings on a step where nothing
-    # meaningful happened.
     radial_ratio_raw = radial_first_order.abs() / radial_second_order.clamp_min(tiny)
     radial_ratio = torch.where(
         valid_wu, radial_ratio_raw, torch.zeros_like(radial_ratio_raw)
     )
 
+    # Keep a fixed output schema.  NaN means "not computed / not applicable"
+    # and is deliberately distinct from the valid score 0.
+    nan_scalar = torch.full((), float("nan"), device=W_before.device, dtype=dtype)
+    update_radiality_metrics: dict[str, torch.Tensor] = {
+        metric_name: nan_scalar.clone()
+        for metric_name in _UPDATE_RADIALITY_METRIC_BY_GEOMETRY.values()
+    }
+
+    selected_geometries = _validate_update_radiality_geometries(
+        update_radiality_geometries
+    )
+    if W_before.ndim == 2 and W_before.numel() > 0 and selected_geometries:
+        update_radiality_metrics.update(
+            _calculate_update_radialities(
+                W_before,
+                U,
+                selected_geometries,
+            )
+        )
+
     raw_A2 = state["raw_A2"].clone()
     angular_A1 = state["angular_A1"].clone()
     angular_A2 = state["angular_A2"].clone()
     R1 = state["R1"].clone()
-    # Same "meant to swing large" reasoning as radial_ratio -- additive
-    # +tiny (not a relative floor) is intentional.
     E_radial = R1 / (raw_A2 + tiny)
 
     state["raw_A2"].add_(radial_second_order)
@@ -230,4 +429,5 @@ def calculate_radial_metrics(
         "angular_A2": angular_A2,
         "R1": R1,
         "E_radial": E_radial,
+        **update_radiality_metrics,
     }

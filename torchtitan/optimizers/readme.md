@@ -373,12 +373,14 @@ exactly as valid as any other `D_out > D_in` layer's.
 A third tracked-metric family, alongside norm/spectrum and gram, living in its own module
 (`radial_helper.py`). Unlike gram (row-wise Gram-matrix framework, needs `V_raw`, gated behind
 `gram_level`), radial metrics ask a different, simpler question: how does a weight's *whole-tensor*
-norm and direction evolve step to step. Every metric is a single Frobenius-norm-scale scalar (never a
-row-wise vector), computed from just `W_before`/`W_after` (the same pair already used as gram's
-`W_before`/`W_after`) -- cheap enough that `calculate_radial_metrics` is called **unconditionally**
-whenever any per-param logging fires at all, independent of `gram_level` and `norms_to_log`'s
-contents, at all 4 `step_*` call sites (including `step_embedding`, ungated by
-`track_embed_gram` -- radial's cost is O(1) scalars, not O(vocab_size) Gram matrices).
+norm and direction evolve step to step. Every output is a scalar (never a row-wise vector), computed
+from just `W_before`/`W_after` (the same pair already used as gram's `W_before`/`W_after`). The
+original metrics use Frobenius reductions; the RMS-to-infinity and l1-to-RMS update radialities add
+row/column L2 reductions. `calculate_radial_metrics` is called **unconditionally** whenever any
+per-param logging fires, independent of `gram_level` and `norms_to_log`, at all four `step_*` call
+sites (including `step_embedding`, ungated by `track_embed_gram`). Exact RMS-to-RMS radiality is
+substantially more expensive because it requires an SVD of the current weight and an operator norm
+of the update.
 
 Four running accumulators (`raw_A2`, `angular_A1`, `angular_A2`, `R1`) track the parameter's
 cumulative history and persist across checkpoint save/restore -- stored in
@@ -415,10 +417,16 @@ deterministically reports the same degenerate sentinel (`radial_cosine=0`, `tang
 `radial_ratio=0`) regardless of which parallelism strategy computed it, while a genuinely small-but-real
 step (e.g. `relative_step ~ 1e-3`) is well above the threshold and reports real signal, unclamped.
 
+The induced-operator-norm update radialities apply the same relative threshold in their own primal
+geometry: they report `NaN` when `N(W_before) == 0` or
+`N(U) <= 1e-6 * N(W_before)`. These are undefined or numerically degenerate cases for
+`<D_{N*}(W_before), U/N(U)>`; `NaN` keeps them distinct from the valid radiality `0`, which means
+that the selected outward normal and normalized update are orthogonal.
+
 `alpha_fit`/`tau_fit` (fitting the angle-decay power law `theta_t = C*(t+tau)^-alpha` from the logged
 `(t, angle)` history) is a deliberately deferred, offline/analysis-time follow-up, not optimizer
-state: unlike everything above (a genuine O(1)-per-call update), fitting this needs some bounded
-history of past angles and periodic (not per-step) nonlinear refitting to stay cheap at scale, and
+state: unlike the fixed set of reductions above, fitting this needs some bounded history of past
+angles and periodic (not per-step) nonlinear refitting to stay cheap at scale, and
 `tau` enters the fit nonlinearly, so there's no simple closed-form running update for it.
 
 **Checkpoint compatibility:** resuming from a checkpoint saved *before* `radial_state` existed

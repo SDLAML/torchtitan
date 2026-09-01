@@ -3083,8 +3083,12 @@ class DiSCO(AbstractDiSCO):
                 # independent of gram_level/norms_to_log (see
                 # radial_helper.py); reuses the exact (p, pseudo_w) pair
                 # already used as gram's (W_before, W_after).
+                radial_w = p.transpose(0, 1) if need_T else p
+                radial_pseudo_w = (
+                    pseudo_w.transpose(0, 1) if need_T else pseudo_w
+                )
                 radial_metrics = calculate_radial_metrics(
-                    p, pseudo_w, self._radial_state_by_param_id[original_pid]
+                    radial_w, radial_pseudo_w, self._radial_state_by_param_id[original_pid]
                 )
 
                 cleaned_p_name = remove_orig_mod_and_weight_for_p_name(p_name)
@@ -3319,9 +3323,17 @@ class DiSCO(AbstractDiSCO):
                         # expert params (see the lazy-init above), so index
                         # by ep_idx to get this expert's own 0-d views.
                         radial_state_for_p = self._radial_state_by_param_id[id(p)]
+                        radial_w = (
+                            p_local[ep_idx].transpose(0, 1)
+                            if transpose
+                            else p_local[ep_idx]
+                        )
+                        radial_pseudo_w = (
+                            pseudo_w.transpose(0, 1) if transpose else pseudo_w
+                        )
                         radial_metrics = calculate_radial_metrics(
-                            p_local[ep_idx],
-                            pseudo_w,
+                            radial_w,
+                            radial_pseudo_w,
                             {k: v[ep_idx] for k, v in radial_state_for_p.items()},
                         )
                         for name in RADIAL_METRIC_NAMES:
