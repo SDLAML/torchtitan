@@ -38,6 +38,13 @@ where D_{N*}(W_before) is a norming covector of W_before.  It lies in
 [-1, 1] away from degenerate cases and measures the signed first-order
 alignment of the update with a selected outward normal of the N-unit ball.
 
+For the same geometries, directional separation is
+
+    N(W_after / N(W_after) - W_before / N(W_before)).
+
+It compares the directions of two nonzero consecutive iterates without
+depending on their radii.
+
 Supported geometries:
   * "rms_to_rms": RMS -> RMS induced operator norm.
   * "rms_to_inf": RMS -> l_infinity induced operator norm.
@@ -45,13 +52,16 @@ Supported geometries:
 
 All three are enabled by default, but callers can pass a subset through
 `update_radiality_geometries`.  Disabled, non-applicable (non-2-D), or
-degenerate dual-geometry metrics are returned as NaN rather than 0, because
-0 has the meaning "tangent/aligned orthogonally" for a valid geometry.  A
-geometry is degenerate when N(W_before) = 0 or when
-N(U) <= `_REL_DEGENERACY_EPS` * N(W_before).
+degenerate geometry metrics are returned as NaN rather than 0.  Update
+radiality is degenerate when N(W_before) = 0 or when
+N(U) <= `_REL_DEGENERACY_EPS` * N(W_before); directional separation is
+degenerate when either iterate has zero norm.  Zero remains a meaningful
+valid result: tangent/aligned orthogonally for update radiality and unchanged
+direction for directional separation.
 
-Important cost note: the exact RMS -> RMS metric requires an SVD of the
-current weight plus an operator norm of the update, so unlike the original
+Important cost note: the exact RMS -> RMS metrics require spectral-norm
+computations for the current weight, update, next weight, and normalized
+direction difference, so unlike the original
 Frobenius scalar metrics it is not a cheap O(1)-style reduction.  The
 RMS -> inf and l1 -> RMS metrics only require row/column L2 reductions.
 
@@ -66,6 +76,12 @@ from collections.abc import Iterable
 
 import torch
 
+from .norm_helper import (
+    l1_to_rms_norm,
+    rms_to_inf_norm,
+    rms_to_rms_norm,
+)
+
 
 UPDATE_RADIALITY_GEOMETRIES: tuple[str, ...] = (
     "rms_to_rms",
@@ -77,6 +93,12 @@ _UPDATE_RADIALITY_METRIC_BY_GEOMETRY: dict[str, str] = {
     "rms_to_rms": "update_radiality_rms_to_rms",
     "rms_to_inf": "update_radiality_rms_to_inf",
     "l1_to_rms": "update_radiality_l1_to_rms",
+}
+
+_DIRECTIONAL_SEPARATION_METRIC_BY_GEOMETRY: dict[str, str] = {
+    "rms_to_rms": "directional_separation_rms_to_rms",
+    "rms_to_inf": "directional_separation_rms_to_inf",
+    "l1_to_rms": "directional_separation_l1_to_rms",
 }
 
 RADIAL_METRIC_NAMES: list[str] = [
@@ -98,6 +120,9 @@ RADIAL_METRIC_NAMES: list[str] = [
     "update_radiality_rms_to_rms",
     "update_radiality_rms_to_inf",
     "update_radiality_l1_to_rms",
+    "directional_separation_rms_to_rms",
+    "directional_separation_rms_to_inf",
+    "directional_separation_l1_to_rms",
 ]
 
 _ACCUMULATOR_NAMES: tuple[str, ...] = ("raw_A2", "angular_A1", "angular_A2", "R1")
@@ -144,6 +169,37 @@ def _validate_update_radiality_geometries(
                 f"Supported geometries: {supported}."
             )
     return selected
+
+
+def _geometry_norm(W: torch.Tensor, geometry: str) -> torch.Tensor:
+    """Apply the canonical norm-helper function for a geometry."""
+    if geometry == "rms_to_rms":
+        return rms_to_rms_norm(W)
+    if geometry == "rms_to_inf":
+        return rms_to_inf_norm(W)
+    if geometry == "l1_to_rms":
+        return l1_to_rms_norm(W)
+    raise AssertionError(f"Unhandled update-radiality geometry: {geometry}")
+
+
+def _directional_separation(
+    W_before: torch.Tensor,
+    W_after: torch.Tensor,
+    geometry: str,
+) -> torch.Tensor:
+    """Measure separation between normalized, nonzero iterates."""
+    norm_before = _geometry_norm(W_before, geometry)
+    norm_after = _geometry_norm(W_after, geometry)
+    tiny = torch.finfo(norm_before.dtype).tiny
+
+    direction_before = W_before / norm_before.clamp_min(tiny)
+    direction_after = W_after / norm_after.clamp_min(tiny)
+    separation = _geometry_norm(direction_after - direction_before, geometry)
+    valid = (norm_before > 0) & (norm_after > 0)
+
+    return torch.where(
+        valid, separation, torch.full_like(separation, float("nan"))
+    )
 
 
 def _update_radiality_rms_to_rms(
@@ -300,6 +356,20 @@ def _calculate_update_radialities(
     return result
 
 
+def _calculate_directional_separations(
+    W_before: torch.Tensor,
+    W_after: torch.Tensor,
+    geometries: tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    """Compute directional separations for the selected geometries."""
+    return {
+        _DIRECTIONAL_SEPARATION_METRIC_BY_GEOMETRY[
+            geometry
+        ]: _directional_separation(W_before, W_after, geometry)
+        for geometry in geometries
+    }
+
+
 @torch.no_grad()
 def calculate_radial_metrics(
     W_before: torch.Tensor,
@@ -314,12 +384,15 @@ def calculate_radial_metrics(
     accumulator outputs reflect Sum_{i<t} (they do NOT include the current
     step), then `state` is updated so the next call sees this step.
 
-    `update_radiality_geometries` controls which 2-D dual-geometry metrics
-    are actually computed. `None` means all supported geometries; pass an
+    `update_radiality_geometries` controls which 2-D geometry metrics are
+    actually computed. This includes both update radiality and directional
+    separation. `None` means all supported geometries; pass an
     empty tuple to disable them all. Geometry names must exactly match
     `UPDATE_RADIALITY_GEOMETRIES`. The output schema stays fixed:
-    disabled geometries, non-2-D tensors, zero weights, and updates satisfying
-    N(U) <= `_REL_DEGENERACY_EPS` * N(W_before) receive NaN sentinels.
+    disabled geometries and non-2-D tensors receive NaN sentinels. Update
+    radiality is also NaN for zero weights and updates satisfying
+    N(U) <= `_REL_DEGENERACY_EPS` * N(W_before); directional separation is
+    NaN when either iterate has zero norm.
     """
     if isinstance(W_before, torch.nn.Parameter):
         W_before = W_before.data
@@ -387,7 +460,10 @@ def calculate_radial_metrics(
     nan_scalar = torch.full((), float("nan"), device=W_before.device, dtype=dtype)
     update_radiality_metrics: dict[str, torch.Tensor] = {
         metric_name: nan_scalar.clone()
-        for metric_name in _UPDATE_RADIALITY_METRIC_BY_GEOMETRY.values()
+        for metric_name in (
+            *_UPDATE_RADIALITY_METRIC_BY_GEOMETRY.values(),
+            *_DIRECTIONAL_SEPARATION_METRIC_BY_GEOMETRY.values(),
+        )
     }
 
     selected_geometries = _validate_update_radiality_geometries(
@@ -398,6 +474,13 @@ def calculate_radial_metrics(
             _calculate_update_radialities(
                 W_before,
                 U,
+                selected_geometries,
+            )
+        )
+        update_radiality_metrics.update(
+            _calculate_directional_separations(
+                W_before,
+                W_after,
                 selected_geometries,
             )
         )
