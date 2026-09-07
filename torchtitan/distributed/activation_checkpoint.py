@@ -284,6 +284,17 @@ class SelectiveAC(ActivationCheckpointing):
                 # memory/compute trade-off: the default 2 keeps upstream's
                 # "save every other mm", 0 recomputes every mm (most memory
                 # saved), 1 saves all of them.
+                #
+                # SCOPE CHANGE vs llm-0.4.0: there the frequency gated only
+                # aten.mm.default, so aten.linear.default and aten.mm.dtype were
+                # always saved. Upstream groups all three as mm_ops precisely
+                # because some backends keep aten.linear as a leaf instead of
+                # decomposing it to aten.mm, so gating only mm.default would
+                # miss those. The gate therefore covers mm_ops here.
+                #
+                # Recompute is exact, so this is numerically neutral -- it only
+                # shifts the memory/speed trade-off. At frequency 0 it saves
+                # strictly less than 0.4.0 did.
                 if func in save_ops:
                     if func in mm_ops:
                         save_mm = (
