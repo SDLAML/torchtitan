@@ -29,6 +29,9 @@ from torchtitan.components.checkpointer import BaseCheckpointManager, Checkpoint
 from torchtitan.components.data.collators import TrainerBatch
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data_mix_scheduler import build_data_mix_scheduler
+from torchtitan.hf_datasets.mixed_text_datasets import (
+    infer_dataloader_snapshot_every_n_steps,
+)
 from torchtitan.components.ema import EMAOptimizersContainer
 from torchtitan.optimizers import norm_helper
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
@@ -648,12 +651,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # build dataloader
         num_tokens_per_batch = config.training.num_tokens_per_microbatch_per_dp_rank
+        # seed and snapshot_every_n_steps are extras the torchdata-backed loader
+        # uses and upstream's grain loader ignores (its build() absorbs **kwargs).
+        # Without the seed the data order is not reproducible; without the
+        # snapshot interval the mixing state is captured every step, which is
+        # correct but needlessly slow for a multi-dataset mix.
+        snapshot_every_n_steps = infer_dataloader_snapshot_every_n_steps(
+            checkpoint_enabled=config.checkpoint.enable,
+            checkpoint_interval=config.checkpoint.interval,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+        )
         self.dataloader = config.dataloader.build(
             dp_world_size=dp_degree,
             dp_rank=dp_rank,
             tokenizer=self.tokenizer,
             max_context_length=config.training.max_context_length,
             num_tokens_per_batch=num_tokens_per_batch,
+            snapshot_every_n_steps=snapshot_every_n_steps,
+            seed=config.debug.seed,
         )
 
         # Dynamic data mixing: reweights the dataset mix over training and
