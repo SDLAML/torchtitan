@@ -246,6 +246,14 @@ class SelectiveAC(ActivationCheckpointing):
         )
 
         def _get_custom_policy():
+            mm_save_every = int(
+                os.environ.get("TORCHTITAN_SAC_SAVE_MM_FREQUENCY", "2")
+            )
+            if mm_save_every < 0:
+                raise ValueError(
+                    "TORCHTITAN_SAC_SAVE_MM_FREQUENCY must be >= 0, "
+                    f"got {mm_save_every}"
+                )
             meta = {"forward_mm_count": 0, "recompute_mm_count": 0}
 
             def wrapped_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
@@ -271,10 +279,19 @@ class SelectiveAC(ActivationCheckpointing):
                         return CheckpointPolicy.PREFER_RECOMPUTE
                     meta[mm_count_key] += 1
 
-                # Save all compute/comm ops, except every second mm/linear.
+                # Save all compute/comm ops, except the mm/linear ops the save
+                # frequency skips. TORCHTITAN_SAC_SAVE_MM_FREQUENCY tunes the
+                # memory/compute trade-off: the default 2 keeps upstream's
+                # "save every other mm", 0 recomputes every mm (most memory
+                # saved), 1 saves all of them.
                 if func in save_ops:
-                    if func in mm_ops and meta[mm_count_key] % 2 == 0:
-                        return CheckpointPolicy.PREFER_RECOMPUTE
+                    if func in mm_ops:
+                        save_mm = (
+                            mm_save_every != 0
+                            and meta[mm_count_key] % mm_save_every == 1
+                        )
+                        if not save_mm:
+                            return CheckpointPolicy.PREFER_RECOMPUTE
                     return CheckpointPolicy.MUST_SAVE
                 return CheckpointPolicy.PREFER_RECOMPUTE
 
