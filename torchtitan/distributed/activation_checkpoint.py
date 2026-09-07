@@ -207,6 +207,31 @@ class SelectiveAC(ActivationCheckpointing):
         ANY mm with shape matching (*, in) x (in, out) will be force recomputed.
         """
 
+        mm_save_frequency: int = 2
+        """How often a matmul output is saved rather than recomputed: save one
+        in every N. 2 is upstream's "save every other matmul"; 1 saves all of
+        them (most memory, least recompute); 0 recomputes all of them (least
+        memory, most recompute).
+
+        ``TORCHTITAN_SAC_SAVE_MM_FREQUENCY`` overrides this when set, so existing
+        launch scripts keep working.
+        """
+
+        mm_save_frequency_ops: list[str] = field(
+            default_factory=lambda: ["mm", "mm_dtype", "linear"]
+        )
+        """Which matmul-like ops ``mm_save_frequency`` governs. Anything not
+        listed here is saved whenever it is in the save set, unconditionally.
+
+        Valid entries: "mm" (aten.mm.default), "mm_dtype" (aten.mm.dtype),
+        "linear" (aten.linear.default). Most backends decompose aten.linear into
+        aten.mm, but some register it as a leaf, which is why it is separable.
+
+        llm-0.4.0 gated only aten.mm.default; set this to ["mm"] to reproduce
+        that exactly. The choice is numerically neutral -- recompute is exact --
+        so it only moves the memory/compute trade-off.
+        """
+
     def get_save_ops(self) -> set:
         """Returns the set of ops whose activations should be saved. Override
         to customize the save set."""
@@ -239,21 +264,41 @@ class SelectiveAC(ActivationCheckpointing):
 
         # Some backends (e.g. PrivateUse1) register aten.linear as a leaf op
         # instead of decomposing it into aten.mm, so we must handle both.
-        mm_ops = (
-            torch.ops.aten.mm.default,
-            torch.ops.aten.mm.dtype,
-            torch.ops.aten.linear.default,
+        # `mm_ops` is what the matmul counter advances on; `gated_mm_ops` is the
+        # subset the save frequency actually governs (see mm_save_frequency_ops).
+        _MM_OP_BY_NAME = {
+            "mm": torch.ops.aten.mm.default,
+            "mm_dtype": torch.ops.aten.mm.dtype,
+            "linear": torch.ops.aten.linear.default,
+        }
+        mm_ops = tuple(_MM_OP_BY_NAME.values())
+        unknown = set(config.mm_save_frequency_ops) - set(_MM_OP_BY_NAME)
+        if unknown:
+            raise ValueError(
+                f"Unknown entries in activation_checkpoint.mm_save_frequency_ops: "
+                f"{sorted(unknown)}. Valid: {sorted(_MM_OP_BY_NAME)}."
+            )
+        gated_mm_ops = tuple(
+            _MM_OP_BY_NAME[name] for name in config.mm_save_frequency_ops
         )
 
-        def _get_custom_policy():
-            mm_save_every = int(
-                os.environ.get("TORCHTITAN_SAC_SAVE_MM_FREQUENCY", "2")
+        # Resolved here rather than inside _get_custom_policy so a bad value is
+        # rejected when the model is wrapped, not on the first forward. The env
+        # var stays authoritative so launch scripts that export it keep working
+        # without editing their configs.
+        mm_save_every = int(
+            os.environ.get(
+                "TORCHTITAN_SAC_SAVE_MM_FREQUENCY", config.mm_save_frequency
             )
-            if mm_save_every < 0:
-                raise ValueError(
-                    "TORCHTITAN_SAC_SAVE_MM_FREQUENCY must be >= 0, "
-                    f"got {mm_save_every}"
-                )
+        )
+        if mm_save_every < 0:
+            raise ValueError(
+                "activation_checkpoint.mm_save_frequency (or "
+                "TORCHTITAN_SAC_SAVE_MM_FREQUENCY) must be >= 0, "
+                f"got {mm_save_every}"
+            )
+
+        def _get_custom_policy():
             meta = {"forward_mm_count": 0, "recompute_mm_count": 0}
 
             def wrapped_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
@@ -296,7 +341,7 @@ class SelectiveAC(ActivationCheckpointing):
                 # shifts the memory/speed trade-off. At frequency 0 it saves
                 # strictly less than 0.4.0 did.
                 if func in save_ops:
-                    if func in mm_ops:
+                    if func in gated_mm_ops:
                         save_mm = (
                             mm_save_every != 0
                             and meta[mm_count_key] % mm_save_every == 1
