@@ -8,11 +8,8 @@ from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.optimizers.container import OptimizersContainer
-from torchtitan.config.configs import (
-    ActivationCheckpointConfig,
-    ParallelismConfig,
-    TrainingConfig,
-)
+from torchtitan.config.configs import ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 
 from torchtitan.experiments.sft.auto_tokenizer import HuggingFaceAutoTokenizer
 from torchtitan.experiments.sft.configs import SFTTrainerConfig

@@ -1022,6 +1022,12 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         infinite: bool = True
         """Whether to loop the dataset indefinitely"""
 
+        repeat: bool = True
+        """Upstream's name for the same thing. Validator.__init__ does
+        ``replace(config.dataloader, repeat=...)`` to make a finite pass over
+        held-out data, so this field has to exist; it is ANDed with
+        ``infinite``."""
+
         dataset: list[str] = field(default_factory=lambda: ["c4_test"])
         """Dataset to use"""
 
@@ -1157,7 +1163,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         dataset_files = _coerce_to_list(config.dataset_files)
         dataset_split = _coerce_to_list(config.dataset_split)
         dataset_key = config.dataset_key
-        infinite = config.infinite
+        infinite = config.infinite and config.repeat
 
         normed_list_length = len(dataset_name)
         dataset_alias = _normalize_list(dataset_alias, normed_list_length)

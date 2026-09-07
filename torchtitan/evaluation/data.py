@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, get_worker_info, IterableDataset
 
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.evaluation.config import EvaluationConfigError
-from torchtitan.hf_datasets.text_datasets import (
+from torchtitan.hf_datasets.mixed_text_datasets import (
     _coerce_to_list,
     _normalize_list,
     _prepared_data_files,

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
 
 from torchtitan.config.configs import ParallelismConfig
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.hf_datasets.mixed_text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.trainer import Trainer
 

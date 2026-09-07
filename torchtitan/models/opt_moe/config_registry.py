@@ -8,6 +8,7 @@ from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.loss import MoEAuxLoss
 from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.components.validate import Validator
 from torchtitan.optimizers.container import OptimizersContainer
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
@@ -29,6 +30,15 @@ def moe_template_config() -> Trainer.Config:
         # adds the auxiliary term straight-through.
         loss=MoEAuxLoss.Config(),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=20),
+        # The validator defaults to the grain loader; point it at the same
+        # torchdata-backed loader the training path uses so held-out configs
+        # can set the same dataset_* fields.
+        validator=Validator.Config(
+            dataloader=HuggingFaceTextDataLoader.Config(
+                dataset="simple_custom",
+                pack_strategy="best_fit",
+            ),
+        ),
         training=TrainingConfig(
             local_batch_size=4,
             seq_len=4096,

@@ -37,7 +37,7 @@ from torchtitan.evaluation.runtime import (
     result_row,
     upsert_result,
 )
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.hf_datasets.mixed_text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.llama3.config_registry import llama3_debugmodel
 
 
