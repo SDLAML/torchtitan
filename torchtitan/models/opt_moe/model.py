@@ -322,7 +322,10 @@ class OPTMoEModel(Decoder):
                     sliding_window_size=swa_window if use_swa[layer_id] else -1,
                     # SWA requires FlexAttention; non-SWA keeps the configured backend.
                     attn_backend=attn_backend,
-                    rope=layer_rope if use_rope[layer_id] else None,
+                    # Always stamped: GQAttention requires a rope config to
+                    # build. NoPE layers drop the module in the attention's
+                    # __init__ once use_rope is known, so no cache is retained.
+                    rope=layer_rope,
                     residual_div=residual_div_attn,
                 )
                 attn_cfg.inner_attention = attn_cfg.build_inner_attention()

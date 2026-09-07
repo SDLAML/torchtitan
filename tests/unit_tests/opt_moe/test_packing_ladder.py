@@ -44,7 +44,7 @@ N_LAYERS = 2
 SWA_WINDOW = 32
 
 
-def build(*, moe: bool, swa: bool, doc_mask: bool, seq_len: int = SEQ):
+def build(*, moe: bool, swa: bool, doc_mask: bool, fuse_qkv: bool = False, seq_len: int = SEQ):
     """Smallest model exercising one rung of the ladder."""
     attention = GatedNormSWAttention.Config(
         n_heads=2,
@@ -55,6 +55,7 @@ def build(*, moe: bool, swa: bool, doc_mask: bool, seq_len: int = SEQ):
         sliding_window_size=SWA_WINDOW if swa else -1,
         attn_backend="flex",
         attn_mask_type="block_causal" if doc_mask else "causal",
+        fuse_qkv=fuse_qkv,
     )
     layer = OPTMoETransformerBlock.Config(
         n_dense_layers=0 if moe else N_LAYERS,
@@ -168,6 +169,26 @@ def main() -> int:
         print(f"{'':<44}   rel={pack_d/pack_s:.1e}      rel={rope_d/rope_s:.1e}")
         del model
         torch.cuda.empty_cache()
+
+    # Fused QKV must be a pure throughput switch: upstream's
+    # _fused_qkv_param_init reproduces the exact draws the split wq/wk/wv make,
+    # so with the same seed both must produce identical outputs.
+    print()
+    torch.manual_seed(7)
+    split, _ = build(moe=True, swa=True, doc_mask=True, fuse_qkv=False)
+    torch.manual_seed(7)
+    fused, _ = build(moe=True, swa=True, doc_mask=True, fuse_qkv=True)
+    toks = torch.randint(10, 200, (64,), device="cuda")
+    pos = _document_positions(toks.unsqueeze(0).cpu(), EOS).cuda()
+    masks = split.get_attention_masks(positions=pos)
+    a = _forward(split, toks, pos, masks)
+    b = _forward(fused, toks, pos, masks)
+    d = (a - b).abs().max().item()
+    fuse_ok = d < 2e-3 * a.abs().max().item()
+    failures += not fuse_ok
+    print(f"fused vs split QKV (same seed): {'OK' if fuse_ok else 'FAIL'}  max|d|={d:.2e}")
+    del split, fused
+    torch.cuda.empty_cache()
 
     print()
     print("expected: packing holds WITH the document mask, and is violated without it;")
