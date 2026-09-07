@@ -54,6 +54,23 @@ def moe_template_config() -> Trainer.Config:
         activation_checkpoint=SelectiveAC.Config(),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
+            # OPT MoE runs on the partial_dtensor backend, not spmd_types.
+            #
+            # Under spmd_types, apply_fsdp_to_decoder passes dp_mesh_dims and
+            # then requires every parameter to already be a DTensor produced by
+            # Module.parallelize -- which only converts modules carrying a
+            # ShardingConfig. OPT MoE's attention and MoE are custom modules
+            # with no sharding plan (see models/opt_moe/sharding.py), and its
+            # grouped expert weights are raw nn.Parameters on GroupedExperts
+            # rather than configurable sub-modules, so they stay plain tensors
+            # and FSDP rejects them.
+            #
+            # partial_dtensor takes the FSDP path that accepts plain tensors,
+            # which is correct for the FSDP/HSDP configurations OPT MoE
+            # supports today. Upstream intends to remove this backend
+            # eventually; the fix is to give every OPT MoE module a
+            # ShardingConfig, which is the same work that unlocks TP/EP.
+            spmd_backend="partial_dtensor",
         ),
         # scripts/checkpoint_conversion/convert_to_hf.py reconstructs the model
         # spec from this file, so opt_moe runs always write it.
