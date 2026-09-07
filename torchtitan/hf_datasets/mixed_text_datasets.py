@@ -982,25 +982,61 @@ def _resolve_dataset_aliases(dataset_aliases: list[str | None]) -> list[str]:
     ]
 
 
+def _document_positions(inputs: torch.Tensor, eos_id: "int | None") -> torch.Tensor:
+    """Per-token positions that reset to 0 at each packed-document boundary.
+
+    ``positions`` is how the flex document mask learns where documents start:
+    ``get_efficient_causal_mask_mod_for_packed_document`` treats every
+    ``positions == 0`` as a document start. Greedy packing concatenates several
+    eos-separated documents into one fixed-length sequence, so resetting only at
+    sequence boundaries would let tokens attend across documents -- which is what
+    ``attn_mask_type="block_causal"`` exists to prevent.
+
+    Matches the pre-0.5.0 ``get_document_mask_mod(batch, eos_id)`` convention:
+    the eos token belongs to the document it terminates, and the *next* token
+    begins a new one.
+
+    Args:
+        inputs: Token ids, shape ``[B, S]``.
+        eos_id: Document separator. ``None`` treats each row as one document.
+
+    Returns:
+        Flattened positions, shape ``[B * S]``.
+    """
+    batch_size, seq_len = inputs.shape
+    if eos_id is None:
+        return torch.arange(seq_len, dtype=torch.int64).repeat(batch_size)
+
+    # A document starts at the row start, and after every eos.
+    starts = torch.zeros_like(inputs, dtype=torch.bool)
+    starts[:, 0] = True
+    starts[:, 1:] = inputs[:, :-1] == eos_id
+
+    token_idx = torch.arange(seq_len, dtype=torch.int64).expand(batch_size, seq_len)
+    # cummax carries the most recent document-start index forward.
+    doc_start_idx = torch.where(starts, token_idx, torch.zeros_like(token_idx))
+    doc_start_idx = doc_start_idx.cummax(dim=1).values
+    return (token_idx - doc_start_idx).reshape(-1)
+
+
 def _flat_collate(
     samples: "list[tuple[dict[str, Any], Any]]",
+    *,
+    eos_id: "int | None" = None,
 ) -> "tuple[dict[str, Any], torch.Tensor]":
     """Collate ``local_batch_size`` sequences into one token-flat batch.
 
-    Upstream models take a single packed ``[T]`` token stream with a
-    ``positions`` vector rather than a ``[B, S]`` rectangle. Stacking the B
-    sequences and flattening, with ``positions`` restarting at 0 for each one,
-    reproduces the old ``[B, S]`` semantics exactly: the flex document mask is
-    built from ``positions``, so a restart marks a document boundary and the
-    result is block-diagonal causal -- the same attention pattern each row had
-    when it was its own batch element.
+    Upstream models take a single packed ``[T]`` token stream plus a
+    ``positions`` vector rather than a ``[B, S]`` rectangle. Positions carry the
+    document structure that the ``[B, S]`` layout used to carry implicitly, so
+    they reset per packed document (see ``_document_positions``), not merely per
+    sequence.
     """
     inputs = torch.stack(
         [torch.as_tensor(sample[0]["input"]) for sample in samples]
     )
     labels = torch.stack([torch.as_tensor(sample[1]) for sample in samples])
-    batch_size, seq_len = inputs.shape
-    positions = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size)
+    positions = _document_positions(inputs, eos_id)
     return {
         "input": inputs.reshape(-1),
         "positions": positions,
@@ -1322,7 +1358,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             "batch_size": local_batch_size,
             "generator": rng,
             "snapshot_every_n_steps": snapshot_every_n_steps,
-            "collate_fn": _flat_collate,
+            "collate_fn": partial(_flat_collate, eos_id=tokenizer.eos_id),
         }
 
         super().__init__(
