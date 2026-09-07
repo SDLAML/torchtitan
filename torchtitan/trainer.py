@@ -991,7 +991,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.optimizers.zero_grad(set_to_none=self.config.training.disable_cuda_graphs)
         # Save per-optimizer-group learning rates for logging
         lr_metrics = self.lr_schedulers.get_metrics()
-        should_log = self.metrics_processor.should_log(self.step)
+        # Always log the final step even when it does not land on a log_freq
+        # boundary, so a run ends with a metrics point (and, when norm logging
+        # is on, a final spectrum snapshot) rather than possibly missing it.
+        # This has to be decided here, not at the log site: the loss is only
+        # accumulated when should_log is true.
+        should_log = (
+            self.metrics_processor.should_log(self.step)
+            or self.step == self.config.training.steps
+        )
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
@@ -1125,10 +1133,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             # on the very last training step even if it does not land on a
             # log_norm_freq boundary, so the run ends with a final spectrum
             # snapshot rather than possibly missing it.
-            is_last_training_step = self.step == self.config.training.steps
             log_norm_freq = self.config.metrics.log_norm_freq
             need_to_calculate_norm = log_norm_freq > 0 and (
-                is_last_training_step
+                self.step == self.config.training.steps
                 or (should_log and (self.step == 1 or self.step % log_norm_freq == 0))
             )
             if need_to_calculate_norm and hasattr(
