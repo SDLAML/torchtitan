@@ -17,6 +17,8 @@ from torchtitan.models.common.attention import (
     ScaledDotProductAttention,
     VarlenAttention,
 )
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.rope import CosSinRoPE, RoPE
 from torchtitan.protocols.module import Module
 from .utils.inits import make_param_init
@@ -140,11 +142,12 @@ class GatedNormSWAttention(BaseAttention):
         ], f"mid_norm_position ({self.mid_norm_position}) must be either 'after' or 'before'"
         self.head_wise_mid_norm = config.head_wise_mid_norm
 
-        self.q_norm = nn.Identity()
-        self.k_norm = nn.Identity()
-        self.v_norm = nn.Identity()
-        self.mid_norm = nn.Identity()
-        self.gate_proj = nn.Identity()
+        identity = Identity.Config()
+        self.q_norm = identity.build()
+        self.k_norm = identity.build()
+        self.v_norm = identity.build()
+        self.mid_norm = identity.build()
+        self.gate_proj = identity.build()
 
         build_attention_norm = partial(
             build_norm, norm_type=config.norm_type, eps=config.norm_eps
@@ -161,20 +164,57 @@ class GatedNormSWAttention(BaseAttention):
             else:
                 self.mid_norm = build_attention_norm(dim=self.head_dim)
 
+        gate_init = {
+            "weight": make_param_init(
+                config.w_gate_init_fn_type, config.w_gate_init_std, config.residual_div
+            )
+        }
         if self.gated_attention_type == "head-wise":
             # G1-style: one gate per attention head.
-            self.gate_proj = nn.Linear(dim, self.n_heads, bias=False)
+            self.gate_proj = Linear.Config(
+                in_features=dim, out_features=self.n_heads, param_init=gate_init
+            ).build()
         elif self.gated_attention_type == "element-wise":
             # Dense gate over the full attention output channel dimension.
-            self.gate_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
+            self.gate_proj = Linear.Config(
+                in_features=dim,
+                out_features=self.n_heads * self.head_dim,
+                param_init=gate_init,
+            ).build()
 
         # Scaling factor (needed when head_dim differs from dim // n_heads)
         self.scaling = self.head_dim**-0.5 if config.head_dim is not None else None
 
-        self.wq = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
+        self.wq = Linear.Config(
+            in_features=dim,
+            out_features=self.n_heads * self.head_dim,
+            param_init={
+                "weight": make_param_init(config.wq_init_fn_type, config.wq_init_std)
+            },
+        ).build()
+        self.wk = Linear.Config(
+            in_features=dim,
+            out_features=self.n_kv_heads * self.head_dim,
+            param_init={
+                "weight": make_param_init(config.wk_init_fn_type, config.wk_init_std)
+            },
+        ).build()
+        self.wv = Linear.Config(
+            in_features=dim,
+            out_features=self.n_kv_heads * self.head_dim,
+            param_init={
+                "weight": make_param_init(config.wv_init_fn_type, config.wv_init_std)
+            },
+        ).build()
+        self.wo = Linear.Config(
+            in_features=self.n_heads * self.head_dim,
+            out_features=dim,
+            param_init={
+                "weight": make_param_init(
+                    config.wo_init_fn_type, config.wo_init_std, config.residual_div
+                )
+            },
+        ).build()
 
         self.attn_backend = config.attn_backend
         self.inner_attention = config.inner_attention.build()
@@ -189,38 +229,6 @@ class GatedNormSWAttention(BaseAttention):
                 "expansion assigns the global or SWA-local cache per layer."
             )
             self.rope = config.rope.build()
-
-        self._param_init = self._build_param_init()
-
-    def _build_param_init(self) -> dict:
-        """Per-parameter initializers, replacing the old init_weights cascade.
-
-        ``residual_div`` is baked in here rather than passed at call time: the
-        upstream ``Module`` contract initializes each parameter through a
-        single-argument callable looked up by name.
-        """
-        cfg = self.config
-        param_init = {
-            "wq.weight": make_param_init(cfg.wq_init_fn_type, cfg.wq_init_std),
-            "wk.weight": make_param_init(cfg.wk_init_fn_type, cfg.wk_init_std),
-            "wv.weight": make_param_init(cfg.wv_init_fn_type, cfg.wv_init_std),
-            "wo.weight": make_param_init(
-                cfg.wo_init_fn_type, cfg.wo_init_std, cfg.residual_div
-            ),
-        }
-        if self.gated_attention_type is not None:
-            param_init["gate_proj.weight"] = make_param_init(
-                cfg.w_gate_init_fn_type, cfg.w_gate_init_std, cfg.residual_div
-            )
-        return param_init
-
-    def _init_self_parameters(self) -> None:
-        # wq/wk/wv/wo/gate_proj are direct children (nn.Linear), so their
-        # weights are not "own" parameters of this module; drive them here.
-        for name, param in self.named_parameters(recurse=True):
-            init_fn = self._param_init.get(name)
-            if init_fn is not None:
-                init_fn(param)
 
     def _apply_rope(
         self,

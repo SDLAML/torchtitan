@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 from torch import nn
 
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.nn_modules import Identity
 from torchtitan.protocols.module import Module
 from .utils.activations import build_activation
 
@@ -53,9 +55,34 @@ class FeedForward(Module):
             "FeedForward.Config.dim must be stamped by the model's config "
             "expansion before build()."
         )
-        self.w1 = nn.Linear(dim, config.hidden_dim, bias=False)
-        self.w2 = nn.Linear(config.hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, config.hidden_dim, bias=False)
+        # Configurable Linear rather than nn.Linear: every submodule has to
+        # satisfy the Module protocol, and param_init then lives on the config.
+        w3_residual_div = config.residual_div if config.init_gate_as_residual else 1.0
+        self.w1 = Linear.Config(
+            in_features=dim,
+            out_features=config.hidden_dim,
+            param_init={
+                "weight": make_param_init(config.w1_init_fn_type, config.w1_init_std)
+            },
+        ).build()
+        self.w2 = Linear.Config(
+            in_features=config.hidden_dim,
+            out_features=dim,
+            param_init={
+                "weight": make_param_init(
+                    config.w2_init_fn_type, config.w2_init_std, config.residual_div
+                )
+            },
+        ).build()
+        self.w3 = Linear.Config(
+            in_features=dim,
+            out_features=config.hidden_dim,
+            param_init={
+                "weight": make_param_init(
+                    config.w3_init_fn_type, config.w3_init_std, w3_residual_div
+                )
+            },
+        ).build()
         self.act_fn = build_activation(config.activation_type)
 
         if config.norm_everywhere:
@@ -63,29 +90,7 @@ class FeedForward(Module):
                 config.norm_type, dim=config.hidden_dim, eps=config.norm_eps
             )
         else:
-            self.mid_norm = nn.Identity()
-
-        self._param_init = self._build_param_init()
+            self.mid_norm = Identity.Config().build()
 
     def forward(self, x):
         return self.w2(self.mid_norm(self.act_fn(self.w1(x)) * self.w3(x)))
-
-    def _build_param_init(self) -> dict:
-        """Per-parameter initializers, replacing the old init_weights cascade."""
-        cfg = self.config
-        w3_residual_div = cfg.residual_div if cfg.init_gate_as_residual else 1.0
-        return {
-            "w1.weight": make_param_init(cfg.w1_init_fn_type, cfg.w1_init_std),
-            "w2.weight": make_param_init(
-                cfg.w2_init_fn_type, cfg.w2_init_std, cfg.residual_div
-            ),
-            "w3.weight": make_param_init(
-                cfg.w3_init_fn_type, cfg.w3_init_std, w3_residual_div
-            ),
-        }
-
-    def _init_self_parameters(self) -> None:
-        for name, param in self.named_parameters(recurse=True):
-            init_fn = self._param_init.get(name)
-            if init_fn is not None:
-                init_fn(param)

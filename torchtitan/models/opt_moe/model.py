@@ -23,6 +23,7 @@ from torchtitan.models.common.attention import (
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import (
     get_nparams_and_active_nparams,
@@ -474,7 +475,7 @@ class OPTMoEModel(Decoder):
                 config.norm_type, config.dim, config.norm_eps
             ).build()
         else:
-            self.embeddings_norm = nn.Identity()
+            self.embeddings_norm = Identity.Config().build()
 
     def forward(
         self,

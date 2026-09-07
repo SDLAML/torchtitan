@@ -13,6 +13,8 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 
 from torchtitan.ops.scatter_add import deterministic_scatter_add
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.nn_modules import Identity
 from torchtitan.protocols.module import Module
 
 from torchtitan.tools.logging import logger
@@ -87,7 +89,7 @@ def _run_experts_grouped_mm(
     return out
 
 
-class GroupedExperts(nn.Module):
+class GroupedExperts(Module):
     def __init__(
         self,
         *,
@@ -122,7 +124,7 @@ class GroupedExperts(nn.Module):
             )
             self.mid_norm = build_norm(norm_type, dim=hidden_dim, eps=norm_eps)
         else:
-            self.mid_norm = nn.Identity()
+            self.mid_norm = Identity.Config().build()
 
     def __repr__(self):
         model_str = f"GroupedExperts(dim={self.dim}, hidden_dim={self.hidden_dim},\n"
@@ -255,7 +257,7 @@ def init_all_experts_different(init_fn, w, init_std, slot, layer_id):
         w.copy_(local_tensor)
 
 
-class TokenChoiceTopKRouter(nn.Module):
+class TokenChoiceTopKRouter(Module):
     def __init__(
         self,
         dim: int,
@@ -267,7 +269,7 @@ class TokenChoiceTopKRouter(nn.Module):
     ):
         super().__init__()
 
-        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.gate = Linear.Config(in_features=dim, out_features=num_experts).build()
         self.num_experts = num_experts
         self.top_k = top_k
         self.route_scale = route_scale
@@ -398,7 +400,7 @@ class TokenChoiceTopKRouter(nn.Module):
 
 # NOTE: the reason we make this a stateless module is to support
 #       expert_tensor_parallel_degree=1 with consistent TP/EP APIs.
-class TokenReorderer(nn.Module):
+class TokenReorderer(Module):
     """
     This module reorders token indices to match the order of experts, enabling
     efficient parallel processing of tokens by experts.
