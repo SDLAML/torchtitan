@@ -752,7 +752,10 @@ class MoE(Module):
                 # for logging only
                 self.load_balance_loss.add_(load_balance_loss.detach())
         else:
-            load_balance_loss = None
+            # A zero scalar rather than None: the block's return type then does
+            # not vary with config, which keeps the compiled graph's outputs
+            # type-stable.
+            load_balance_loss = x.new_zeros(())
 
         # ====
 

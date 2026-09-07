@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
+from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.optimizers.container import OptimizersContainer
 from torchtitan.config import Configurable
 
@@ -27,8 +28,22 @@ class _EMAParamOptimizer(Optimizer):
     ``enable`` only controls whether the EMA tensor is allocated.
     """
 
-    def __init__(self, params: list[nn.Parameter], *, enable: bool) -> None:
-        super().__init__(params, defaults={})
+    def __init__(
+        self,
+        params: list[nn.Parameter],
+        *,
+        enable: bool,
+        param_names: list[str] | None = None,
+    ) -> None:
+        # `param_names` on the group is what lets the checkpoint utilities
+        # re-key optimizer state by FQN; without it, saving raises
+        # "Optimizer must be built with (name, param) tuples".
+        if param_names is not None:
+            super().__init__(
+                [{"params": params, "param_names": param_names}], defaults={}
+            )
+        else:
+            super().__init__(params, defaults={})
         if enable:
             for group in self.param_groups:
                 for p in group["params"]:
@@ -104,8 +119,14 @@ class EMAOptimizersContainer(OptimizersContainer):
         self.optimizers: list[_EMAParamOptimizer] = []
         all_params: list[nn.Parameter] = []
         for model in model_parts:
-            params = [p for p in model.parameters() if p.requires_grad]
-            self.optimizers.append(_EMAParamOptimizer(params, enable=self.enable))
+            named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+            params = [p for _, p in named]
+            param_names = [canonical_fqn(n) for n, _ in named]
+            self.optimizers.append(
+                _EMAParamOptimizer(
+                    params, enable=self.enable, param_names=param_names
+                )
+            )
             all_params.extend(params)
         self._validate_length(len(self.model_parts))
         self._post_init(all_params, {})
