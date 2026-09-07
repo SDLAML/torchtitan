@@ -1294,7 +1294,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             self.sdc_replayer.reset_schedule()
 
     def close(self) -> None:
-        if hasattr(self, "dataloader") and self.dataloader:
+        # `is not None`, not truthiness: DataLoader.__bool__ falls back to
+        # __len__, which raises TypeError for an IterableDataset with no
+        # length. That turns any error during training into a confusing
+        # "object of type X has no len()" from close().
+        if getattr(self, "dataloader", None) is not None:
             self.dataloader.close()
         if not self.config.training.disable_cuda_graphs:
             cudagraph_teardown()
