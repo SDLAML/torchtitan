@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.optimizers.container import OptimizersContainer
 from torchtitan.config import Configurable
 
 __all__ = ["EMAOptimizersContainer"]

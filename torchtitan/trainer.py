@@ -28,6 +28,9 @@ from torch.distributed.tensor import DTensor
 from torchtitan.components.checkpointer import BaseCheckpointManager, CheckpointManager
 from torchtitan.components.data.collators import TrainerBatch
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
+from torchtitan.components.data_mix_scheduler import build_data_mix_scheduler
+from torchtitan.components.ema import EMAOptimizersContainer
+from torchtitan.optimizers import norm_helper
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer
@@ -99,6 +102,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
         lr_scheduler: LRSchedulersContainer.Config = field(
             default_factory=LRSchedulersContainer.Config
+        )
+        ema_weights: EMAOptimizersContainer.Config = field(
+            default_factory=EMAOptimizersContainer.Config
         )
         training: TrainingConfig = field(default_factory=TrainingConfig)
         parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
@@ -597,6 +603,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.metrics_processor.optimizers = self.optimizers
         self.metrics_processor.model_parts = self.model_parts
 
+        self._setup_norm_logging(config, parallel_dims)
+
+        # Online EMA of model weights (e.g. cheap mid-WSD-training eval without
+        # a full LR decay). Always built and the hook always registered;
+        # EMAOptimizersContainer no-ops internally when disabled.
+        self.ema_optimizer = config.ema_weights.build(model_parts=self.model_parts)
+        self.optimizers.register_step_post_hook(
+            lambda *args, **kwargs: self.ema_optimizer.step(self.step)
+        )
+
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
@@ -631,6 +647,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             tokenizer=self.tokenizer,
             max_context_length=config.training.max_context_length,
             num_tokens_per_batch=num_tokens_per_batch,
+        )
+
+        # Dynamic data mixing: reweights the dataset mix over training and
+        # reports per-dataset document/token counts. No upstream equivalent --
+        # grain's DatasetMixConfig fixes its weights at build time.
+        self.data_mix_scheduler = build_data_mix_scheduler(
+            self.dataloader,
+            getattr(config.dataloader, "data_mixing_scheduler_configs", None),
+            config.training.steps,
+        )
+        self.data_mix_scheduler.dump_mixing_configs(config.dump_folder)
+        self.data_mix_scheduler.step(0)
+        logger.info(
+            f"mixing weights at step 0: "
+            f"{self.data_mix_scheduler.get_log_dict_at_step(0)[0]}"
         )
 
         # build checkpointer
@@ -862,6 +893,93 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             return torch.sum(torch.stack(detached_losses)).to(self.device)
         return self._pp_loss_sentinel_on_non_last_stage
 
+    def _setup_norm_logging(self, config: "Trainer.Config", parallel_dims) -> None:
+        """Wire DiSCO's norm/spectrum/gram logging and the per-rank gate.
+
+        DiSCO may only skip the logging all_gather when the metrics side
+        genuinely gives EVERY shard rank a logger.
+
+        `save_all_shard_ranks` alone is not enough: it is applied inside
+        `_build_metric_logger` only after `should_log` is already true, and with
+        `save_for_all_ranks=False` that has been narrowed to a single global
+        rank. Enabling local mode on the raw flag would have every rank skip the
+        gather while only one rank owns a logger -- so that rank logs its own
+        1/N of the parameters and the rest are silently dropped.
+
+        It also has to be decided from config alone, identically on every rank:
+        the gather is a collective, so if some ranks skipped it and others did
+        not the job would hang rather than misreport.
+        """
+        if not hasattr(self.optimizers, "calculate_norm_at_next_step"):
+            # Upstream container: no DiSCO norm machinery to wire.
+            return
+
+        metrics_config = config.metrics
+        logging_on = bool(
+            metrics_config.enable_wandb or metrics_config.enable_tensorboard
+        )
+        if metrics_config.save_all_shard_ranks and not metrics_config.save_for_all_ranks:
+            raise ValueError(
+                "metrics.save_all_shard_ranks requires metrics.save_for_all_ranks. "
+                "Without it only one rank builds a logger, so skipping the "
+                "logging all_gather would silently drop every parameter owned by "
+                "the other shard ranks."
+            )
+        self.optimizers.log_metrics_locally = bool(
+            metrics_config.save_all_shard_ranks
+            and metrics_config.save_for_all_ranks
+            and logging_on
+        )
+        if self.optimizers.log_metrics_locally:
+            # The invariant that actually matters: every rank owning a distinct
+            # slice of the metrics must hold a logger to write it to. Both sides
+            # derive that from `rank_owns_metrics_shard`, so this is inert -- it
+            # exists to make a future divergence fail loudly at init instead of
+            # silently producing a partial dashboard, which is how the pure-DDP
+            # case went unnoticed.
+            owns_shard = dist_utils.rank_owns_metrics_shard(parallel_dims)
+            # `_build_metric_logger` returns a bare `BaseLogger` (a no-op with no
+            # `number_of_loggers`) on ranks that do not log, and a
+            # `LoggerContainer` on ranks that do -- so this must not assume the
+            # container type.
+            has_logger = getattr(self.metrics_processor.logger, "number_of_loggers", 0) > 0
+            # Only the direction that loses data is fatal: this rank owns a slice
+            # nobody else will log, and has nowhere to put it. The reverse (a
+            # logger with nothing to log) is harmless, and firing on it would turn
+            # a soft wandb failure into an init-time abort of the whole job.
+            if owns_shard and not has_logger:
+                raise RuntimeError(
+                    "per-rank metric logging would silently drop data on this "
+                    "rank: it owns a disjoint slice of the per-parameter metrics "
+                    "but has no logger to write them to. The optimizer's "
+                    "ownership split and metrics._build_metric_logger's rank "
+                    "predicate have diverged; both must come from "
+                    "distributed.utils.rank_owns_metrics_shard."
+                )
+            elif has_logger and not owns_shard:
+                logger.warning(
+                    "this rank has a metrics logger but owns no metrics shard; "
+                    "it will log global scalars only. Harmless, but it means the "
+                    "two rank predicates disagree."
+                )
+
+        self.optimizers.norms_to_log = norm_helper.get_norms_to_log(
+            config.metrics.norms_to_log
+        )
+        self.optimizers.gram_level = config.metrics.gram_level
+        # enable_plot/enable_export live on the optimizer config itself and are
+        # already set by its __init__; only export_dir depends on dump_folder.
+        self.optimizers.spectrum_logging_config = (
+            self.optimizers.spectrum_logging_config._replace(
+                export_dir=os.path.join(config.dump_folder, "spectrum_export")
+            )
+        )
+        self.optimizers.gram_vector_logging_config = (
+            self.optimizers.gram_vector_logging_config._replace(
+                export_dir=os.path.join(config.dump_folder, "gram_export")
+            )
+        )
+
     def train_step(self, data_iterator: Iterator[TrainerBatch]):
         self.optimizers.zero_grad(set_to_none=self.config.training.disable_cuda_graphs)
         # Save per-optimizer-group learning rates for logging
@@ -954,9 +1072,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     accumulated_loss.add_(detached_loss)
 
         with sl.log_trace_span("optim"):
+            # max_norm <= 0 disables clipping in this fork's configs. Passing
+            # it straight through would clip every gradient to zero, so use inf:
+            # the norm is still computed (for the finiteness check and metrics)
+            # but the scale factor clamps to 1.
+            max_norm = self.config.training.max_norm
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
-                self.config.training.max_norm,
+                max_norm if max_norm > 0 else float("inf"),
                 foreach=True,
                 pp_mesh=parallel_dims.get_optional_mesh("pp"),
                 ep_enabled=parallel_dims.ep_enabled,
@@ -991,8 +1114,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 f"step {self.step}. Stopping training before the optimizer update.",
             )
             self.checkpointer.maybe_wait_for_staging()
+            # Tell DiSCO to compute norms during the upcoming step(). Also do it
+            # on the very last training step even if it does not land on a
+            # log_norm_freq boundary, so the run ends with a final spectrum
+            # snapshot rather than possibly missing it.
+            is_last_training_step = self.step == self.config.training.steps
+            log_norm_freq = self.config.metrics.log_norm_freq
+            need_to_calculate_norm = log_norm_freq > 0 and (
+                is_last_training_step
+                or (should_log and (self.step == 1 or self.step % log_norm_freq == 0))
+            )
+            if need_to_calculate_norm and hasattr(
+                self.optimizers, "calculate_norm_at_next_step"
+            ):
+                self.optimizers.calculate_norm_at_next_step()
             self.optimizers.step()
             self.lr_schedulers.step()
+            self.data_mix_scheduler.step(self.step + 1)
 
         # log metrics
         if not should_log:
@@ -1036,6 +1174,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
         }
+        data_mix, data_docs, data_tokens = self.data_mix_scheduler.get_log_dict_at_step(
+            self.step
+        )
+        extra_metrics.update(data_mix)
+        extra_metrics.update({k: int(v) for k, v in data_docs.items()})
+        extra_metrics.update({k: int(v) for k, v in data_tokens.items()})
+
+        if need_to_calculate_norm and hasattr(self.optimizers, "get_parameter_norms"):
+            extra_metrics.update(self.optimizers.get_parameter_norms(step=self.step))
+        if hasattr(self.optimizers, "join_log_queue"):
+            # The MoE load-balancing hook reports router entropy / max-violation
+            # from a worker thread; drain it before reading the per-layer dicts.
+            self.optimizers.join_log_queue()
+        for model_part in self.model_parts:
+            layers = getattr(model_part, "layers", None)
+            if layers is None:
+                continue
+            for layer in layers.values():
+                moe = getattr(layer, "moe", None)
+                expert_metrics = getattr(moe, "_log_expert_metrics", None)
+                if expert_metrics:
+                    extra_metrics.update(expert_metrics)
         self.metrics_processor.log(
             self.step,
             global_avg_loss,

@@ -7,7 +7,7 @@
 import os
 import time
 from collections import namedtuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -16,6 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.utils import rank_owns_metrics_shard
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import Color, device_module, device_type, NoColor
@@ -296,6 +297,51 @@ class MetricsProcessor(Configurable):
         only stage that computes loss metrics.
         """
 
+        log_norm_freq: int = 0
+        """How often to log parameter-norm metrics, in iterations. 0 disables."""
+
+        norms_to_log: list[str] = field(default_factory=lambda: ["default"])
+        """
+        Which parameter norms to log. "all"/"everything" logs every available
+        norm; "default" logs rms_to_rms, l1_to_rms, rms_to_inf, supremum and
+        condition_number.
+        """
+
+        gram_level: int = 0
+        """
+        Level of Gram-based weight/momentum-geometry metrics (see
+        optimizers/gram_helper.py), on the same log_norm_freq cadence:
+        - 0: off (default, zero overhead)
+        - 1: cheap O(m^2) entrywise geometry
+        - 2: adds O(m^3) spectral metrics (cumulative)
+        - 3: adds whitened/generalised metrics (cumulative)
+        """
+
+        save_all_shard_ranks: bool = False
+        """
+        Whether every shard rank saves its own metrics instead of one rank
+        saving metrics gathered from all of them.
+
+        Logs on exactly the ranks that own a distinct slice of the metrics --
+        the mesh DiSCO partitions parameter ownership over is opened up, and
+        local rank 0 is required in every other mesh (see
+        distributed/utils.rank_owns_metrics_shard):
+
+          * with FSDP/EP: any fsdp rank, at dp_replicate rank 0 and tp rank 0.
+            Replicas hold bit-identical copies, so only one logs.
+          * pure DDP: ownership is spread over dp_replicate itself, so *every*
+            dp_replicate rank logs, at tp rank 0.
+
+        Each shard rank already computes exactly its own subset, so the union
+        across ranks equals what the single-rank path logs. This lets DiSCO skip
+        the logging all_gather and stops one rank building the metrics dict for
+        the whole model. The cost is one W&B run per shard rank.
+        """
+
+        save_first_dp_and_tp: bool = False
+        """Log only from local rank 0 of the loss mesh (dp_replicate x dp_shard
+        x cp) and tp rank 0."""
+
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
 
@@ -401,6 +447,19 @@ class MetricsProcessor(Configurable):
                 parallel_dims=parallel_dims, pp_schedule=pp_schedule
             )
             should_log = torch.distributed.get_rank() == metrics_rank
+        elif should_log and config.save_all_shard_ranks:
+            # Narrow "all ranks" to exactly the ranks that own a distinct slice
+            # of the per-parameter metrics. This must stay the same predicate
+            # DiSCO uses to decide who keeps metrics locally -- if the two
+            # disagree, ranks compute metrics with no logger to write them to
+            # and the data is silently dropped.
+            should_log = rank_owns_metrics_shard(parallel_dims)
+        elif should_log and config.save_first_dp_and_tp:
+            loss_mesh = parallel_dims.get_optional_mesh("loss")
+            tp_mesh = parallel_dims.get_optional_mesh("tp")
+            should_log = (loss_mesh is None or loss_mesh.get_local_rank() == 0) and (
+                tp_mesh is None or tp_mesh.get_local_rank() == 0
+            )
 
         logger.debug(
             f"Logging decision: has_logging_enabled={has_logging_enabled}, should_log={should_log}"
