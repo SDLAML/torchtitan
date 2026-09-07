@@ -326,3 +326,30 @@ def setup_residual_scale(residual_scale: str, n_layers: int):
             raise ValueError(f"Invalid residual_scale: {residual_scale}")
 
     return block_scale, identity_scale
+
+
+def make_param_init(
+    init_fn_type: str,
+    std: float,
+    residual_div: float = 1.0,
+) -> "functools.partial":
+    """Build a single-argument initializer for upstream's ``param_init`` dict.
+
+    ``Module._init_param`` calls ``self._param_init[name](param)`` with exactly
+    one positional argument, so the mean/std/residual-scaling that the old
+    ``init_weights(residual_div=...)`` cascade passed at call time has to be
+    bound here instead.
+
+    Args:
+        init_fn_type: Key into ``INIT_FN_MAP`` (e.g. ``"scaled_orthogonal"``).
+        std: Base standard deviation before depth scaling.
+        residual_div: Depth-init divisor from ``setup_depth_init``. Applied to
+            output projections so deeper residual branches start smaller.
+    """
+    init_fn = build_init_fn(init_fn_type)
+    return functools.partial(init_fn, mean=0.0, std=std / residual_div)
+
+
+def skip_init(param: "torch.nn.Parameter") -> None:
+    """No-op initializer, for weights restored from a checkpoint."""
+    return None

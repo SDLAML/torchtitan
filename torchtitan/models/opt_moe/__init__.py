@@ -6,10 +6,9 @@
 
 import copy
 
-from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.models.common import RoPE
+from torchtitan.models.common.rope import CosSinRoPE
 
 from torchtitan.protocols.model_spec import ModelSpec
 from .gated_norm_swattention import GatedNormSWAttention
@@ -29,11 +28,10 @@ moe_opt_moe_configs = {
     "dense-1B-Proxy-8layers-test": OPTMoEModel.Config(
         n_layers=8,
         dim=256,
-        rope_of_swa=RoPE.Config(
+        rope_of_swa=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=1000000.0,
-            backend="cos_sin",
         ),
         rope_pattern="NNRRRRNN",
         swa_pattern="SSSSFFFF",
@@ -56,11 +54,10 @@ moe_opt_moe_configs = {
                 gated_attention_type="head-wise",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "dense-1B-Proxy-8layers": OPTMoEModel.Config(
@@ -82,11 +79,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "dense-1B": OPTMoEModel.Config(
@@ -108,11 +104,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "bsc-1B-7B-opt-g": OPTMoEModel.Config(
@@ -142,11 +137,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "bsc-1B-7B-opt-g-proxy": OPTMoEModel.Config(
@@ -176,11 +170,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "bsc-1B-7B-opt-g-proxy-8layers": OPTMoEModel.Config(
@@ -210,11 +203,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "qwen30b-a3b-8layers": OPTMoEModel.Config(
@@ -239,11 +231,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "qwen30b-a3b": OPTMoEModel.Config(
@@ -273,11 +264,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "qwen35b-a3b": OPTMoEModel.Config(
@@ -307,11 +297,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     #
@@ -349,11 +338,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "mis-8b-proxy": OPTMoEModel.Config(
@@ -388,11 +376,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "mis-30b-a3b": OPTMoEModel.Config(
@@ -426,11 +413,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "mis-100b-a5b": OPTMoEModel.Config(
@@ -464,11 +450,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     #
@@ -492,11 +477,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     # ==== 0.4.0-model-architecture-ablation ====
@@ -519,11 +503,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope": OPTMoEModel.Config(
@@ -545,11 +528,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-qk-norm": OPTMoEModel.Config(
@@ -571,11 +553,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-gate": OPTMoEModel.Config(
@@ -598,11 +579,10 @@ moe_opt_moe_configs = {
                 gated_attention_type="element-wise",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-headwise-gate": OPTMoEModel.Config(
@@ -625,11 +605,10 @@ moe_opt_moe_configs = {
                 gated_attention_type="head-wise",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-headwise-gate-only": OPTMoEModel.Config(
@@ -653,11 +632,10 @@ moe_opt_moe_configs = {
                 gate_only=True,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-gate-only": OPTMoEModel.Config(
@@ -681,11 +659,10 @@ moe_opt_moe_configs = {
                 gate_only=True,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_128": OPTMoEModel.Config(
@@ -709,11 +686,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=128,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_128-block_causal": OPTMoEModel.Config(
@@ -739,11 +715,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_128_nope": OPTMoEModel.Config(
@@ -768,11 +743,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=128,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_128_nope-block_causal": OPTMoEModel.Config(
@@ -799,11 +773,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-swa_128-full_nope": OPTMoEModel.Config(
@@ -830,11 +803,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-half_rope-swa_128_nope": OPTMoEModel.Config(
@@ -860,11 +832,10 @@ moe_opt_moe_configs = {
                 qk_rope_dim=64,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_128-qk-norm": OPTMoEModel.Config(
@@ -888,11 +859,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=128,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_128-gate": OPTMoEModel.Config(
@@ -917,11 +887,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=128,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_128-headwise-gate": OPTMoEModel.Config(
@@ -946,11 +915,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=128,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_128-headwise-gate-only": OPTMoEModel.Config(
@@ -976,11 +944,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=128,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_128-headwise-norm-before": OPTMoEModel.Config(
@@ -1006,11 +973,10 @@ moe_opt_moe_configs = {
                 mid_norm_position="before",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_128-gate-only": OPTMoEModel.Config(
@@ -1036,11 +1002,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=128,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_512": OPTMoEModel.Config(
@@ -1064,11 +1029,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=512,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_512-qk-norm": OPTMoEModel.Config(
@@ -1092,11 +1056,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=512,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_512-gate": OPTMoEModel.Config(
@@ -1121,11 +1084,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=512,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_512-headwise-gate": OPTMoEModel.Config(
@@ -1150,11 +1112,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=512,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_512-headwise-gate-only": OPTMoEModel.Config(
@@ -1180,11 +1141,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=512,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_512-headwise-norm-before": OPTMoEModel.Config(
@@ -1210,11 +1170,10 @@ moe_opt_moe_configs = {
                 mid_norm_position="before",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_512-gate-only": OPTMoEModel.Config(
@@ -1240,11 +1199,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=512,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-partial_rope-swa_512-gate": OPTMoEModel.Config(
@@ -1270,11 +1228,10 @@ moe_opt_moe_configs = {
                 qk_rope_dim=32,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=32,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-nope-swa_512-gate": OPTMoEModel.Config(
@@ -1300,11 +1257,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=512,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-partial_rope-nope-swa_512-gate": OPTMoEModel.Config(
@@ -1331,11 +1287,10 @@ moe_opt_moe_configs = {
                 qk_rope_dim=32,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=32,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-half_partial_rope-nope-swa_512-gate": OPTMoEModel.Config(
@@ -1362,11 +1317,10 @@ moe_opt_moe_configs = {
                 qk_rope_dim=64,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_512_nope-block_causal": OPTMoEModel.Config(
@@ -1393,11 +1347,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-600M-full_rope-swa_512_nope-headwise-gate-only-block_causal": OPTMoEModel.Config(
@@ -1426,11 +1379,10 @@ moe_opt_moe_configs = {
                 gate_only=True,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-50M-64-layers-full_rope": OPTMoEModel.Config(
@@ -1454,11 +1406,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-50M-64-layers-full_rope-qk-norm": OPTMoEModel.Config(
@@ -1482,11 +1433,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-50M-64-layers-full_rope-elementwise-gate-only": OPTMoEModel.Config(
@@ -1512,11 +1462,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-50M-64-layers-full_nope-swa_128": OPTMoEModel.Config(
@@ -1543,11 +1492,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-50M-64-layers-full_nope-swa_128-qk-norm": OPTMoEModel.Config(
@@ -1574,11 +1522,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-50M-64-layers-full_nope-swa_128-elementwise-gate-only": OPTMoEModel.Config(
@@ -1607,11 +1554,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-50M-64-layers-full_nope-swa_512": OPTMoEModel.Config(
@@ -1638,11 +1584,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-50M-64-layers-full_nope-swa_512-qk-norm": OPTMoEModel.Config(
@@ -1669,11 +1614,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-50M-64-layers-full_nope-swa_512-elementwise-gate-only": OPTMoEModel.Config(
@@ -1702,11 +1646,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-3B-full_rope-swa_128_nope-block_causal": OPTMoEModel.Config(
@@ -1733,11 +1676,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M1-dense-1.5B-full_rope-swa_128_nope-block_causal": OPTMoEModel.Config(
@@ -1764,11 +1706,10 @@ moe_opt_moe_configs = {
                 attn_backend="flex",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M3-moe-600M-full_rope-proxy": OPTMoEModel.Config(
@@ -1798,11 +1739,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M3-moe-600M-full_rope": OPTMoEModel.Config(
@@ -1832,11 +1772,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M3-moe-600M-full_rope-swa_128_nope": OPTMoEModel.Config(
@@ -1869,11 +1808,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=128,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M3-moe-600M-full_rope-swa_512_nope": OPTMoEModel.Config(
@@ -1906,11 +1844,10 @@ moe_opt_moe_configs = {
                 sliding_window_size=512,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M3-moe-600M-full_rope-proxy-bias_sign_zero_mean": OPTMoEModel.Config(
@@ -1941,11 +1878,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M3-moe-600M-full_rope-proxy-bias_rms_zero_mean": OPTMoEModel.Config(
@@ -1976,11 +1912,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "M3-moe-600M-full_rope-proxy-bias_rms": OPTMoEModel.Config(
@@ -2011,11 +1946,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     # ======= RMNP  - standard models
@@ -2038,11 +1972,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d8-w256": OPTMoEModel.Config(
@@ -2064,11 +1997,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d12-w384": OPTMoEModel.Config(
@@ -2090,11 +2022,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     # d16-w512 is the default model
@@ -2117,11 +2048,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d20-w640": OPTMoEModel.Config(
@@ -2143,11 +2073,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d24-w768": OPTMoEModel.Config(
@@ -2169,11 +2098,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d8-w512": OPTMoEModel.Config(
@@ -2195,11 +2123,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d12-w512": OPTMoEModel.Config(
@@ -2221,11 +2148,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d20-w512": OPTMoEModel.Config(
@@ -2247,11 +2173,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d24-w512": OPTMoEModel.Config(
@@ -2273,11 +2198,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w256": OPTMoEModel.Config(
@@ -2299,11 +2223,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w384": OPTMoEModel.Config(
@@ -2325,11 +2248,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w640": OPTMoEModel.Config(
@@ -2351,11 +2273,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w768": OPTMoEModel.Config(
@@ -2377,11 +2298,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     # with v-norm
@@ -2405,11 +2325,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w384-vnorm": OPTMoEModel.Config(
@@ -2432,11 +2351,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w512-vnorm": OPTMoEModel.Config(
@@ -2459,11 +2377,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w640-vnorm": OPTMoEModel.Config(
@@ -2486,11 +2403,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w768-vnorm": OPTMoEModel.Config(
@@ -2513,11 +2429,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     # without qk-norm
@@ -2541,11 +2456,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w384-no-qk-norm": OPTMoEModel.Config(
@@ -2568,11 +2482,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w512-no-qk-norm": OPTMoEModel.Config(
@@ -2595,11 +2508,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w640-no-qk-norm": OPTMoEModel.Config(
@@ -2622,11 +2534,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w768-no-qk-norm": OPTMoEModel.Config(
@@ -2649,11 +2560,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     # head-dim-64
@@ -2676,11 +2586,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w384-head-dim-64": OPTMoEModel.Config(
@@ -2702,11 +2611,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w512-head-dim-64": OPTMoEModel.Config(
@@ -2728,11 +2636,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w640-head-dim-64": OPTMoEModel.Config(
@@ -2754,11 +2661,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w768-head-dim-64": OPTMoEModel.Config(
@@ -2780,11 +2686,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=64,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     # embedding-norms
@@ -2808,11 +2713,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w384-embeddings-norm": OPTMoEModel.Config(
@@ -2835,11 +2739,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w512-embeddings-norm": OPTMoEModel.Config(
@@ -2862,11 +2765,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w640-embeddings-norm": OPTMoEModel.Config(
@@ -2889,11 +2791,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w768-embeddings-norm": OPTMoEModel.Config(
@@ -2916,11 +2817,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     # norm-everywhere
@@ -2943,11 +2843,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w384-norm-everywhere": OPTMoEModel.Config(
@@ -2969,11 +2868,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w512-norm-everywhere": OPTMoEModel.Config(
@@ -2995,11 +2893,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w640-norm-everywhere": OPTMoEModel.Config(
@@ -3021,11 +2918,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w768-norm-everywhere": OPTMoEModel.Config(
@@ -3047,11 +2943,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     # qkvo-norm
@@ -3076,11 +2971,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w384-qkvo-norm": OPTMoEModel.Config(
@@ -3104,11 +2998,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w512-qkvo-norm": OPTMoEModel.Config(
@@ -3132,11 +3025,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w640-qkvo-norm": OPTMoEModel.Config(
@@ -3160,11 +3052,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w768-qkvo-norm": OPTMoEModel.Config(
@@ -3188,11 +3079,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     # qkvo-norm-head-wise
@@ -3218,11 +3108,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w384-qkvo-norm-head-wise": OPTMoEModel.Config(
@@ -3247,11 +3136,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w512-qkvo-norm-head-wise": OPTMoEModel.Config(
@@ -3276,11 +3164,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w640-qkvo-norm-head-wise": OPTMoEModel.Config(
@@ -3305,11 +3192,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w768-qkvo-norm-head-wise": OPTMoEModel.Config(
@@ -3334,11 +3220,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     # ffn-mid-norm
@@ -3361,11 +3246,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w384-ffn-mid-norm": OPTMoEModel.Config(
@@ -3387,11 +3271,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w512-ffn-mid-norm": OPTMoEModel.Config(
@@ -3413,11 +3296,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w640-ffn-mid-norm": OPTMoEModel.Config(
@@ -3439,11 +3321,10 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
     "gauge-d16-w768-ffn-mid-norm": OPTMoEModel.Config(
@@ -3465,24 +3346,24 @@ moe_opt_moe_configs = {
                 norm_eps=1e-30,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=128,
-            max_seq_len=4096,
+            max_context_length=4096,
             theta=10000.0,
-            backend="cos_sin",
         ),
     ),
 }
 
 
 def model_registry(flavor: str) -> ModelSpec:
+    model_config = copy.deepcopy(moe_opt_moe_configs[flavor])
     return ModelSpec(
         name="opt_moe",
         flavor=flavor,
-        model=copy.deepcopy(moe_opt_moe_configs[flavor]),
+        model=model_config,
+        max_context_length=model_config.rope.max_context_length,
         parallelize_fn=parallelize_opt_moe,
         pipelining_fn=pipeline_llm,
-        build_loss_fn=build_cross_entropy_loss,
         post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=OPTMoEStateDictAdapter,
         hf_assets_setup_fn=setup_hf.copy_and_overwrite_model_config,

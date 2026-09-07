@@ -5,36 +5,37 @@
 # LICENSE file in the root directory of this source tree.
 
 import numbers
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torchtitan.models.common.nn_modules import LayerNorm, RMSNorm
+from torchtitan.protocols.module import Module
 
-class SingleScaleRMSNorm(nn.Module):
+
+class SingleScaleRMSNorm(Module):
     """AKA SSNorm, from https://arxiv.org/abs/2506.19697."""
 
     __constants__ = ["normalized_shape", "eps"]
     normalized_shape: tuple[int, ...]
     eps: float | None
 
-    def __init__(
-        self,
-        normalized_shape: int | list[int] | torch.Size,
-        eps: float = 1e-6,
-        *,
-        device=None,
-        dtype=None,
-    ) -> None:
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        normalized_shape: int
+        eps: float = 1e-6
+
+    def __init__(self, config: Config) -> None:
         super().__init__()
+        normalized_shape = config.normalized_shape
         if isinstance(normalized_shape, numbers.Integral):
-            # mypy error: incompatible types in assignment
             normalized_shape = (normalized_shape,)  # type: ignore[assignment]
         self.normalized_shape = tuple(normalized_shape)  # type: ignore[arg-type]
-        self.eps = eps
+        self.eps = config.eps
 
-        self.ssnorm_scale = nn.Parameter(torch.empty((1,), device=device, dtype=dtype))
-        self.reset_parameters()
+        self.ssnorm_scale = nn.Parameter(torch.empty((1,), dtype=torch.float32))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = F.rms_norm(input, self.normalized_shape, eps=self.eps)
@@ -47,42 +48,44 @@ class SingleScaleRMSNorm(nn.Module):
         return f"normalized_shape={self.normalized_shape}, eps={self.eps}"
 
 
-NORM_LAYERS = {
-    "layernorm": lambda dim, eps: nn.LayerNorm(dim, eps=eps, bias=False),
-    "np_layernorm": lambda dim, eps: nn.LayerNorm(
-        dim,
-        eps=eps,
-        elementwise_affine=False,
-        bias=False,
+# Every OPT MoE norm type maps onto a configurable upstream module, so norms are
+# first-class ``Module``s: ``Module.parallelize`` can shard them and
+# ``init_states`` initializes them, neither of which worked when they were bare
+# ``nn.Module`` instances built by a lambda.
+NORM_CONFIGS = {
+    "layernorm": lambda dim, eps: LayerNorm.Config(normalized_shape=dim, eps=eps),
+    "np_layernorm": lambda dim, eps: LayerNorm.Config(
+        normalized_shape=dim, eps=eps, elementwise_affine=False
     ),
-    "rmsnorm": lambda dim, eps: nn.RMSNorm(dim, eps=eps),
-    "np_rmsnorm": lambda dim, eps: nn.RMSNorm(dim, eps=eps, elementwise_affine=False),
-    "ss_rmsnorm": lambda dim, eps: SingleScaleRMSNorm(
-        dim, eps=eps, dtype=torch.float32
+    "rmsnorm": lambda dim, eps: RMSNorm.Config(normalized_shape=dim, eps=eps),
+    "np_rmsnorm": lambda dim, eps: RMSNorm.Config(
+        normalized_shape=dim, eps=eps, elementwise_affine=False
+    ),
+    "ss_rmsnorm": lambda dim, eps: SingleScaleRMSNorm.Config(
+        normalized_shape=dim, eps=eps
     ),
 }
 
 
-def build_norm(norm_type: str, dim: int, eps: float = 1e-6):
-    """
-    Builds the specified normalization layer based on the norm_type.
+def build_norm_config(norm_type: str, dim: int, eps: float = 1e-6):
+    """Return the ``Module.Config`` for the requested norm type.
 
     Args:
-        norm_type (str): The type of normalization layer to build.
-            Supported types: layernorm, np_layernorm, rmsnorm, np_rmsnorm
-        dim (int): The dimension of the normalization layer.
-        eps (float, optional): The epsilon value for numerical stability. Defaults to 1e-6.
-
-    Returns:
-        The built normalization layer.
+        norm_type: One of ``layernorm``, ``np_layernorm``, ``rmsnorm``,
+            ``np_rmsnorm``, ``ss_rmsnorm``.
+        dim: Normalized dimension.
+        eps: Epsilon for numerical stability.
 
     Raises:
-        NotImplementedError: If an unknown norm_type is provided.
+        NotImplementedError: If an unknown ``norm_type`` is provided.
     """
-    norm_type = norm_type.lower()  # Normalize to lowercase
-
-    norm_layer_fn = NORM_LAYERS.get(norm_type)
-    if norm_layer_fn is not None:
-        return norm_layer_fn(dim, eps=eps)
-    else:
+    norm_config_fn = NORM_CONFIGS.get(norm_type.lower())
+    if norm_config_fn is None:
         raise NotImplementedError(f"Unknown norm_type: '{norm_type}'")
+    return norm_config_fn(dim, eps)
+
+
+def build_norm(norm_type: str, dim: int, eps: float = 1e-6):
+    """Build a norm module directly. Prefer ``build_norm_config`` where the
+    config tree is available, so the module participates in sharding."""
+    return build_norm_config(norm_type, dim, eps).build()

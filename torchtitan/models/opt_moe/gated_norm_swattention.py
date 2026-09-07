@@ -4,35 +4,40 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
-    FlexAttentionWrapper,
-    ScaledDotProductAttentionWrapper,
-    VarlenAttentionWrapper,
-    VarlenMetadata,
+    FlexAttention,
+    ScaledDotProductAttention,
+    VarlenAttention,
 )
-from torchtitan.models.common.rope import (
-    apply_rotary_emb_complex,
-    apply_rotary_emb_cos_sin,
-)
-from .utils.inits import build_init_fn
+from torchtitan.models.common.rope import CosSinRoPE, RoPE
+from torchtitan.protocols.module import Module
+from .utils.inits import make_param_init
 from .utils.norms import build_norm
 
 
 class GatedNormSWAttention(BaseAttention):
-    """Gated Norm Sliding Window Attention module shared across OPT MoE."""
+    """Gated Norm Sliding Window Attention module shared across OPT MoE.
+
+    Token-flat: inputs are ``[T, D]`` and Q/K/V are ``[T, H, K]``, matching
+    upstream's post-0.3 batch contract. There is no batch dimension; document
+    boundaries are carried by ``positions`` and by the flex ``BlockMask``.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseAttention.Config):
         n_heads: int
+        # ``dim`` used to arrive as a build kwarg from the block. Upstream builds
+        # every layer config with a bare ``build()``, so the model's config
+        # expansion stamps it onto each per-layer copy instead.
+        dim: int = 0
         n_kv_heads: int | None = None
         head_dim: int | None = None
         qk_norm: bool = False
@@ -54,8 +59,15 @@ class GatedNormSWAttention(BaseAttention):
         # Number of head dimensions to apply RoPE to.  None (default) means full
         # head_dim (standard RoPE).  Set to a smaller value for partial RoPE where
         # only the first qk_rope_dim dims are rotated and the rest pass through.
-        # rope.dim in the model config must equal qk_rope_dim when this is set.
         sliding_window_size: int = -1
+
+        # Filled in by OPTMoEModel.Config expansion from ``attn_backend`` and the
+        # model-level rope/rope_of_swa configs. Declared with defaults so the
+        # compact flavor registry in __init__.py does not have to spell them out.
+        inner_attention: Module.Config = field(
+            default_factory=ScaledDotProductAttention.Config
+        )
+        rope: RoPE.Config | None = None
 
         wq_init_fn_type: str = "scaled_orthogonal"
         wk_init_fn_type: str = "scaled_orthogonal"
@@ -69,9 +81,30 @@ class GatedNormSWAttention(BaseAttention):
         wo_init_std: float = 1.0
         w_gate_init_std: float = 1.0
 
-    def __init__(self, config: Config, *, dim: int):
+        # Depth-init divisor for the output projections, stamped per layer by the
+        # model's config expansion (was passed to init_weights(residual_div=...)).
+        residual_div: float = 1.0
+
+        def build_inner_attention(self) -> Module.Config:
+            """Map ``attn_backend`` onto an upstream inner-attention config."""
+            match self.attn_backend:
+                case "flex":
+                    return FlexAttention.Config()
+                case "varlen":
+                    return VarlenAttention.Config()
+                case "sdpa":
+                    return ScaledDotProductAttention.Config()
+                case _:
+                    raise ValueError(f"Unknown attention type: {self.attn_backend}")
+
+    def __init__(self, config: Config):
         super().__init__()
         self.config = config
+        dim = config.dim
+        assert dim > 0, (
+            "GatedNormSWAttention.Config.dim must be stamped by the model's "
+            "config expansion before build()."
+        )
         self.n_heads = config.n_heads
         self.n_kv_heads = (
             config.n_heads if config.n_kv_heads is None else config.n_kv_heads
@@ -89,13 +122,13 @@ class GatedNormSWAttention(BaseAttention):
         )
         self.enable_gqa = self.n_heads > self.n_kv_heads
         self.use_rope = config.use_rope
-        self.rope_backend = config.rope_backend
         self.qk_rope_dim: int = (
             config.qk_rope_dim if config.qk_rope_dim is not None else self.head_dim
         )
         assert (
             self.qk_rope_dim <= self.head_dim
         ), f"qk_rope_dim ({self.qk_rope_dim}) must be less than or equal to head_dim ({self.head_dim})"
+        self.partial_rope = self.qk_rope_dim != self.head_dim
 
         self.gated_attention_type = config.gated_attention_type
         self.gate_only = config.gate_only
@@ -144,167 +177,152 @@ class GatedNormSWAttention(BaseAttention):
         self.wo = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
 
         self.attn_backend = config.attn_backend
-        self.inner_attention: nn.Module
-        match self.attn_backend:
-            case "flex":
-                self.inner_attention = FlexAttentionWrapper()
-            case "varlen":
-                self.inner_attention = VarlenAttentionWrapper()
-            case "sdpa":
-                self.inner_attention = ScaledDotProductAttentionWrapper()
-            case _:
-                raise ValueError(f"Unknown attention type: {self.attn_backend}")
+        self.inner_attention = config.inner_attention.build()
+
+        # RoPE is now owned by the attention module (upstream removed freqs_cis
+        # from the block forward signature). For partial RoPE the cache is built
+        # at qk_rope_dim so only the leading slice is rotated.
+        self.rope: RoPE | None = None
+        if self.use_rope:
+            assert config.rope is not None, (
+                "use_rope=True requires a rope config; the model's config "
+                "expansion assigns the global or SWA-local cache per layer."
+            )
+            self.rope = config.rope.build()
+
+        self._param_init = self._build_param_init()
+
+    def _build_param_init(self) -> dict:
+        """Per-parameter initializers, replacing the old init_weights cascade.
+
+        ``residual_div`` is baked in here rather than passed at call time: the
+        upstream ``Module`` contract initializes each parameter through a
+        single-argument callable looked up by name.
+        """
+        cfg = self.config
+        param_init = {
+            "wq.weight": make_param_init(cfg.wq_init_fn_type, cfg.wq_init_std),
+            "wk.weight": make_param_init(cfg.wk_init_fn_type, cfg.wk_init_std),
+            "wv.weight": make_param_init(cfg.wv_init_fn_type, cfg.wv_init_std),
+            "wo.weight": make_param_init(
+                cfg.wo_init_fn_type, cfg.wo_init_std, cfg.residual_div
+            ),
+        }
+        if self.gated_attention_type is not None:
+            param_init["gate_proj.weight"] = make_param_init(
+                cfg.w_gate_init_fn_type, cfg.w_gate_init_std, cfg.residual_div
+            )
+        return param_init
+
+    def _init_self_parameters(self) -> None:
+        # wq/wk/wv/wo/gate_proj are direct children (nn.Linear), so their
+        # weights are not "own" parameters of this module; drive them here.
+        for name, param in self.named_parameters(recurse=True):
+            init_fn = self._param_init.get(name)
+            if init_fn is not None:
+                init_fn(param)
+
+    def _apply_rope(
+        self,
+        xq_THK: torch.Tensor,
+        xk_THK: torch.Tensor,
+        positions: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.rope is not None
+        if not self.partial_rope:
+            return self.rope(xq_THK, xk_THK, positions)
+        # Partial RoPE: rotate only the leading qk_rope_dim dims, pass the rest
+        # through untouched.
+        xq_rot, xq_pass = (
+            xq_THK[..., : self.qk_rope_dim],
+            xq_THK[..., self.qk_rope_dim :],
+        )
+        xk_rot, xk_pass = (
+            xk_THK[..., : self.qk_rope_dim],
+            xk_THK[..., self.qk_rope_dim :],
+        )
+        xq_rot, xk_rot = self.rope(xq_rot, xk_rot, positions)
+        return (
+            torch.cat([xq_rot, xq_pass], dim=-1),
+            torch.cat([xk_rot, xk_pass], dim=-1),
+        )
 
     def forward(
         self,
-        x: torch.Tensor,
-        rope_cache: torch.Tensor,
+        x_TD: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        bs, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        num_tokens = x_TD.shape[0]
+        xq, xk, xv = self.wq(x_TD), self.wk(x_TD), self.wv(x_TD)
 
         # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
         # local heads from sizes of xq, xk, and xv as TP may have sharded them
         # after the above linear ops.
-        xq = xq.view(bs, seqlen, -1, self.head_dim)
-        xk = xk.view(bs, seqlen, -1, self.head_dim)
-        xv = xv.view(bs, seqlen, -1, self.head_dim)
+        xq = xq.view(num_tokens, -1, self.head_dim)
+        xk = xk.view(num_tokens, -1, self.head_dim)
+        xv = xv.view(num_tokens, -1, self.head_dim)
 
-        # Optional QK normalization (before RoPE, per Qwen3)
+        # Optional QK/V normalization (before RoPE, per Qwen3)
         xq = self.q_norm(xq)
         xk = self.k_norm(xk)
         xv = self.v_norm(xv)
 
-        # Apply rotary embeddings
         if self.use_rope:
-            if self.qk_rope_dim != self.head_dim:
-                # Partial RoPE: rotate only the first qk_rope_dim dims, pass the rest through.
-                xq_rot, xq_pass = (
-                    xq[..., : self.qk_rope_dim],
-                    xq[..., self.qk_rope_dim :],
-                )
-                xk_rot, xk_pass = (
-                    xk[..., : self.qk_rope_dim],
-                    xk[..., self.qk_rope_dim :],
-                )
-                if self.rope_backend == "cos_sin":
-                    xq_rot, xk_rot = apply_rotary_emb_cos_sin(
-                        xq_rot, xk_rot, rope_cache, positions
-                    )
-                else:
-                    xq_rot, xk_rot = apply_rotary_emb_complex(
-                        xq_rot, xk_rot, freqs_cis=rope_cache, positions=positions
-                    )
-                xq = torch.cat([xq_rot, xq_pass], dim=-1)
-                xk = torch.cat([xk_rot, xk_pass], dim=-1)
-            elif self.rope_backend == "cos_sin":
-                xq, xk = apply_rotary_emb_cos_sin(xq, xk, rope_cache, positions)
-            else:
-                xq, xk = apply_rotary_emb_complex(
-                    xq, xk, freqs_cis=rope_cache, positions=positions
-                )
-
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = xk.transpose(1, 2)  # (bs, n_kv_heads, seqlen, head_dim)
-        xv = xv.transpose(1, 2)  # (bs, n_kv_heads, seqlen, head_dim)
+            xq, xk = self._apply_rope(xq, xk, positions)
 
         scale_kwargs = {"scale": self.scaling} if self.scaling is not None else {}
 
-        match self.attn_backend:
-            case "flex":
-                assert isinstance(attention_masks, BlockMask), attention_masks
-                block_mask = attention_masks
-                output = (
-                    self.inner_attention(
-                        xq,
-                        xk,
-                        xv,
-                        block_mask=block_mask,
-                        enable_gqa=self.enable_gqa,
-                        **scale_kwargs,
-                    )
-                    .transpose(1, 2)
-                    .contiguous()
-                )
-            case "varlen":
-                assert isinstance(attention_masks, VarlenMetadata), attention_masks
-                output = self.inner_attention(
-                    xq, xk, xv, attention_masks, **scale_kwargs
-                )
-                output = output.view(bs, seqlen, -1, self.head_dim)
-            case "sdpa":
-                assert attention_masks is None
-                output = (
-                    self.inner_attention(
-                        xq,
-                        xk,
-                        xv,
-                        enable_gqa=self.enable_gqa,
-                        **scale_kwargs,
-                    )
-                    .transpose(1, 2)
-                    .contiguous()
-                )
-            case _:
-                raise ValueError(f"Unknown attention type: {self.attn_backend}")
+        if self.attn_backend == "sdpa":
+            # Upstream's SDPA module still works in (B, L, H, K); add and drop
+            # the singleton batch dim at the kernel boundary. Flex and varlen
+            # are natively token-flat.
+            assert attention_masks is None
+            output = self.inner_attention(
+                xq.unsqueeze(0),
+                xk.unsqueeze(0),
+                xv.unsqueeze(0),
+                enable_gqa=self.enable_gqa,
+                **scale_kwargs,
+            ).squeeze(0)
+        else:
+            output = self.inner_attention(
+                xq,
+                xk,
+                xv,
+                attention_masks=attention_masks,
+                enable_gqa=self.enable_gqa,
+                **scale_kwargs,
+            )
+        output = output.contiguous()
 
-        # "before" mid-norm: per-head norm applied before gating
-        # output shape here: [bs, seqlen, n_local_heads, head_dim]
+        # "before" mid-norm: per-head norm applied before gating.
+        # output shape here: [T, n_local_heads, head_dim]
         if self.mid_norm_position == "before" and not self.gate_only:
             output = self.mid_norm(output)
 
         if self.gated_attention_type is not None:
             # Compute gate and multiply in float32 for numeric stability, then cast back.
             orig_dtype = output.dtype
-            gate = torch.sigmoid(self.gate_proj(x).float())
+            gate = torch.sigmoid(self.gate_proj(x_TD).float())
             if self.gated_attention_type == "head-wise":
-                # gate: [bs, seqlen, n_local_heads]
-                # result: [g1*norm(o1), g2*norm(o2), ...] per head
+                # gate: [T, n_local_heads] -> broadcast over head_dim
                 output = (output.float() * gate.unsqueeze(-1)).to(orig_dtype)
             elif self.gated_attention_type == "element-wise":
-                # gate: [bs, seqlen, n_local_heads * head_dim]
-                output_flat = output.reshape(bs, seqlen, -1).float()
+                # gate: [T, n_local_heads * head_dim]
+                output_flat = output.reshape(num_tokens, -1).float()
                 output = (output_flat * gate).to(orig_dtype)
 
         # "after" mid-norm: norm applied either per-head or over the full
         # concatenated head output, depending on head_wise_mid_norm.
         if self.mid_norm_position == "after" and not self.gate_only:
             if self.head_wise_mid_norm:
-                output = output.reshape(bs, seqlen, -1, self.head_dim)
+                output = output.reshape(num_tokens, -1, self.head_dim)
                 output = self.mid_norm(output)
-                output = output.reshape(bs, seqlen, -1)
+                output = output.reshape(num_tokens, -1)
             else:
-                output = output.reshape(bs, seqlen, -1)
+                output = output.reshape(num_tokens, -1)
                 output = self.mid_norm(output)
         else:
-            output = output.reshape(bs, seqlen, -1)
+            output = output.reshape(num_tokens, -1)
         return self.wo(output)
-
-    def init_weights(self, residual_div: float, skip_init: bool = False):
-        for norm in (self.q_norm, self.k_norm, self.v_norm, self.mid_norm):
-            if not isinstance(norm, nn.Identity):
-                norm.reset_parameters()
-
-        if skip_init:
-            return
-
-        wq_init_fn = build_init_fn(self.config.wq_init_fn_type)
-        wk_init_fn = build_init_fn(self.config.wk_init_fn_type)
-        wv_init_fn = build_init_fn(self.config.wv_init_fn_type)
-
-        wq_init_fn(self.wq.weight, mean=0.0, std=self.config.wq_init_std)
-        wk_init_fn(self.wk.weight, mean=0.0, std=self.config.wk_init_std)
-        wv_init_fn(self.wv.weight, mean=0.0, std=self.config.wv_init_std)
-
-        wo_init_fn = build_init_fn(self.config.wo_init_fn_type)
-        wo_init_fn(self.wo.weight, mean=0.0, std=self.config.wo_init_std / residual_div)
-
-        if self.gated_attention_type is not None:
-            w_gate_init_fn = build_init_fn(self.config.w_gate_init_fn_type)
-            w_gate_init_fn(
-                self.gate_proj.weight,
-                mean=0.0,
-                std=self.config.w_gate_init_std / residual_div,
-            )

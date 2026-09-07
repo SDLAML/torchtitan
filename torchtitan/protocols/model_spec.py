@@ -46,6 +46,9 @@ class ModelSpec:
     pipelining_fn: Callable | None
     post_optimizer_build_fn: Callable | None
     state_dict_adapter: type[BaseStateDictAdapter] | None
+    # Copies the model's HF assets (config.json, modeling_*.py, chat template)
+    # into the checkpoint dir so exported checkpoints load with trust_remote_code.
+    hf_assets_setup_fn: Callable | None = None
 
     def traverse(
         self, config_cls: type, *, recurse: bool = False, _prefix: str = ""

@@ -11,7 +11,7 @@ import re
 
 import torch
 
-from torchtitan.components.dataloader import BaseDataLoader
+from torchtitan.components.legacy_dataloader import BaseDataLoader
 
 __all__ = [
     "DataMixScheduler",

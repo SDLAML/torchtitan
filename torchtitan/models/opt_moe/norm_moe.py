@@ -12,10 +12,6 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from torchtitan.models.common.moe.utils import (
-    indices_padding_wrapper,
-    need_indices_padding,
-)
 from torchtitan.ops.scatter_add import deterministic_scatter_add
 from torchtitan.protocols.module import Module
 
@@ -24,7 +20,7 @@ from torchtitan.tools.logging import logger
 from .norm_ffn import FeedForward
 
 from .utils.activations import build_activation
-from .utils.inits import build_init_fn
+from .utils.inits import build_init_fn, make_param_init
 from .utils.moe_utils import calc_gate_scaling_factor
 from .utils.norms import build_norm
 
@@ -158,17 +154,12 @@ class GroupedExperts(nn.Module):
             w3 = self.w3
 
         if self.use_grouped_mm:
-            # NOTE: If EP is not used, we need to pad the indices
-            #       to prepare for grouped_mm;
-            #       otherwise, EP will handle the padding.
-            if need_indices_padding() and (
-                not isinstance(self.w1, DTensor)
-                or "ep" not in self.w1.device_mesh.mesh_dim_names
-            ):
-                run_experts_fn = indices_padding_wrapper(_run_experts_grouped_mm)
-            else:
-                run_experts_fn = _run_experts_grouped_mm
-            return run_experts_fn(
+            # Token-group alignment padding used to be applied here via
+            # generate_permute_indices. That kernel no longer exists upstream:
+            # alignment padding now lives in token_dispatcher and is only needed
+            # for quantized (fp8/mxfp8) grouped GEMMs, which this path does not
+            # use. For bf16 the group sizes need no padding.
+            return _run_experts_grouped_mm(
                 w1,
                 w2,
                 w3,
@@ -194,12 +185,9 @@ class GroupedExperts(nn.Module):
         init_gate_as_residual: bool,
         weights_init_stds: tuple[float, float, float],
         init_fn_types: tuple[str, str, str],
-        skip_init: bool = False,
     ):
         if not isinstance(self.mid_norm, nn.Identity):
             self.mid_norm.reset_parameters()
-        if skip_init:
-            return
 
         w1_init_std, w2_init_std, w3_init_std = weights_init_stds
         w1_init_fn_type, w2_init_fn_type, w3_init_fn_type = init_fn_types
@@ -293,10 +281,7 @@ class TokenChoiceTopKRouter(nn.Module):
             f"FORCE_ROUTER_FP32_MATMUL: {self.force_router_fp32_matmul}"
         )
 
-    def init_weights(self, init_std: float, init_fn_type: str, skip_init: bool = False):
-        if skip_init:
-            return
-
+    def init_weights(self, init_std: float, init_fn_type: str):
         # nn.init.xavier_uniform_(self.expert_embeddings)
         init_fn = build_init_fn(init_fn_type)
         init_fn(self.gate.weight, mean=0.0, std=init_std)
@@ -528,10 +513,24 @@ class MoE(Module):
         router_init_fn_type: str = "scion_normal_output"
         router_init_std: float = 1.0
 
-    def __init__(self, config: Config, *, layer_id: int, dim: int):
+        # Stamped per layer by OPTMoEModel.Config expansion. Upstream builds
+        # every layer config with a bare build(), so layer_id/dim can no longer
+        # arrive as build kwargs, and residual_div/init_gate_as_residual can no
+        # longer arrive as init_weights args.
+        dim: int = 0
+        layer_id: int = 0
+        residual_div: float = 1.0
+        init_gate_as_residual: bool = False
+
+    def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.layer_id = layer_id
+        self.layer_id = config.layer_id
+        dim = config.dim
+        assert dim > 0, (
+            "MoE.Config.dim must be stamped by the model's config expansion "
+            "before build()."
+        )
 
         self.num_experts = config.num_experts
         self.top_k = config.top_k
@@ -593,7 +592,10 @@ class MoE(Module):
                 w1_init_std=config.w1_init_std,
                 w2_init_std=config.w2_init_std,
                 w3_init_std=config.w3_init_std,
-            ).build(dim=dim)
+                dim=dim,
+                residual_div=config.residual_div,
+                init_gate_as_residual=config.init_gate_as_residual,
+            ).build()
             if config.num_shared_experts > 0
             else None
         )
@@ -620,16 +622,20 @@ class MoE(Module):
         Forward pass for the MoE layer.
 
         Args:
-            x (torch.Tensor): Input tensor with shape ``(bs, slen, dim)``.
-            loss_mask (torch.Tensor | None): Loss mask tensor with shape ``(bs, slen)``.
+            x (torch.Tensor): Input tensor with shape ``(T, dim)``.
+            loss_mask (torch.Tensor | None): Loss mask tensor with shape ``(T,)``.
 
         Returns:
             (out, load_balance_loss):
-                ``out`` has shape ``(bs, slen, dim)`` and ``load_balance_loss`` is
+                ``out`` has shape ``(T, dim)`` and ``load_balance_loss`` is
                 a scalar tensor when enabled, otherwise ``None``.
         """
-        bs, slen, dim = x.shape
-        x = x.view(-1, dim)
+        # Upstream batches are token-flat: one packed [T, dim] stream with
+        # document boundaries carried by `positions`, no batch dimension.
+        # `sequence_wise` aux loss therefore scores the whole microbatch as a
+        # single sequence.
+        n_tokens, dim = x.shape
+        bs, slen = 1, n_tokens
 
         # top_scores and selected_experts_indices shape (bs*slen, top_k)
         # num_tokens_per_expert shape (num_experts,)
@@ -735,42 +741,35 @@ class MoE(Module):
             routed_output,
         )
 
-        out = out.reshape(bs, slen, dim)
         return out, load_balance_loss
 
-    def init_weights(
-        self,
-        residual_div: float,
-        init_gate_as_residual: bool,
-        skip_init: bool = False,
-    ):
+    def _init_self_parameters(self) -> None:
+        """Initialize experts and router.
+
+        ``GroupedExperts`` and ``TokenChoiceTopKRouter`` are plain ``nn.Module``
+        rather than ``Module``, so ``Module.init_states`` walks past them without
+        initializing their parameters -- it only recurses into ``Module``
+        children. Drive them from here. ``shared_experts`` is a ``Module`` and
+        initializes itself from its own ``param_init``.
+        """
+        cfg = self.config
         self.experts.init_weights(
-            residual_div=residual_div,
-            init_gate_as_residual=init_gate_as_residual,
+            residual_div=cfg.residual_div,
+            init_gate_as_residual=cfg.init_gate_as_residual,
             weights_init_stds=(
-                self.config.w1_init_std,
-                self.config.w2_init_std,
-                self.config.w3_init_std,
+                cfg.w1_init_std,
+                cfg.w2_init_std,
+                cfg.w3_init_std,
             ),
             init_fn_types=(
-                self.config.w1_init_fn_type,
-                self.config.w2_init_fn_type,
-                self.config.w3_init_fn_type,
+                cfg.w1_init_fn_type,
+                cfg.w2_init_fn_type,
+                cfg.w3_init_fn_type,
             ),
-            skip_init=skip_init,
         )
-        if self.shared_experts is not None:
-            self.shared_experts.init_weights(
-                residual_div=residual_div,
-                init_gate_as_residual=init_gate_as_residual,
-                skip_init=skip_init,
-            )
-        self.router.init_weights(
-            self.config.router_init_std,
-            self.config.router_init_fn_type,
-            skip_init=skip_init,
-        )
+        self.router.init_weights(cfg.router_init_std, cfg.router_init_fn_type)
 
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         self.expert_bias.zero_()
         self.tokens_per_expert.zero_()
         self.tokens_per_expert_cumul.zero_()

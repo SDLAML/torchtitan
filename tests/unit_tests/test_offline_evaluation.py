@@ -15,7 +15,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 
-from torchtitan.components.checkpoint import ModelWrapper
+from torchtitan.components.checkpointer import ModelWrapper
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.evaluation.config import (
     EvaluationConfigError,

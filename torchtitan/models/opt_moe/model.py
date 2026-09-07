@@ -5,7 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses as _dc
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from torch import nn
@@ -13,23 +14,30 @@ from torch.nn.attention.flex_attention import and_masks
 
 from torchtitan.models.common.attention import (
     AttentionMasksType,
-    create_attention_mask,
+    FlexAttention,
     get_causal_mask_mod,
-    get_document_mask_mod,
+    get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
+    VarlenAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.embedding import Embedding
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rope import RoPE
-from torchtitan.models.utils import get_moe_model_nparams_and_flops
+from torchtitan.models.utils import (
+    get_nparams_and_active_nparams,
+    quadratic_attention_flops_per_token,
+)
 from torchtitan.tools.logging import logger
 from .gated_norm_swattention import GatedNormSWAttention
 from .utils.inits import (
     build_init_fn,
+    make_param_init,
     parse_depth_init,
     setup_depth_init,
     setup_residual_scale,
 )
-from .utils.norms import build_norm
+from .utils.norms import build_norm_config
 
 
 def _parse_layer_pattern(
@@ -85,12 +93,20 @@ def _parse_layer_pattern(
 
 
 class OPTMoETransformerBlock(TransformerBlock):
-    """
-    OPT MoE TransformerBlock Module
+    """OPT MoE TransformerBlock.
+
+    Token-flat throughout: ``x`` is ``[T, D]``. Returns ``(output, lbl_loss)``
+    so the model can accumulate per-layer MoE load-balance losses without
+    threading a running tensor through every layer signature.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(TransformerBlock.Config):
+        # ``TransformerBlock.Config`` requires these; OPT MoE builds its norms
+        # from ``norm_type``/``norm_eps`` instead, so they stay unset.
+        attention_norm: Any = None
+        ffn_norm: Any = None
+
         n_dense_layers: int = 0
         init_gate_as_residual: bool = False
         depth_init: bool | str = "total_depth"
@@ -98,12 +114,24 @@ class OPTMoETransformerBlock(TransformerBlock):
         norm_eps: float = 1e-30
         norm_type: str = "np_rmsnorm"
 
-    def __init__(self, config: Config, *, layer_id: int, dim: int, n_layers: int):
+        # Stamped per layer by OPTMoEModel.Config._expand_layers(). Upstream
+        # builds each layer with a bare build(), so these can no longer be
+        # build() kwargs.
+        dim: int = 0
+        layer_id: int = 0
+        n_layers: int = 1
+
+    def __init__(self, config: Config):
         super().__init__()
-        self.layer_id = layer_id
-        self.attention = config.attention.build(dim=dim)
-        self.attention_norm = build_norm(config.norm_type, dim=dim, eps=config.norm_eps)
-        self.ffn_norm = build_norm(config.norm_type, dim=dim, eps=config.norm_eps)
+        dim = config.dim
+        assert dim > 0, (
+            "OPTMoETransformerBlock.Config.dim must be stamped by "
+            "OPTMoEModel.Config._expand_layers() before build()."
+        )
+        self.layer_id = config.layer_id
+        self.attention = config.attention.build()
+        self.attention_norm = config.attention_norm.build()
+        self.ffn_norm = config.ffn_norm.build()
 
         # Per-layer attention-mode flags (derived from the per-layer attention config).
         assert isinstance(config.attention, GatedNormSWAttention.Config)
@@ -127,25 +155,22 @@ class OPTMoETransformerBlock(TransformerBlock):
         self._repr_swa_window_size: int = (
             config.attention.sliding_window_size if self.use_swa else -1
         )
-        self._repr_rope_theta: float = -1.0
+        self._repr_rope_theta: float = (
+            float(config.attention.rope.theta)
+            if config.attention.use_rope and config.attention.rope is not None
+            else -1.0
+        )
 
-        self.moe_enabled = layer_id >= config.n_dense_layers
+        self.moe_enabled = config.moe is not None
         if self.moe_enabled:
-            assert config.moe is not None
-            self.moe = config.moe.build(dim=dim, layer_id=layer_id)
+            self.moe = config.moe.build()
         else:
             assert config.feed_forward is not None
-            self.feed_forward = config.feed_forward.build(dim=dim)
-
-        self.init_gate_as_residual = config.init_gate_as_residual
+            self.feed_forward = config.feed_forward.build()
 
         # x = identity_scale * x + block_scale * block(x)
-        self.depth_init = parse_depth_init(config.depth_init)
-        self.residual_div_attn, self.residual_div_ffn = setup_depth_init(
-            self.depth_init, layer_id, n_layers
-        )
         self.block_scale, self.identity_scale = setup_residual_scale(
-            config.residual_scale, n_layers
+            config.residual_scale, config.n_layers
         )
 
     def extra_repr(self) -> str:
@@ -160,24 +185,22 @@ class OPTMoETransformerBlock(TransformerBlock):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
+        attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
     ) -> "tuple[torch.Tensor, torch.Tensor | None]":
-        """
-        Perform a forward pass through the TransformerBlock.
+        """Forward pass through the block.
 
         Args:
-            x (torch.Tensor): Input tensor.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-            attention_masks: Attention mask(s) for this layer.
-            positions: Optional position indices.
-            loss_mask: Optional token loss mask for MoE load-balance loss.
+            x: Input tensor ``[T, D]``.
+            attention_masks: Mask(s) for this layer; a dict keyed ``full``/``swa``
+                when layers mix backends, or a single mask.
+            positions: Optional position indices ``[T]``.
+            loss_mask: Optional token loss mask for the MoE load-balance loss.
 
         Returns:
-            (output, lbl_loss): output tensor; lbl_loss is this layer's
-            load-balance loss (MoE layers) or None (dense layers).
+            ``(output, lbl_loss)`` -- ``lbl_loss`` is this layer's load-balance
+            loss on MoE layers and ``None`` on dense layers.
         """
         # _mask_key is pre-computed at init; no string comparisons or tensor ops here.
         if self._mask_key is None:
@@ -188,7 +211,7 @@ class OPTMoETransformerBlock(TransformerBlock):
             layer_mask = attention_masks  # single BlockMask (backward compat)
 
         h = self.identity_scale * x + self.block_scale * self.attention(
-            self.attention_norm(x), freqs_cis, layer_mask, positions
+            self.attention_norm(x), layer_mask, positions
         )
 
         if self.moe_enabled:
@@ -199,31 +222,9 @@ class OPTMoETransformerBlock(TransformerBlock):
 
         return self.identity_scale * h + self.block_scale * mlp_output, lbl_loss
 
-    def init_weights(self, skip_init: bool = False):
-        for norm in (self.attention_norm, self.ffn_norm):
-            norm.reset_parameters()
-        self.attention.init_weights(
-            residual_div=self.residual_div_attn,
-            skip_init=skip_init,
-        )
-        if self.moe_enabled:
-            self.moe.init_weights(
-                residual_div=self.residual_div_ffn,
-                init_gate_as_residual=self.init_gate_as_residual,
-                skip_init=skip_init,
-            )
-        else:
-            self.feed_forward.init_weights(
-                residual_div=self.residual_div_ffn,
-                init_gate_as_residual=self.init_gate_as_residual,
-                skip_init=skip_init,
-            )
-
 
 class OPTMoEModel(Decoder):
-    """
-    OPT MoE Transformer model with attention and feed-forward layers.
-    """
+    """OPT MoE Transformer model with attention and feed-forward layers."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
@@ -232,6 +233,15 @@ class OPTMoEModel(Decoder):
         vocab_size: int = 201088
         layer: TransformerBlock.Config
 
+        # Upstream's Decoder.Config requires these outright. OPT MoE describes a
+        # model with one `layer` template plus per-layer patterns, so they are
+        # derived in _expand_layers() instead of being spelled out per flavor.
+        layers: list = field(default_factory=list)
+        lm_head: Any = None
+        tok_embeddings: Any = None
+        norm: Any = None
+
+        rope: RoPE.Config
         norm_eps: float = 1e-30
         norm_type: str = "np_rmsnorm"
 
@@ -242,333 +252,264 @@ class OPTMoEModel(Decoder):
         final_out_init_std: float = 1.0
 
         use_embeddings_norm: bool = False
-        # --- Flexible per-layer attention configuration ---
+
+        # Mirrored from training config in update_from_config; consumed by
+        # preprocess_inputs to build the MoE load-balance token mask.
+        enable_token_mask_for_moe: bool = False
 
         rope_of_swa: RoPE.Config | None = None
-        # RoPE frequency cache for SWA layers (typically a lower theta for local context).
+        # RoPE cache for SWA layers (typically a lower theta for local context).
         # The global ``rope`` config applies to full-attention layers.
         # None → all layers share the global ``rope`` cache.
         # Ignored for NoPE SWA layers.
 
         rope_pattern: str | list[bool] | None = None
         # Per-layer RoPE vs NoPE selection.
-        # String: one char per layer — 'R' = RoPE, 'N' = NoPE.  E.g. ``"RRRN"`` for 4 layers.
+        # String: one char per layer — 'R' = RoPE, 'N' = NoPE.  E.g. ``"RRRN"``.
         # list[bool]: True = RoPE, False = NoPE.
-        # None keeps the legacy uniform-layer behaviour from ``layer.attention.use_rope``.
+        # None keeps the uniform behaviour from ``layer.attention.use_rope``.
 
         swa_pattern: str | list[bool] | None = None
         # Per-layer sliding-window vs full-attention selection.
-        # String: one char per layer — 'S' = SWA, 'F' = Full attention.  E.g. ``"SSSF"``.
-        # list[bool]: True = SWA, False = Full attention.
-        # None keeps the legacy uniform-layer behaviour from ``layer.attention``.
-        # With the default ``layer.attention.sliding_window_size=-1``, this means full attention.
+        # String: one char per layer — 'S' = SWA, 'F' = Full attention.
+        # None keeps the uniform behaviour from ``layer.attention``.
         # SWA layers are automatically assigned attn_backend="flex".
-        # ``layer.attention.sliding_window_size`` must be > 0 when any layer is 'S'.
 
-        def update_from_config(
-            self,
-            *,
-            trainer_config,
-            **kwargs,
-        ) -> None:
-            training = trainer_config.training
-            parallelism = trainer_config.parallelism
-            debug = trainer_config.debug
-            seq_len = training.seq_len
-            if seq_len > self.rope.max_seq_len:
+        def _expand_layers(self) -> None:
+            """Expand the ``layer`` template into upstream's per-layer config list.
+
+            Upstream builds each block from a fully-specified entry in
+            ``Decoder.Config.layers`` via a bare ``build()``, so everything the
+            old code passed as a build kwarg or an ``init_weights`` argument --
+            dim, layer_id, n_layers, the depth-init divisors, the RoPE cache and
+            the inner-attention backend -- has to be stamped onto a per-layer
+            copy here.
+            """
+            n_layers = self.n_layers
+            base_attn = self.layer.attention
+            assert isinstance(base_attn, GatedNormSWAttention.Config)
+
+            use_rope = _parse_layer_pattern(
+                self.rope_pattern, n_layers, "R", "N", default_true=base_attn.use_rope
+            )
+            use_swa = _parse_layer_pattern(
+                self.swa_pattern,
+                n_layers,
+                "S",
+                "F",
+                default_true=base_attn.sliding_window_size > 0,
+            )
+            swa_window = base_attn.sliding_window_size
+            depth_init = parse_depth_init(self.layer.depth_init)
+
+            layers: list = []
+            for layer_id in range(n_layers):
+                residual_div_attn, residual_div_ffn = setup_depth_init(
+                    depth_init, layer_id, n_layers
+                )
+                # SWA layers use the local RoPE cache when one is configured.
+                layer_rope = (
+                    self.rope_of_swa
+                    if (use_swa[layer_id] and self.rope_of_swa is not None)
+                    else self.rope
+                )
+                attn_backend = "flex" if use_swa[layer_id] else base_attn.attn_backend
+                attn_cfg = _dc.replace(
+                    base_attn,
+                    dim=self.dim,
+                    use_rope=use_rope[layer_id],
+                    sliding_window_size=swa_window if use_swa[layer_id] else -1,
+                    # SWA requires FlexAttention; non-SWA keeps the configured backend.
+                    attn_backend=attn_backend,
+                    rope=layer_rope if use_rope[layer_id] else None,
+                    residual_div=residual_div_attn,
+                )
+                attn_cfg.inner_attention = attn_cfg.build_inner_attention()
+
+                is_dense = layer_id < self.layer.n_dense_layers
+                moe_cfg = None
+                ff_cfg = None
+                if is_dense:
+                    assert self.layer.feed_forward is not None, (
+                        f"layer {layer_id} is dense (n_dense_layers="
+                        f"{self.layer.n_dense_layers}) but no feed_forward config is set"
+                    )
+                    ff_cfg = _dc.replace(
+                        self.layer.feed_forward,
+                        dim=self.dim,
+                        residual_div=residual_div_ffn,
+                        init_gate_as_residual=self.layer.init_gate_as_residual,
+                    )
+                else:
+                    assert self.layer.moe is not None, (
+                        f"layer {layer_id} is an MoE layer but no moe config is set"
+                    )
+                    moe_cfg = _dc.replace(
+                        self.layer.moe,
+                        dim=self.dim,
+                        layer_id=layer_id,
+                        residual_div=residual_div_ffn,
+                        init_gate_as_residual=self.layer.init_gate_as_residual,
+                    )
+
+                layers.append(
+                    _dc.replace(
+                        self.layer,
+                        attention=attn_cfg,
+                        moe=moe_cfg,
+                        feed_forward=ff_cfg,
+                        attention_norm=build_norm_config(
+                            self.layer.norm_type, self.dim, self.layer.norm_eps
+                        ),
+                        ffn_norm=build_norm_config(
+                            self.layer.norm_type, self.dim, self.layer.norm_eps
+                        ),
+                        dim=self.dim,
+                        layer_id=layer_id,
+                        n_layers=n_layers,
+                    )
+                )
+            self.layers = layers
+            self.norm = build_norm_config(self.norm_type, self.dim, self.norm_eps)
+
+            # Decoder.__init__ builds these directly; OPT MoE overrides `norm`
+            # with its own build_norm, but tok_embeddings/lm_head are stock.
+            self.tok_embeddings = Embedding.Config(
+                num_embeddings=self.vocab_size,
+                embedding_dim=self.dim,
+                param_init={
+                    "weight": make_param_init(
+                        self.first_in_init_fn_type, self.first_in_init_std
+                    )
+                },
+            )
+            self.lm_head = Linear.Config(
+                in_features=self.dim,
+                out_features=self.vocab_size,
+                param_init={
+                    "weight": make_param_init(
+                        self.final_out_init_fn_type, self.final_out_init_std
+                    )
+                },
+            )
+
+        def update_from_config(self, *, config, **kwargs) -> None:
+            parallelism = config.parallelism
+            max_context_length = config.training.max_context_length
+            if max_context_length > self.rope.max_context_length:
                 logger.warning(
-                    f"Sequence length {seq_len} exceeds original maximum {self.rope.max_seq_len}."
+                    f"Context length {max_context_length} exceeds original "
+                    f"maximum {self.rope.max_context_length}."
                 )
 
-            # Sync rope max_seq_len (both global and SWA-local caches)
-            self.rope = _dc.replace(self.rope, max_seq_len=seq_len)
+            # Sync rope length (both global and SWA-local caches)
+            self.rope = _dc.replace(self.rope, max_context_length=max_context_length)
             if self.rope_of_swa is not None:
-                self.rope_of_swa = _dc.replace(self.rope_of_swa, max_seq_len=seq_len)
+                self.rope_of_swa = _dc.replace(
+                    self.rope_of_swa, max_context_length=max_context_length
+                )
 
-            if self.layer.moe is not None and self.layer.n_dense_layers < self.n_layers:
-                self.layer.moe._debug_force_load_balance = debug.moe_force_load_balance
-
-            # Validate per-layer patterns: length and character set are checked by
-            # _parse_layer_pattern; also verify a SWA window size is set when needed.
-            assert isinstance(self.layer.attention, GatedNormSWAttention.Config)
-            use_swa = _parse_layer_pattern(self.swa_pattern, self.n_layers, "S", "F")
-            has_swa_from_pattern = any(use_swa)
-            # Backward compatibility: when swa_pattern is unset, a positive
-            # sliding_window_size still means SWA is active for all layers.
-            has_swa_from_base = (
-                self.swa_pattern is None
-                and self.layer.attention.sliding_window_size > 0
+            self.enable_token_mask_for_moe = getattr(
+                config.training, "enable_token_mask_for_moe", False
             )
-            uses_swa = has_swa_from_pattern or has_swa_from_base
 
-            if uses_swa and self.layer.attention.sliding_window_size <= 0:
+            base_attn = self.layer.attention
+            assert isinstance(base_attn, GatedNormSWAttention.Config)
+            use_swa = _parse_layer_pattern(self.swa_pattern, self.n_layers, "S", "F")
+            uses_swa = any(use_swa) or (
+                self.swa_pattern is None and base_attn.sliding_window_size > 0
+            )
+            if uses_swa and base_attn.sliding_window_size <= 0:
                 raise ValueError(
                     "SWA is enabled but layer.attention.sliding_window_size "
                     "is not set (must be > 0)."
                 )
-            if uses_swa and self.layer.attention.attn_backend == "varlen":
+            if uses_swa and base_attn.attn_backend == "varlen":
                 raise ValueError("SWA is not supported with varlen attention.")
-            # When swa_pattern is None (uniform base SWA via sliding_window_size>0),
-            # no per-layer rebuild happens so the base attn_backend must be "flex".
-            # When swa_pattern is explicitly set, the rebuild in __init__ auto-promotes
-            # SWA layers to "flex" regardless of the base backend — so sdpa base is fine.
-            if has_swa_from_base and self.layer.attention.attn_backend != "flex":
-                raise ValueError(
-                    "SWA requires attn_backend='flex'. "
-                    f"Got attn_backend='{self.layer.attention.attn_backend}'."
-                )
-            if self.n_layers == self.layer.n_dense_layers:
-                # Dense model
-                assert self.layer.feed_forward is not None
-            else:
-                # MoE model
-                assert self.layer.moe is not None
 
-            if (
-                parallelism.context_parallel_degree > 1
-                and self.layer.attention.attn_backend == "varlen"
-            ):
-                raise NotImplementedError(
-                    f"Context Parallel only supports SDPA and FlexAttention."
-                    f"Got attn_backend='{self.layer.attention.attn_backend}'. "
-                    f"Varlen attention is not supported with CP."
-                )
+            # Expand before delegating: Decoder.Config.update_from_config walks
+            # self.layers for TP/EP validation and token-dispatcher setup, so the
+            # per-layer list has to exist by then.
+            self._expand_layers()
+            Decoder.Config.update_from_config(self, config=config, **kwargs)
 
-            # Configure expert parallel communication backend from config
-            if (
-                parallelism.expert_parallel_comm_backend == "deepep"
-                and parallelism.expert_parallel_degree > 1
-            ):
-                # we only use deepep for MoE when ep is enabled
-                from torchtitan.models.opt_moe.norm_moe_deepep import DeepEPMoE
+            from torchtitan.models.opt_moe.sharding import set_opt_moe_sharding_config
 
-                self.layer.moe = DeepEPMoE.Config(**_dc.asdict(self.layer.moe))
+            # enable_sequence_parallel defaults to True regardless of TP, so
+            # gate on the actual degree -- otherwise a plain FSDP run would look
+            # like a TP run to the sharding plan.
+            set_opt_moe_sharding_config(
+                self,
+                enable_sp=(
+                    parallelism.enable_sequence_parallel
+                    and parallelism.tensor_parallel_degree > 1
+                ),
+                enable_tp=parallelism.tensor_parallel_degree > 1,
+                enable_ep=parallelism.expert_parallel_degree > 1,
+            )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-            assert isinstance(self.layer.attention, GatedNormSWAttention.Config)
-
-            if self.layer.attention.head_dim is not None:
-                head_dim = self.layer.attention.head_dim
-            else:
-                head_dim = self.dim // self.layer.attention.n_heads
-
-            return get_moe_model_nparams_and_flops(
-                self,
-                model,
-                self.layer.attention.n_heads,
-                2 * head_dim,
-                seq_len,
+            nparams, active_nparams = get_nparams_and_active_nparams(model)
+            base_attn = self.layer.attention
+            assert isinstance(base_attn, GatedNormSWAttention.Config)
+            head_dim = (
+                base_attn.head_dim
+                if base_attn.head_dim is not None
+                else self.dim // base_attn.n_heads
             )
+            attention_op_flops = self.n_layers * quadratic_attention_flops_per_token(
+                num_heads=base_attn.n_heads,
+                qk_head_dim=head_dim,
+                v_head_dim=head_dim,
+                seq_len=seq_len,
+            )
+            return nparams, 6 * active_nparams + attention_op_flops
 
     def __init__(self, config: Config):
         super().__init__(config)
-        self.norm = build_norm(config.norm_type, dim=config.dim, eps=config.norm_eps)
         if config.use_embeddings_norm:
-            self.embeddings_norm = build_norm(
-                config.norm_type, dim=config.dim, eps=config.norm_eps
-            )
+            self.embeddings_norm = build_norm_config(
+                config.norm_type, config.dim, config.norm_eps
+            ).build()
         else:
             self.embeddings_norm = nn.Identity()
-        n_layers = config.n_layers
-        base_attn = config.layer.attention
-        assert isinstance(base_attn, GatedNormSWAttention.Config)
-        base_use_rope = base_attn.use_rope
-        base_use_swa = base_attn.sliding_window_size > 0
-
-        # Normalize patterns to full bool lists immediately — downstream code never
-        # sees None, eliminating repeated null-checks.
-        #   rope: None → legacy base setting from layer.attention.use_rope
-        #   swa:  None → legacy base setting from layer.attention.sliding_window_size
-        use_rope: list[bool] = _parse_layer_pattern(
-            config.rope_pattern, n_layers, "R", "N", default_true=base_use_rope
-        )
-        use_swa: list[bool] = _parse_layer_pattern(
-            config.swa_pattern, n_layers, "S", "F", default_true=base_use_swa
-        )
-
-        # Rebuild layers with per-layer attention configs when there is any variation.
-        # Decoder.__init__ already built uniform layers; we replace the ModuleDict only
-        # when needed to avoid double-building the common all-default case.
-        # Explicit patterns always trigger a rebuild so all-F/all-R overrides are applied.
-        has_explicit_patterns = (
-            config.rope_pattern is not None or config.swa_pattern is not None
-        )
-        rebuild_layers = (
-            has_explicit_patterns
-            or any(v != base_use_rope for v in use_rope)
-            or any(v != base_use_swa for v in use_swa)
-        )
-        if rebuild_layers:
-            swa_window = (
-                base_attn.sliding_window_size
-            )  # validated > 0 in update_from_config
-
-            self.layers = torch.nn.ModuleDict()
-            for layer_id in range(n_layers):
-                attn_cfg = _dc.replace(
-                    base_attn,
-                    use_rope=use_rope[layer_id],
-                    sliding_window_size=swa_window if use_swa[layer_id] else -1,
-                    # SWA requires FlexAttention; non-SWA keeps the configured backend.
-                    attn_backend="flex"
-                    if use_swa[layer_id]
-                    else base_attn.attn_backend,
-                )
-                layer_cfg = _dc.replace(config.layer, attention=attn_cfg)
-                self.layers[str(layer_id)] = layer_cfg.build(
-                    layer_id=layer_id, dim=config.dim, n_layers=n_layers
-                )
-
-        # Effective per-layer flags used after construction (including the no-rebuild
-        # backward-compatible path where uniform layers from Decoder.__init__ are kept).
-        if rebuild_layers:
-            layer_use_swa = use_swa
-            layer_use_rope = use_rope
-        else:
-            assert isinstance(config.layer.attention, GatedNormSWAttention.Config)
-            layer_use_swa = [config.layer.attention.sliding_window_size > 0] * n_layers
-            layer_use_rope = [config.layer.attention.use_rope] * n_layers
-
-        # RoPE frequency cache for SWA layers (separate theta from global).
-        # Built only when rope_of_swa is configured AND some layers are SWA.
-        if config.rope_of_swa is not None and any(layer_use_swa):
-            self.rope_of_swa = config.rope_of_swa.build()
-            self.register_buffer(
-                "freqs_cis_local", self.rope_of_swa.cache, persistent=False
-            )
-        else:
-            self.rope_of_swa = None
-            self.freqs_cis_local = None
-
-        # Pre-compute per-layer freqs_cis selection: True → use freqs_cis_local (SWA + RoPE).
-        # Keyed by the string layer_id used in self.layers, matching PP-pruned subsets.
-        # NoPE SWA layers (use_rope=False) don't consume the cache, so they stay False.
-        self._layer_use_local_rope: dict[str, bool] = {
-            str(i): (
-                layer_use_swa[i]
-                and layer_use_rope[i]
-                and config.rope_of_swa is not None
-            )
-            for i in range(n_layers)
-        }
-
-        # Populate per-layer debug metadata shown in print(model).
-        for layer_id_str, layer in self.layers.items():
-            layer_idx = int(layer_id_str)
-            assert isinstance(layer, OPTMoETransformerBlock)
-
-            layer._repr_use_rope = layer_use_rope[layer_idx]
-            layer._repr_swa_window_size = (
-                layer.attention.sliding_window_size if layer_use_swa[layer_idx] else -1
-            )
-            if not layer_use_rope[layer_idx]:
-                layer._repr_rope_theta = -1.0
-            elif layer_use_swa[layer_idx] and config.rope_of_swa is not None:
-                layer._repr_rope_theta = float(config.rope_of_swa.theta)
-            else:
-                layer._repr_rope_theta = float(config.rope.theta)
-
-    def init_weights(
-        self,
-        **kwargs,
-    ):
-        buffer_device: torch.device | None = kwargs.get("buffer_device")
-        buffer_device = buffer_device or self.freqs_cis.device
-        if self.rope is not None:
-            self.rope.init_weights(buffer_device=buffer_device)
-            self.freqs_cis = self.rope.cache
-        else:
-            # PP case: rope module was pruned, rebuild to get freqs_cis
-            rope = self.config.rope.build()
-            rope.init_weights(buffer_device=buffer_device)
-            self.freqs_cis = rope.cache
-
-        if self.rope_of_swa is not None:
-            self.rope_of_swa.init_weights(buffer_device=buffer_device)
-            self.freqs_cis_local = self.rope_of_swa.cache
-        elif any(self._layer_use_local_rope[k] for k in self.layers):
-            # PP case: rope_of_swa was pruned from this stage, but some layers here
-            # still need freqs_cis_local.  Rebuild transiently from the config.
-            rope_of_swa = self.config.rope_of_swa.build()
-            rope_of_swa.init_weights(buffer_device=buffer_device)
-            self.freqs_cis_local = rope_of_swa.cache
-
-        """
-        We always init/reset the norm parameters, because its cheap.
-        Then we pass the skip_init flag to the layer init_weights to skip the weight initialization.
-        """
-        if self.norm is not None:
-            self.norm.reset_parameters()
-
-        if not isinstance(self.embeddings_norm, nn.Identity):
-            self.embeddings_norm.reset_parameters()
-        skip_init = kwargs.get("skip_init", False)
-
-        first_in_init_fn = build_init_fn(self.config.first_in_init_fn_type)
-        if self.tok_embeddings is not None:
-            first_in_init_fn(
-                self.tok_embeddings.weight,
-                mean=0.0,
-                std=self.config.first_in_init_std,
-            )
-
-        for layer in self.layers.values():
-            # pyrefly: ignore [not-callable]
-            layer.init_weights(skip_init=skip_init)
-
-        final_out_init_fn = build_init_fn(self.config.final_out_init_fn_type)
-        if self.output is not None:
-            final_out_init_fn(
-                self.output.weight,
-                mean=0.0,
-                std=self.config.final_out_init_std,
-            )
 
     def forward(
         self,
         tokens: torch.Tensor,
-        accumulated_load_balance_loss: torch.Tensor | None = None,
-        attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
+        attention_masks: AttentionMasksType | None = None,
         loss_mask: torch.Tensor | None = None,
+        accumulated_load_balance_loss: torch.Tensor | None = None,
     ):
-        """
-        Perform a forward pass through the Transformer model.
+        """Forward pass.
 
         Args:
-            tokens (torch.Tensor): Input token indices if pipeline parallelism is not enabled.
-            accumulated_load_balance_loss (torch.Tensor | None): Accumulated load balance loss.
-            attention_masks (AttentionMasksType | None): Attention masks.
-            positions (torch.Tensor | None): Positions.
-            loss_mask (torch.Tensor | None): Loss mask.
+            tokens: Input token indices ``[T]``, or hidden states when this is
+                not the first pipeline stage.
+            positions: Position indices ``[T]``.
+            attention_masks: Per-layer masks (dict) or a single mask.
+            loss_mask: Token mask for the MoE load-balance loss.
+            accumulated_load_balance_loss: Load-balance loss carried in from a
+                prior pipeline stage.
 
         Returns:
-            torch.Tensor: Output logits after applying the Transformer model.
-
+            ``(output, total_lbl_loss)``.
         """
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-
+        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         h = self.embeddings_norm(h)
-        # Collect per-layer load-balance losses; accumulation happens after the loop
-        # so we never thread a running tensor through every layer's signature.
+
+        # Collect per-layer load-balance losses; accumulation happens after the
+        # loop so we never thread a running tensor through every layer signature.
         local_lbl_loss: torch.Tensor | None = None
-        for layer_id_str, layer in self.layers.items():
-            # _layer_use_local_rope is pre-computed at init (pure Python bool dict lookup,
-            # no GPU interaction).  When rope_of_swa is None every entry is False so
-            # freqs_cis_local is never referenced.
-            freqs = (
-                self.freqs_cis_local
-                if self._layer_use_local_rope[layer_id_str]
-                else self.freqs_cis
-            )
-            h, lbl = layer(h, freqs, attention_masks, positions, loss_mask)
+        for layer in self.layers.values():
+            h, lbl = layer(h, attention_masks, positions, loss_mask)
             if lbl is not None:
                 local_lbl_loss = lbl if local_lbl_loss is None else local_lbl_loss + lbl
 
-        # Merge local losses with any incoming accumulated loss from a prior PP stage.
         if accumulated_load_balance_loss is not None:
             total_lbl_loss = (
                 accumulated_load_balance_loss + local_lbl_loss
@@ -580,23 +521,23 @@ class OPTMoEModel(Decoder):
         else:
             total_lbl_loss = torch.zeros((), device=h.device, dtype=torch.float32)
 
-        h = self.norm(h) if self.norm else h
-        output = self.output(h) if self.output else h
+        h = self.norm(h) if self.norm is not None else h
+        if self._skip_lm_head:
+            return h, total_lbl_loss
+        output = self.lm_head(h) if self.lm_head is not None else h
         return output, total_lbl_loss
 
     def get_attention_masks(
         self,
-        input_batch: torch.Tensor,
-        tokenizer,
-        extra_inputs: "dict[str, torch.Tensor] | None" = None,
+        positions: torch.Tensor,
     ) -> "AttentionMasksType | None":
         """Return attention masks appropriate for the mix of layer backends.
 
         Returns:
             ``None``                                  — all layers use SDPA.
             ``{"full": BlockMask}``                   — flex layers, no SWA.
-            ``{"full": BlockMask, "swa": BlockMask}`` — mixed flex full + SWA layers.
-            Delegates to ``super()`` for varlen (existing behaviour).
+            ``{"full": BlockMask, "swa": BlockMask}`` — mixed flex full + SWA.
+            Delegates to ``super()`` for varlen.
         """
         has_flex = any(
             getattr(layer, "attn_backend", "sdpa") == "flex"
@@ -612,41 +553,52 @@ class OPTMoEModel(Decoder):
 
         if has_varlen and has_swa:
             raise ValueError("SWA is not supported with varlen attention.")
-
         if has_varlen:
-            return super().get_attention_masks(input_batch, tokenizer, extra_inputs)
-
+            return super().get_attention_masks(positions)
         if not has_flex:
             # All SDPA — PyTorch handles causal masking internally.
             return None
 
-        # Build base mask modifiers.
-        mask_mods = [get_causal_mask_mod()]
-        attn_mask_type = self.config.layer.attention.attn_mask_type
-        if attn_mask_type == "causal":
-            B = 1
-        elif attn_mask_type == "block_causal":
-            B = input_batch.shape[0]
-            assert tokenizer.eos_id is not None
-            mask_mods.append(get_document_mask_mod(input_batch, tokenizer.eos_id))
-        else:
-            raise ValueError(f"Unknown attn_mask_type: {attn_mask_type!r}")
-
-        seqlen = input_batch.shape[1]
-        full_mask = create_attention_mask(
-            and_masks(*mask_mods), B, None, seqlen, seqlen
-        )
-
+        # Document boundaries now come from `positions` resetting to 0 rather
+        # than from scanning for eos_id, so the mask no longer needs the
+        # tokenizer or the raw token ids.
+        attn_config = self.config.first_attention
+        assert attn_config is not None
+        mask_mods = [
+            get_causal_mask_mod(),
+            get_efficient_causal_mask_mod_for_packed_document(positions),
+        ]
+        full_mask = self._create_flex_attention_mask(positions, attn_config, mask_mods)
         if not has_swa:
             return {"full": full_mask}
 
-        assert isinstance(self.config.layer.attention, GatedNormSWAttention.Config)
-        swa_window = self.config.layer.attention.sliding_window_size
-        swa_mask = create_attention_mask(
-            and_masks(*mask_mods, get_sliding_window_mask_mod(swa_window)),
-            B,
-            None,
-            seqlen,
-            seqlen,
+        base_attn = self.config.layer.attention
+        assert isinstance(base_attn, GatedNormSWAttention.Config)
+        swa_mask = self._create_flex_attention_mask(
+            positions,
+            attn_config,
+            mask_mods + [get_sliding_window_mask_mod(base_attn.sliding_window_size)],
         )
         return {"full": full_mask, "swa": swa_mask}
+
+    def preprocess_inputs(
+        self,
+        input_dict: dict[str, torch.Tensor],
+        *,
+        parallel_dims,
+        parallelism,
+    ):
+        """Build masks/CP shards, then add the MoE token mask.
+
+        The MoE loss mask is derived from the CP-sharded labels so its token
+        layout matches the hidden states the router sees; building it before CP
+        would leave it full-length and break indexing inside the router.
+        """
+        inputs, labels, extra_kwargs = super().preprocess_inputs(
+            input_dict, parallel_dims=parallel_dims, parallelism=parallelism
+        )
+        if self.config.enable_token_mask_for_moe:
+            from torchtitan.components.loss import IGNORE_INDEX
+
+            extra_kwargs["loss_mask"] = labels != IGNORE_INDEX
+        return inputs, labels, extra_kwargs

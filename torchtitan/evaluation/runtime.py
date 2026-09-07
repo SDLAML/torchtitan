@@ -23,7 +23,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn.functional as functional
 
-from torchtitan.components.checkpoint import ModelWrapper
+from torchtitan.components.checkpointer import ModelWrapper
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import TORCH_DTYPE_MAP
