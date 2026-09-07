@@ -273,9 +273,17 @@ def apply_fsdp_to_decoder(
         # Dense blocks (no ``moe_enabled``) fall through to a plain fully_shard.
         if getattr(transformer_block, "moe_enabled", False):
             assert hasattr(transformer_block, "moe")
-            # Expert weights live on the grouped-GEMM child (inner_experts).
-            # pyrefly: ignore [missing-attribute]
-            experts = transformer_block.moe.routed_experts.inner_experts
+            # Expert weights live on the grouped-GEMM child (inner_experts) for
+            # common.moe.MoE. A model may supply its own MoE that holds the
+            # grouped expert weights directly (OPT MoE's GroupedExperts does),
+            # so fall back to that rather than assuming the upstream layout.
+            moe = transformer_block.moe
+            routed_experts = getattr(moe, "routed_experts", None)
+            if routed_experts is not None:
+                # pyrefly: ignore [missing-attribute]
+                experts = routed_experts.inner_experts
+            else:
+                experts = moe.experts
             expert_params = set(experts.parameters())
             num_experts = experts.num_experts
 
