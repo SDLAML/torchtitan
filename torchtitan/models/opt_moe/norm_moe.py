@@ -102,9 +102,24 @@ class GroupedExperts(Module):
         norm_everywhere: bool = False,
         norm_type: str | None = "np_rmsnorm",
         norm_eps: float | None = 1e-30,
+        weights_init_stds: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        init_fn_types: tuple[str, str, str] = (
+            "scaled_orthogonal",
+            "scaled_orthogonal",
+            "scaled_orthogonal",
+        ),
+        residual_div: float = 1.0,
+        init_gate_as_residual: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
+        # Held for _init_self_parameters: w1/w2/w3 are raw nn.Parameters on this
+        # module, so Module.init_states calls back here rather than descending
+        # into configurable children.
+        self._weights_init_stds = weights_init_stds
+        self._init_fn_types = init_fn_types
+        self._residual_div = residual_div
+        self._init_gate_as_residual = init_gate_as_residual
         self.dim = dim
         self.hidden_dim = hidden_dim
         self.num_experts = num_experts
@@ -180,6 +195,14 @@ class GroupedExperts(Module):
                 activation=self.act_fn,
                 mid_norm=self.mid_norm,
             )
+
+    def _init_self_parameters(self) -> None:
+        self.init_weights(
+            residual_div=self._residual_div,
+            init_gate_as_residual=self._init_gate_as_residual,
+            weights_init_stds=self._weights_init_stds,
+            init_fn_types=self._init_fn_types,
+        )
 
     def init_weights(
         self,
@@ -266,10 +289,19 @@ class TokenChoiceTopKRouter(Module):
         route_scale: float,
         _debug_force_load_balance: bool = False,
         force_router_fp32_matmul: bool = False,
+        init_std: float = 1.0,
+        init_fn_type: str = "scion_normal_output",
     ):
         super().__init__()
 
-        self.gate = Linear.Config(in_features=dim, out_features=num_experts).build()
+        # The router init has to ride on the gate's config: now that the gate is
+        # a configurable Linear, Module.init_states initializes it through
+        # param_init and would otherwise fall back to nn.Linear.reset_parameters.
+        self.gate = Linear.Config(
+            in_features=dim,
+            out_features=num_experts,
+            param_init={"weight": make_param_init(init_fn_type, init_std)},
+        ).build()
         self.num_experts = num_experts
         self.top_k = top_k
         self.route_scale = route_scale
@@ -569,6 +601,18 @@ class MoE(Module):
             norm_everywhere=config.norm_everywhere,
             norm_type=config.norm_type,
             norm_eps=config.norm_eps,
+            weights_init_stds=(
+                config.w1_init_std,
+                config.w2_init_std,
+                config.w3_init_std,
+            ),
+            init_fn_types=(
+                config.w1_init_fn_type,
+                config.w2_init_fn_type,
+                config.w3_init_fn_type,
+            ),
+            residual_div=config.residual_div,
+            init_gate_as_residual=config.init_gate_as_residual,
         )
         self.router = TokenChoiceTopKRouter(
             dim=dim,
@@ -577,6 +621,8 @@ class MoE(Module):
             route_scale=self.scaling_factor,
             _debug_force_load_balance=config._debug_force_load_balance,
             force_router_fp32_matmul=config.force_router_on_fp32,
+            init_std=config.router_init_std,
+            init_fn_type=config.router_init_fn_type,
         )
         self.reorderer = TokenReorderer(
             num_experts=self.num_experts, top_k=config.top_k
@@ -744,32 +790,6 @@ class MoE(Module):
         )
 
         return out, load_balance_loss
-
-    def _init_self_parameters(self) -> None:
-        """Initialize experts and router.
-
-        ``GroupedExperts`` and ``TokenChoiceTopKRouter`` are plain ``nn.Module``
-        rather than ``Module``, so ``Module.init_states`` walks past them without
-        initializing their parameters -- it only recurses into ``Module``
-        children. Drive them from here. ``shared_experts`` is a ``Module`` and
-        initializes itself from its own ``param_init``.
-        """
-        cfg = self.config
-        self.experts.init_weights(
-            residual_div=cfg.residual_div,
-            init_gate_as_residual=cfg.init_gate_as_residual,
-            weights_init_stds=(
-                cfg.w1_init_std,
-                cfg.w2_init_std,
-                cfg.w3_init_std,
-            ),
-            init_fn_types=(
-                cfg.w1_init_fn_type,
-                cfg.w2_init_fn_type,
-                cfg.w3_init_fn_type,
-            ),
-        )
-        self.router.init_weights(cfg.router_init_std, cfg.router_init_fn_type)
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         self.expert_bias.zero_()
