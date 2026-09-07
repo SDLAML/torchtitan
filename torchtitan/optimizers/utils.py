@@ -199,12 +199,27 @@ def create_disco_param_groups(
     )
     params = []
 
+    def _legacy_name(name: str) -> str:
+        """Pre-0.5.0 spelling of a parameter name.
+
+        Upstream renamed the decoder's unembedding module from ``output`` to
+        ``lm_head``. Thousands of recorded configs in reproduce_cfgs/ and
+        launch_scripts/ match on ``output.weight`` to give the unembedding its
+        own norm factor, and a rule that silently matches nothing would quietly
+        train that tensor under the default spectral norm factor instead.
+        Matching against both spellings keeps those configs correct without
+        rewriting them, and lets new configs use either name.
+        """
+        return name.replace("lm_head", "output")
+
     for param_group_config in param_groups_config:
         # Make a copy to avoid modifying the original
         group_config = param_group_config.copy()
         str_match = group_config.pop("param_str_match")
         filter_fn = functools.partial(re.search, str_match)
-        param_names = [n for n in param_dict.keys() if filter_fn(n)]
+        param_names = [
+            n for n in param_dict.keys() if filter_fn(n) or filter_fn(_legacy_name(n))
+        ]
 
         group_params = {
             "params": [param_dict.pop(n) for n in param_names],
