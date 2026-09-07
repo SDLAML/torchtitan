@@ -7,7 +7,7 @@
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.optimizers.container import OptimizersContainer
 from torchtitan.config.configs import (
     ActivationCheckpointConfig,
     ParallelismConfig,
@@ -52,10 +52,9 @@ def sft_opt_moe_proxy_multiturn() -> SFTTrainerConfig:
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-            selective_ac_option="op",
-        ),
+        # Upstream replaced the mode/selective_ac_option pair with a config
+        # class per policy; per-op SAC is now SelectiveAC.Config.
+        activation_checkpoint=SelectiveAC.Config(),
     )
 
 
@@ -92,10 +91,9 @@ def sft_opt_moe_proxy_gsm8k() -> SFTTrainerConfig:
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-            selective_ac_option="op",
-        ),
+        # Upstream replaced the mode/selective_ac_option pair with a config
+        # class per policy; per-op SAC is now SelectiveAC.Config.
+        activation_checkpoint=SelectiveAC.Config(),
     )
 
 
@@ -131,8 +129,7 @@ def sft_opt_moe_full_multiturn() -> SFTTrainerConfig:
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-            selective_ac_option="op",
-        ),
+        # Upstream replaced the mode/selective_ac_option pair with a config
+        # class per policy; per-op SAC is now SelectiveAC.Config.
+        activation_checkpoint=SelectiveAC.Config(),
     )

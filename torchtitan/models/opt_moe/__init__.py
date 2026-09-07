@@ -6,7 +6,7 @@
 
 import copy
 
-from torchtitan.components.optimizer import register_moe_load_balancing_hook
+from torchtitan.optimizers.container import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common.rope import CosSinRoPE
 

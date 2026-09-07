@@ -6,14 +6,12 @@
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.optimizer import LRSchedulersContainer
+from torchtitan.components.loss import MoEAuxLoss
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.config import (
-    ActivationCheckpointConfig,
-    ParallelismConfig,
-    TrainingConfig,
-)
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+from torchtitan.optimizers.container import OptimizersContainer
+from torchtitan.config import ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.hf_datasets.mixed_text_datasets import HuggingFaceTextDataLoader
 from torchtitan.trainer import Trainer
 from . import model_registry
 
@@ -27,6 +25,9 @@ def moe_template_config() -> Trainer.Config:
             dataset="simple_custom",
         ),
         optimizer=OptimizersContainer.Config(lr=8e-4),
+        # OPT MoE returns (logits, load_balance_loss); this unpacks the tuple and
+        # adds the auxiliary term straight-through.
+        loss=MoEAuxLoss.Config(),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=20),
         training=TrainingConfig(
             local_batch_size=4,
@@ -38,10 +39,9 @@ def moe_template_config() -> Trainer.Config:
             last_save_model_only=False,
             export_dtype="float16",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-            selective_ac_option="op",
-        ),
+        # Upstream replaced the mode/selective_ac_option pair with a config
+        # class per policy; per-op SAC is now SelectiveAC.Config.
+        activation_checkpoint=SelectiveAC.Config(),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
         ),

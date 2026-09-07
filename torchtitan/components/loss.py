@@ -808,3 +808,51 @@ class _DecoderOutputGradientBackProp(torch.autograd.Function):
         # to properly handle. The complicated part is that grad_output might not be
         # on the same device mesh as accumlated_grad.
         return accumulated_grad, None, None
+
+
+class MoEAuxLoss(BaseLoss):
+    """Adds a MoE load-balance auxiliary loss to an inner loss.
+
+    OPT MoE models return ``(logits, load_balance_loss)`` from ``forward`` --
+    upstream's own MoE is aux-loss-free and steers balance through an expert
+    bias updated in an optimizer pre-hook, so there is no upstream equivalent
+    to fold this into.
+
+    The auxiliary term is added straight-through: ``loss + (aux - aux.detach())``
+    contributes the aux gradient without changing the reported loss value, so
+    loss curves stay comparable across aux-loss weights.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseLoss.Config):
+        inner: Any = None
+        """Config of the loss applied to the logits. Defaults to CrossEntropyLoss."""
+
+    def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
+        inner_config = (
+            config.inner if config.inner is not None else CrossEntropyLoss.Config()
+        )
+        self.inner = inner_config.build(compile_config=compile_config)
+        # BaseLoss.fn is unused here: __call__ delegates to the inner loss.
+        self.fn = self.inner.fn
+
+    def __call__(
+        self,
+        pred: Any,
+        labels: torch.Tensor,
+        global_valid_tokens: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        aux_loss = None
+        if isinstance(pred, tuple):
+            pred, aux_loss = pred
+        elif isinstance(pred, dict) and "load_balance_loss" in pred:
+            aux_loss = pred["load_balance_loss"]
+            pred = pred["tokens_list"][0]
+
+        loss, metrics = self.inner(pred, labels, global_valid_tokens, **kwargs)
+        if aux_loss is not None:
+            # Straight-through: gradient of aux flows, its value does not.
+            loss = loss + (aux_loss - aux_loss.detach())
+            metrics = {**metrics, "moe_load_balance_loss": aux_loss.detach()}
+        return loss, metrics

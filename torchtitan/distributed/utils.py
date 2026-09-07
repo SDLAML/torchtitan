@@ -738,3 +738,99 @@ def _clip_grad_norm_with_ep(
     torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach)
 
     return total_norm
+
+
+def get_param_dtype(module: torch.nn.Module) -> torch.dtype | None:
+    """Return the dtype parameters of ``module`` have during forward.
+
+    Uses the FSDP mixed-precision policy when there is one, otherwise the dtype
+    of the first parameter. Returns ``None`` for a module with no parameters.
+    """
+    fsdp_state_fn = getattr(module, "_get_fsdp_state", None)
+    param_dtype = None
+    if fsdp_state_fn is not None:
+        fsdp_state = fsdp_state_fn()
+        param_dtype = fsdp_state._mp_policy.param_dtype
+    # In the non-FSDP case, or if the mixed-precision policy did not set a
+    # param_dtype, fall back to the model parameters.
+    if param_dtype is None:
+        first_param = next(module.parameters(), None)
+        param_dtype = None if first_param is None else first_param.dtype
+    return param_dtype
+
+
+# ---------------------------------------------------------------------------
+# Per-rank ("shard-local") metrics logging -- shared predicate.
+#
+# DiSCO partitions per-parameter metric ownership over exactly one mesh, and
+# `metrics.save_all_shard_ranks` must hand a logger to exactly the ranks of
+# that mesh. When the two disagree the failure is silent: the ranks that own a
+# slice compute it, store it, and have no logger to write it to. That is not
+# hypothetical -- it is what pure DDP did before these helpers existed.
+#
+# Keep this the single source of truth. `components/metrics.py` uses it to
+# decide who builds a logger, and `optimizers/disco.py` uses it to decide who
+# keeps replicated (embed/scalar) metrics and to assert the two agree.
+# ---------------------------------------------------------------------------
+
+
+def metrics_shard_mesh(parallel_dims: "ParallelDims") -> DeviceMesh | None:
+    """The mesh DiSCO spreads per-parameter metric ownership over.
+
+    This mirrors ``disco.get_param_type``'s own branch, and must keep mirroring
+    it:
+
+    * ``fsdp_enabled`` -- every non-scalar param is FSDP or Expert, and both are
+      owned ``param_idx % fsdp_world_size`` on the ``fsdp`` mesh.
+      ``dp_replicate`` then holds bit-identical replicas, so only one replica
+      should log.
+    * otherwise -- every non-scalar param is DDP, owned ``i % world_size`` on
+      the ``dp_replicate`` mesh (``disco._precompute_ddp_metadata``). Here
+      ``dp_replicate`` *is* the shard dimension, so every replica owns a
+      distinct slice and every replica must log.
+
+    Returns None when there is no data-parallel sharding at all (single rank,
+    or PP/TP only), i.e. one rank owns everything.
+    """
+    if parallel_dims.fsdp_enabled:
+        return parallel_dims.get_optional_mesh("fsdp")
+    if parallel_dims.dp_replicate_enabled:
+        return parallel_dims.get_optional_mesh("dp_replicate")
+    return None
+
+
+def metrics_shard_rank(parallel_dims: "ParallelDims") -> tuple[int, int]:
+    """``(local_rank, world_size)`` within ``metrics_shard_mesh``; ``(0, 1)`` if none."""
+    mesh = metrics_shard_mesh(parallel_dims)
+    if mesh is None:
+        return 0, 1
+    return mesh.get_local_rank(), mesh.size()
+
+
+def rank_owns_metrics_shard(parallel_dims: "ParallelDims") -> bool:
+    """Whether this rank owns a distinct slice of the per-parameter metrics.
+
+    The rule ``metrics.save_all_shard_ranks`` is trying to express: *open the
+    mesh ownership is partitioned over, and require local rank 0 in every other
+    mesh.*
+
+    ``tp`` must be rank 0 in both cases -- TP ranks hold shards of the *same*
+    parameter and DiSCO gathers them internally, so they are not distinct
+    logging work.
+    """
+    is_tp_0 = (
+        parallel_dims.get_optional_mesh("tp").get_local_rank() == 0
+        if parallel_dims.tp_enabled
+        else True
+    )
+    if parallel_dims.fsdp_enabled:
+        # `fsdp` is the shard mesh; replicas duplicate it, so pin to replica 0.
+        is_rep_0 = (
+            parallel_dims.get_optional_mesh("dp_replicate").get_local_rank() == 0
+            if parallel_dims.dp_replicate_enabled
+            else True
+        )
+    else:
+        # `dp_replicate` IS the shard mesh -- every replica owns its own slice.
+        is_rep_0 = True
+    return is_tp_0 and is_rep_0

@@ -215,7 +215,16 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
         return groups, patterns
 
-    def __init__(self, config: Config, *, model_parts: list[nn.Module]) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        model_parts: list[nn.Module],
+        **kwargs: Any,
+    ) -> None:
+        # The trainer passes parallel_dims for containers whose parameter
+        # grouping depends on the mesh topology (DiSCO). Ignored here.
+        del kwargs
         impl_kwargs = self._build_impl_kwargs(config)
         param_group_configs = config.param_groups
         all_params = []
