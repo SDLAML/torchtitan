@@ -10,7 +10,7 @@ from torchtitan.components.loss import MoEAuxLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.validate import Validator
 from torchtitan.optimizers.container import OptimizersContainer
-from torchtitan.config import ParallelismConfig, TrainingConfig
+from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.mixed_text_datasets import HuggingFaceTextDataLoader
 from torchtitan.trainer import Trainer
@@ -55,4 +55,7 @@ def moe_template_config() -> Trainer.Config:
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
         ),
+        # scripts/checkpoint_conversion/convert_to_hf.py reconstructs the model
+        # spec from this file, so opt_moe runs always write it.
+        debug=DebugConfig(save_config_file="job_config.json"),
     )

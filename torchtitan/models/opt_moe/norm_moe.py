@@ -560,7 +560,7 @@ class MoE(Module):
 
         hidden_dim = config.hidden_dim
         self.experts = GroupedExperts(
-            layer_id=layer_id,
+            layer_id=self.layer_id,
             dim=dim,
             hidden_dim=hidden_dim,
             num_experts=self.num_experts,
