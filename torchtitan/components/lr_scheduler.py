@@ -52,15 +52,9 @@ class LRSchedulersContainer(Stateful, Configurable):
         schedule_type: Literal["wsd", "aus"] = "wsd"
         """
         Top-level schedule family. 'wsd' preserves the existing
-        warmup/stable/decay behavior. 'aus' applies the shared
-        inverse-square-root Angular Update Size schedule.
-        """
-
-        aus_coefficient: float = 0.5
-        """
-        Shared AUS coefficient. With the AUS schedule, every corrected
-        parameter group uses AUS(t) = aus_coefficient / sqrt(t). Per-group
-        coefficients are intentionally not supported by this prototype.
+        warmup/stable/decay behavior. 'aus' applies an inverse-square-root
+        Angular Update Size schedule using each optimizer parameter group's
+        aus_coefficient (default 0.5).
         """
 
         warmup_steps: int = 200
@@ -124,17 +118,19 @@ class LRSchedulersContainer(Stateful, Configurable):
                         "lr_scheduler.schedule_type='aus' requires "
                         "optimizer.aus_enabled=true for every parameter group."
                     )
-                if (
-                    not math.isfinite(self.aus_coefficient)
-                    or self.aus_coefficient <= 0
-                ):
-                    raise ValueError("lr_scheduler.aus_coefficient must be positive.")
+                for optimizer_index, optimizer in enumerate(optimizer_list):
+                    for group_index, group in enumerate(optimizer.param_groups):
+                        coefficient = group.get("aus_coefficient", 0.5)
+                        if not math.isfinite(coefficient) or coefficient <= 0:
+                            raise ValueError(
+                                "aus_coefficient must be finite and positive "
+                                f"for optimizer {optimizer_index}, group {group_index}."
+                            )
 
-                # This prototype deliberately has one shared AUS schedule. Reset
-                # every group's base LR before LambdaLR snapshots its base_lrs.
+                # Reset each group's base LR before LambdaLR snapshots it.
                 for optimizer in optimizer_list:
                     for group in optimizer.param_groups:
-                        group["lr"] = self.aus_coefficient
+                        group["lr"] = group.get("aus_coefficient", 0.5)
                         group.pop("initial_lr", None)
 
                 def aus_inverse_sqrt(current_step: int) -> float:
@@ -144,7 +140,7 @@ class LRSchedulersContainer(Stateful, Configurable):
                 return LRSchedulersContainer(
                     optimizer_list,
                     aus_inverse_sqrt,
-                    aus_coefficient=self.aus_coefficient,
+                    aus_enabled=True,
                 )
 
             if any(aus_group_flags):
@@ -256,17 +252,21 @@ class LRSchedulersContainer(Stateful, Configurable):
         optimizers: OptimizersContainer | Sequence[Any],
         lr_lambda: Callable,
         *,
-        aus_coefficient: float | None = None,
+        aus_enabled: bool = False,
     ) -> None:
         assert len(optimizers) > 0, (
             "Must have at least one optimizer to create LRScheduler"
         )
 
         self.preserve_lrs_when_loading = False
-        # Keep this on the container, outside the serialized LambdaLR state,
-        # so old WSD checkpoints need no additional scheduler keys.
-        self.aus_coefficient = aus_coefficient
         self.schedulers = [LambdaLR(optimizer, lr_lambda) for optimizer in optimizers]
+        # Snapshot this run's coefficients outside the serialized LambdaLR
+        # state, so optimizer/scheduler checkpoint loads cannot replace them.
+        self._aus_base_lrs = (
+            [list(scheduler.base_lrs) for scheduler in self.schedulers]
+            if aus_enabled
+            else None
+        )
 
     def __iter__(self) -> Iterator[LRScheduler]:
         return iter(self.schedulers)
@@ -280,24 +280,25 @@ class LRSchedulersContainer(Stateful, Configurable):
 
     def state_dict(self) -> dict[str, Any]:
         # While there may be multiple schedulers, we only save the first one because
-        # the state_dict is the same for all. See the limitations section in the
-        # docstring.
+        # schedule step is the same for all. AUS restores each optimizer's
+        # configured base LRs separately. See the limitations in the docstring.
         return self.schedulers[0].state_dict()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        if self.aus_coefficient is not None:
+        if self._aus_base_lrs is not None:
             # Optimizer state is loaded before scheduler state. Resume the
-            # saved step, but always use this run's shared AUS coefficient,
-            # including on the very first update after loading WSD/AUS state.
-            for scheduler in self.schedulers:
+            # saved step using this run's per-group AUS coefficients, including
+            # on the very first update after loading WSD/AUS state.
+            for scheduler, coefficients in zip(self.schedulers, self._aus_base_lrs):
                 scheduler.load_state_dict(copy.deepcopy(state_dict))
-                groups = scheduler.optimizer.param_groups
-                scheduler.base_lrs = [self.aus_coefficient] * len(groups)
-                lr = self.aus_coefficient / math.sqrt(scheduler.last_epoch + 1)
-                for group in groups:
-                    group["initial_lr"] = self.aus_coefficient
-                    group["lr"] = lr
-                scheduler._last_lr = [lr] * len(groups)
+                scheduler.base_lrs = list(coefficients)
+                factor = 1.0 / math.sqrt(scheduler.last_epoch + 1)
+                for group, coefficient in zip(
+                    scheduler.optimizer.param_groups, coefficients
+                ):
+                    group["initial_lr"] = coefficient
+                    group["lr"] = coefficient * factor
+                scheduler._last_lr = [c * factor for c in coefficients]
             return
 
         if self.preserve_lrs_when_loading:

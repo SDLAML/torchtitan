@@ -4,12 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
+import math
 import unittest
 from unittest.mock import MagicMock
 
 import torch
 from torch.optim import Adam
 
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import ConfigManager
 
@@ -80,7 +83,7 @@ class TestLRScheduler(unittest.TestCase):
         return config
 
     def test_aus_inverse_sqrt(self):
-        """AUS enforces the shared coefficient and bypasses WSD."""
+        """AUS defaults to 0.5 and bypasses WSD and the optimizer LR."""
         config = self.create_trainer_config(
             training_steps=5,
             schedule_type="aus",
@@ -104,6 +107,81 @@ class TestLRScheduler(unittest.TestCase):
                 ),
             )
             lr_scheduler.step()
+
+    def test_aus_group_coefficients_across_optimizers_and_resume(self):
+        optimizers = [
+            Adam(
+                [
+                    {"params": [self.model.weight], "aus_coefficient": 0.2},
+                    {"params": [self.model.bias]},  # Default coefficient is 0.5.
+                ],
+                lr=0.123,
+            ),
+            Adam([torch.nn.Parameter(torch.ones(1))], lr=0.9),
+        ]
+        optimizers[1].param_groups[0]["aus_coefficient"] = 0.8
+        for optimizer in optimizers:
+            optimizer._opt_called = True
+            for group in optimizer.param_groups:
+                group["aus_enabled"] = True
+                group["initial_lr"] = 0.01  # Stale scheduler base must be ignored.
+        config = LRSchedulersContainer.Config(schedule_type="aus")
+        scheduler = config.build(optimizers=optimizers, training_steps=5)
+        coefficients = [[0.2, 0.5], [0.8]]
+        for update_number in range(1, 4):
+            for optimizer, group_coefficients in zip(optimizers, coefficients):
+                for group, coefficient in zip(
+                    optimizer.param_groups, group_coefficients
+                ):
+                    self.assertAlmostEqual(
+                        group["lr"], coefficient / math.sqrt(update_number)
+                    )
+            scheduler.step()
+
+        saved = copy.deepcopy(scheduler.state_dict())
+        original_saved = copy.deepcopy(saved)
+        optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        # Reconfigure one group, then simulate optimizer state being loaded first.
+        optimizers[0].param_groups[0]["aus_coefficient"] = 0.6
+        coefficients[0][0] = 0.6
+        resumed = config.build(optimizers=optimizers, training_steps=5)
+        for optimizer, state in zip(optimizers, optimizer_states):
+            optimizer.load_state_dict(state)
+        resumed.load_state_dict(saved)
+        self.assertEqual(saved, original_saved)
+        for child, group_coefficients in zip(resumed, coefficients):
+            self.assertEqual(child.last_epoch, 3)
+            self.assertEqual(child.base_lrs, group_coefficients)
+            self.assertEqual(child.get_last_lr(), [c / 2 for c in group_coefficients])
+            for group, coefficient in zip(
+                child.optimizer.param_groups, group_coefficients
+            ):
+                self.assertEqual(group["initial_lr"], coefficient)
+                self.assertEqual(group["lr"], coefficient / 2)
+        resumed.step()
+        for optimizer, group_coefficients in zip(optimizers, coefficients):
+            for group, coefficient in zip(optimizer.param_groups, group_coefficients):
+                self.assertAlmostEqual(group["lr"], coefficient / math.sqrt(5))
+
+    def test_aus_rejects_invalid_group_coefficients_before_changing_lrs(self):
+        for coefficient in (0.0, -0.1, float("inf"), float("-inf"), float("nan")):
+            with self.subTest(coefficient=coefficient):
+                optimizer = Adam(
+                    [
+                        {"params": [self.model.weight], "aus_coefficient": 0.2},
+                        {"params": [self.model.bias], "aus_coefficient": coefficient},
+                    ],
+                    lr=0.123,
+                )
+                for group in optimizer.param_groups:
+                    group["aus_enabled"] = True
+                with self.assertRaisesRegex(ValueError, "aus_coefficient.*group 1"):
+                    LRSchedulersContainer.Config(schedule_type="aus").build(
+                        optimizers=[optimizer], training_steps=5
+                    )
+                self.assertEqual(
+                    [group["lr"] for group in optimizer.param_groups], [0.123, 0.123]
+                )
 
     def test_aus_requires_optimizer_correction(self):
         config = self.create_trainer_config(

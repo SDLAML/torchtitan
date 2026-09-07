@@ -238,6 +238,7 @@ class DiSCO(AbstractDiSCO):
         extra_reduce_for_HSDP=False,
         experts_weights_layout="G-D_out-D_in",
         aus_enabled=False,
+        aus_coefficient=0.5,
     ):
         env_vars = parse_env_var()
         logger.info(f"[DiSCO] Environment variables: {env_vars}")
@@ -263,6 +264,7 @@ class DiSCO(AbstractDiSCO):
             norm_factor=norm_factor if not debug_mode else "none",
             pre_norm=pre_norm,
             aus_enabled=aus_enabled,
+            aus_coefficient=aus_coefficient,
             backend=backend if not debug_mode else "identity",
             backend_steps=backend_steps,
             splits_into=None,  # should be explicitly set in the extra_param_group_split_rules
@@ -661,6 +663,7 @@ class DiSCO(AbstractDiSCO):
         "splits_dim",
         "pre_norm",
         "aus_enabled",
+        "aus_coefficient",
     )
 
     def load_state_dict(self, state_dict):
@@ -705,9 +708,10 @@ class DiSCO(AbstractDiSCO):
         """
         optional_config_defaults = {
             "pre_norm": "identity",
-            # Checkpoints created before the AUS prototype do not have this
-            # group key. The current run's value is restored below.
+            # Older checkpoints may omit AUS settings. The current run's
+            # values are restored below.
             "aus_enabled": False,
+            "aus_coefficient": 0.5,
         }
 
         def config_group_value(group, key):

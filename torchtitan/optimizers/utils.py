@@ -61,6 +61,7 @@ def create_disco_optimizer_kwargs_from_optimizer_config(
         "pre_norm": pre_norm,
         "backend": zeropower_backend_algorithm,
         "aus_enabled": aus_enabled,
+        "aus_coefficient": getattr(optimizer_config, "aus_coefficient", 0.5),
         "backend_steps": backend_steps,
     }
 
@@ -142,6 +143,7 @@ def create_disco_param_groups(
         "norm_factor": optimizer_kwargs.get("norm_factor"),
         "pre_norm": optimizer_kwargs.get("pre_norm", "identity"),
         "aus_enabled": optimizer_kwargs.get("aus_enabled", False),
+        "aus_coefficient": optimizer_kwargs.get("aus_coefficient", 0.5),
         "backend": optimizer_kwargs.get("backend"),
         "backend_steps": optimizer_kwargs.get("backend_steps"),
         # should be explicitly set in the extra_param_group_split_rules

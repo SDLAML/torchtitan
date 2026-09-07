@@ -21,23 +21,36 @@ Enable the paired optimizer and scheduler settings:
 ```text
 --optimizer.aus_enabled
 --lr_scheduler.schedule_type aus
---lr_scheduler.aus_coefficient 0.5
+--optimizer.aus_coefficient 0.5
 ```
 
-The coefficient defaults to `0.5`, giving the shared schedule
-`AUS(t) = 0.5 / sqrt(t)` with `t=1` for the first optimizer update. The
-scheduler deliberately resets every corrected parameter group to this shared
-coefficient; separate coefficients per group are not part of this prototype.
+Each parameter group uses `AUS(t) = aus_coefficient / sqrt(t)`, with `t=1`
+for the first optimizer update. `optimizer.aus_coefficient` supplies the default
+(`0.5`); override it in `optimizer.extra_param_group_split_rules` for individual
+groups, using the same regex matching as other DiSCO group settings:
+
+```python
+config.optimizer.aus_coefficient = 0.5
+config.optimizer.extra_param_group_split_rules = [
+    {"str_match": "tok_embeddings", "norm_factor": "embed_sqrt", "aus_coefficient": 0.2},
+    {"str_match": "output", "norm_factor": "unembed_sqrt", "aus_coefficient": 0.3},
+]
+```
+
+Unmatched parameters use `0.5` in this example. Every coefficient must be finite
+and positive. The AUS scheduler sets each group's nominal LR from its coefficient;
+`lr` overrides do not affect AUS. The former `lr_scheduler.aus_coefficient` setting
+has moved to `optimizer.aus_coefficient`.
 
 When resuming a full checkpoint, the saved step number is retained and the
-current run's `aus_coefficient` determines the LR, including the first resumed
-update. This also applies when switching from WSD or changing the coefficient;
+current run's per-group coefficients determine the LRs, including the first
+resumed update. This also applies when switching from WSD or changing coefficients;
 `checkpoint.reconfigure_lrs` is not required for AUS.
 
-`aus_enabled` is taken from the current run's configuration and is omitted
-from TorchTitan's flattened optimizer checkpoint schema, so checkpoints
-predating AUS do not need this field. Other existing checkpoint requirements
-(such as momentum and radial state) still apply.
+`aus_enabled` and `aus_coefficient` are taken from the current run's configuration
+and are omitted from TorchTitan's flattened optimizer checkpoint schema, so
+checkpoints predating AUS do not need these fields. Other existing checkpoint
+requirements (such as momentum and radial state) still apply.
 
 The correction is recomputed from the current weight and post-LMO update
 immediately before every update. `spectral`/`rmnp_row_norm_rms_rms` use the

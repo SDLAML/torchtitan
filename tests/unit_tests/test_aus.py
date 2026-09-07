@@ -261,9 +261,9 @@ class TestAUSDiSCODDP(unittest.TestCase):
             lr=0.01,
             weight_decay=0.0,
         )
-        scheduler = LRSchedulersContainer.Config(
-            schedule_type="aus", aus_coefficient=0.5
-        ).build(optimizers=[optimizer], training_steps=2)
+        scheduler = LRSchedulersContainer.Config(schedule_type="aus").build(
+            optimizers=[optimizer], training_steps=2
+        )
 
         updates = (
             torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
@@ -427,11 +427,24 @@ class TestAUSDiSCODDP(unittest.TestCase):
 class TestAUSCheckpointCPU(unittest.TestCase):
     """Exercise in-memory checkpoint state only; no process group or DCP I/O."""
 
-    def _make_container(self, *, aus_enabled):
+    def _make_container(
+        self, *, aus_enabled, aus_coefficient=0.5, group_coefficient=None
+    ):
         model = torch.nn.Linear(2, 2, bias=False)
+        split_rules = []
+        if group_coefficient is not None:
+            model = torch.nn.Sequential(
+                torch.nn.Linear(2, 2, bias=False),
+                torch.nn.Linear(2, 2, bias=False),
+            )
+            split_rules = [
+                {"str_match": r"^1\.weight$", "aus_coefficient": group_coefficient}
+            ]
         config = OptimizersContainer.Config(
             name="DiSCO",
             aus_enabled=aus_enabled,
+            aus_coefficient=aus_coefficient,
+            extra_param_group_split_rules=split_rules,
             norm_factor="rmnp_row_norm",
             zeropower_backend="identity",
             lr=0.01,
@@ -461,6 +474,7 @@ class TestAUSCheckpointCPU(unittest.TestCase):
             )
         )
         del legacy["param_groups.weight.aus_enabled"]
+        del legacy["param_groups.weight.aus_coefficient"]
         for enabled in (False, True):
             with self.subTest(aus_enabled=enabled):
                 model, container = self._make_container(aus_enabled=enabled)
@@ -468,6 +482,7 @@ class TestAUSCheckpointCPU(unittest.TestCase):
                 container.load_state_dict(legacy)
                 optimizer = container.optimizers[0]
                 self.assertEqual(optimizer.param_groups[0]["aus_enabled"], enabled)
+                self.assertEqual(optimizer.param_groups[0]["aus_coefficient"], 0.5)
                 torch.testing.assert_close(
                     optimizer.state[model.weight]["momentum_buffer"],
                     torch.full_like(model.weight, 3.0),
@@ -502,22 +517,40 @@ class TestAUSCheckpointCPU(unittest.TestCase):
         restored.load_state_dict(saved)
         torch.testing.assert_close(restored.state_dict(), saved)
 
-    def test_prototype_checkpoint_flag_does_not_override_run_config(self):
+    def test_checkpoint_aus_settings_do_not_override_run_config(self):
         _, container = self._make_container(aus_enabled=True)
         state = copy.deepcopy(container.state_dict())
         state["param_groups.weight.aus_enabled"] = False
+        state["param_groups.weight.aus_coefficient"] = 0.1
         container.load_state_dict(state)
-        self.assertTrue(container.optimizers[0].param_groups[0]["aus_enabled"])
+        group = container.optimizers[0].param_groups[0]
+        self.assertTrue(group["aus_enabled"])
+        self.assertEqual(group["aus_coefficient"], 0.5)
         self.assertFalse(state["param_groups.weight.aus_enabled"])
+        self.assertEqual(state["param_groups.weight.aus_coefficient"], 0.1)
+
+    def test_direct_optimizer_restore_preserves_group_coefficient(self):
+        _, old = self._make_container(aus_enabled=True, aus_coefficient=0.1)
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                state = copy.deepcopy(old.optimizers[0].state_dict())
+                if legacy:
+                    del state["param_groups"][0]["aus_coefficient"]
+                _, new = self._make_container(aus_enabled=True, aus_coefficient=0.7)
+                new.optimizers[0].load_state_dict(state)
+                self.assertEqual(new.optimizers[0].param_groups[0]["aus_coefficient"], 0.7)
 
     def test_resume_uses_configured_aus_at_saved_step(self):
         for source_schedule in ("wsd", "aus"):
             for reconfigure_lrs in (False, True):
                 with self.subTest(source=source_schedule, reconfigure=reconfigure_lrs):
-                    _, old = self._make_container(aus_enabled=source_schedule == "aus")
+                    _, old = self._make_container(
+                        aus_enabled=source_schedule == "aus",
+                        aus_coefficient=0.1,
+                        group_coefficient=0.2,
+                    )
                     old_scheduler = LRSchedulersContainer.Config(
                         schedule_type=source_schedule,
-                        aus_coefficient=0.1,
                         warmup_steps=0,
                     ).build(optimizers=old, training_steps=100)
                     for _ in range(3):
@@ -526,39 +559,46 @@ class TestAUSCheckpointCPU(unittest.TestCase):
                     optimizer_state = copy.deepcopy(old.state_dict())
                     scheduler_state = copy.deepcopy(old_scheduler.state_dict())
 
-                    model, new = self._make_container(aus_enabled=True)
-                    scheduler = LRSchedulersContainer.Config(
-                        schedule_type="aus", aus_coefficient=0.5
-                    ).build(optimizers=new, training_steps=100)
+                    model, new = self._make_container(
+                        aus_enabled=True, group_coefficient=0.8
+                    )
+                    scheduler = LRSchedulersContainer.Config(schedule_type="aus").build(
+                        optimizers=new, training_steps=100
+                    )
                     new.preserve_lrs_when_loading = reconfigure_lrs
                     scheduler.preserve_lrs_when_loading = reconfigure_lrs
                     new.load_state_dict(optimizer_state)
                     scheduler.load_state_dict(scheduler_state)
                     optimizer = new.optimizers[0]
-                    group = optimizer.param_groups[0]
                     self.assertEqual(scheduler.schedulers[0].last_epoch, 3)
-                    self.assertEqual(scheduler.schedulers[0].base_lrs, [0.5])
-                    self.assertEqual(scheduler.schedulers[0].get_last_lr(), [0.25])
-                    self.assertEqual(group["initial_lr"], 0.5)
-                    self.assertEqual(group["lr"], 0.25)
+                    self.assertEqual(scheduler.schedulers[0].base_lrs, [0.5, 0.8])
+                    self.assertEqual(scheduler.schedulers[0].get_last_lr(), [0.25, 0.4])
 
-                    # Check the first actual resumed displacement, before the
-                    # scheduler is advanced again by the training loop.
-                    with torch.no_grad():
-                        model.weight.copy_(torch.diag(torch.tensor([3.0, 1.0])))
-                    before = model.weight.detach().clone()
-                    model.weight.grad = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-                    optimizer.param_groups[0]["momentum"] = 0.0
-                    correction = calculate_aus_correction(
-                        before, model.weight.grad, "rms_to_inf"
-                    )["correction"]
+                    # Check each group's first actual resumed displacement,
+                    # before the scheduler advances again in the training loop.
+                    expected_weights = []
+                    for group, coefficient in zip(optimizer.param_groups, (0.5, 0.8)):
+                        self.assertEqual(group["aus_coefficient"], coefficient)
+                        self.assertEqual(group["initial_lr"], coefficient)
+                        self.assertEqual(group["lr"], coefficient / 2)
+                        weight = group["params"][0]
+                        with torch.no_grad():
+                            weight.copy_(torch.diag(torch.tensor([3.0, 1.0])))
+                        before = weight.detach().clone()
+                        weight.grad = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+                        group["momentum"] = 0.0
+                        correction = calculate_aus_correction(
+                            before, weight.grad, "rms_to_inf"
+                        )["correction"]
+                        expected_weights.append(
+                            before - coefficient / 2 * correction * weight.grad
+                        )
                     new.step()
-                    torch.testing.assert_close(
-                        model.weight.detach(),
-                        before - 0.25 * correction * model.weight.grad,
-                    )
+                    for weight, expected in zip(model.parameters(), expected_weights):
+                        torch.testing.assert_close(weight.detach(), expected)
                     scheduler.step()
-                    self.assertAlmostEqual(group["lr"], 0.5 / math.sqrt(5))
+                    for group, coefficient in zip(optimizer.param_groups, (0.5, 0.8)):
+                        self.assertAlmostEqual(group["lr"], coefficient / math.sqrt(5))
 
 
 if __name__ == "__main__":

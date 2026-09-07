@@ -114,7 +114,14 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         research implementation supports replicated dense DDP parameters only;
         FSDP, TP, expert/MoE parameters, and split logical matrices are rejected.
         The paired AUS scheduler sets every corrected parameter group's LR to
-        its shared nominal AUS value before each optimizer update.
+        its nominal AUS value before each optimizer update.
+        """
+
+        aus_coefficient: float = 0.5
+        """
+        Default per-group AUS coefficient: AUS(t) = aus_coefficient / sqrt(t).
+        Override in extra_param_group_split_rules for individual groups.
+        Must be finite and positive when using the AUS schedule.
         """
 
         pre_norm: str = "identity"
@@ -296,24 +303,28 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         }
 
     def state_dict(self) -> dict[str, Any]:
-        # AUS enablement belongs to this run's config. Do not make it a
-        # required DCP key: older checkpoints must pass strict load planning.
+        # AUS settings belong to this run's config. Do not make them required
+        # DCP keys: older checkpoints must pass strict load planning.
         return {
             k: v
             for k, v in self._get_state_dict_with_aus_config().items()
-            if not (k.startswith("param_groups.") and k.endswith(".aus_enabled"))
+            if not (
+                k.startswith("param_groups.")
+                and k.endswith((".aus_enabled", ".aus_coefficient"))
+            )
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         # PyTorch's flattened-state reconstruction expects every current
-        # group key. Supply this config-only field before reconstruction,
-        # also overriding any value saved by the initial AUS prototype.
+        # group key. Supply these config-only fields before reconstruction,
+        # also overriding any values saved by earlier AUS implementations.
         state_dict = dict(state_dict)
         state_dict.update(
             {
                 k: v
                 for k, v in self._get_state_dict_with_aus_config().items()
-                if k.startswith("param_groups.") and k.endswith(".aus_enabled")
+                if k.startswith("param_groups.")
+                and k.endswith((".aus_enabled", ".aus_coefficient"))
             }
         )
         if self.preserve_lrs_when_loading:
