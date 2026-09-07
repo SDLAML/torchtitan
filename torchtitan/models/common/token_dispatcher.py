@@ -1191,7 +1191,13 @@ def update_ep_token_dispatcher_config(model_config: Any, config: Any) -> None:
         moe_cfg = getattr(layer_cfg, "moe", None)
         if moe_cfg is None:
             continue
-        token_dispatcher_cfg = moe_cfg.routed_experts.token_dispatcher
+        # A model may supply its own MoE rather than common.moe.MoE (OPT MoE
+        # does, with its own routing and no token dispatcher). Those configs
+        # have no routed_experts, and there is nothing here to fill in for them.
+        routed_experts_cfg = getattr(moe_cfg, "routed_experts", None)
+        if routed_experts_cfg is None:
+            continue
+        token_dispatcher_cfg = routed_experts_cfg.token_dispatcher
         if not isinstance(
             token_dispatcher_cfg,
             (

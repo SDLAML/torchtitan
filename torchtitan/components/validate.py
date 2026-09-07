@@ -50,8 +50,25 @@ class BaseValidator(Configurable):
     def validate(self, model_parts: list[nn.Module], step: int) -> None:
         raise NotImplementedError("validate method not implemented")
 
-    def should_validate(self, step: int) -> bool:
-        return step == 1 or step % self.config.freq == 0
+    def should_validate(self, step: int, total_steps: int | None = None) -> bool:
+        """Whether to run validation at ``step``.
+
+        ``freq <= 0`` disables periodic validation outright: ``freq == 0`` would
+        raise ZeroDivisionError on ``step % freq``, and a negative freq does not
+        error but is misleading -- Python's ``%`` only cares about magnitude for
+        the ``== 0`` check, so ``freq == -1`` would validate every step instead
+        of disabling anything.
+
+        ``total_steps`` additionally forces a final validation on the last step
+        even when it does not land on a ``freq`` boundary.
+        """
+        if self.config.freq <= 0:
+            return False
+        return (
+            step == 1
+            or step % self.config.freq == 0
+            or (total_steps is not None and step == total_steps)
+        )
 
 
 class Validator(BaseValidator):

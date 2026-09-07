@@ -10,6 +10,22 @@
 # You can obtain it from https://github.com/pytorch/ao by following the
 # installation instructions.
 
+"""BitNet model converter -- NOT WIRED UP.
+
+Carried forward unchanged from llm-0.4.0, where it was already dead code: it
+imports ``torchtitan.config.job_config`` (the pre-Configurable JobConfig API),
+which did not exist on that branch either, and nothing references it. It is
+kept so the implementation is not lost, but it will not import as-is.
+
+To revive it on this base:
+  * ``JobConfig`` -> ``Trainer.Config``; ``job_config.bitnet`` becomes a field
+    on a Config dataclass.
+  * ``torchtitan.protocols.model_converter`` was removed upstream. Converters
+    are now ``BaseModelConverter`` implementations (``protocols/model.py``)
+    with a ``convert(model_config) -> model_config`` method, ordered by
+    ``models/utils.validate_converter_order``.
+"""
+
 import torch.nn as nn
 
 from torchtitan.config.job_config import BitNet, JobConfig

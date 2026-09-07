@@ -670,7 +670,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
-            states={"train_state": self},
+            states={"train_state": self, "ema_optimizer": self.ema_optimizer},
             sd_adapter=(
                 model_spec.state_dict_adapter(model_config, config.hf_assets_path)
                 if model_spec.state_dict_adapter
@@ -1243,7 +1243,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
                     # Run validation if validator is available
                     if self.config.validator.enable and self.validator.should_validate(
-                        self.step
+                        self.step, total_steps=config.training.steps
                     ):
                         self.validator.validate(self.model_parts, self.step)
 

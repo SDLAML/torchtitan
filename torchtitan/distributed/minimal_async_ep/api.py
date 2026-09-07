@@ -101,7 +101,12 @@ def maybe_update_minimal_async_ep_config(model_config: Any, config: Any) -> None
         moe_cfg = getattr(layer_cfg, "moe", None)
         if moe_cfg is None:
             continue
-        token_dispatcher_cfg = moe_cfg.routed_experts.token_dispatcher
+        # Models with their own MoE (rather than common.moe.MoE) have no
+        # routed_experts and therefore no token dispatcher to configure.
+        routed_experts_cfg = getattr(moe_cfg, "routed_experts", None)
+        if routed_experts_cfg is None:
+            continue
+        token_dispatcher_cfg = routed_experts_cfg.token_dispatcher
         if isinstance(token_dispatcher_cfg, MinimalAsyncEPTokenDispatcher.Config):
             dispatcher_cfgs.append(token_dispatcher_cfg)
 
