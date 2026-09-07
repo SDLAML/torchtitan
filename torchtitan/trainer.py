@@ -550,14 +550,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Set lm_head reference for ChunkedLossWrapper after model construction.
         # Non-PP: single model part always has lm_head.
         # PP: only the last stage has lm_head; non-last stages skip this.
-        if isinstance(self.loss_fn, ChunkedLossWrapper):
+        # A loss may wrap the chunked one (MoEAuxLoss does, to add the MoE
+        # load-balance term), so look one level in rather than only at the top.
+        chunked_loss_fn = (
+            self.loss_fn
+            if isinstance(self.loss_fn, ChunkedLossWrapper)
+            else getattr(self.loss_fn, "inner", None)
+        )
+        if isinstance(chunked_loss_fn, ChunkedLossWrapper):
             if parallel_dims.pp_enabled:
                 if self.pp_has_last_stage:
                     lm_head = self.model_parts[-1].lm_head
                     assert (
                         lm_head is not None
                     ), "Last PP stage must have lm_head for ChunkedLossWrapper"
-                    self.loss_fn.set_lm_head(
+                    chunked_loss_fn.set_lm_head(
                         lm_head  # pyrefly: ignore[bad-argument-type]
                     )
                     self.model_parts[
@@ -569,7 +576,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 assert (
                     lm_head is not None
                 ), "Model must have lm_head for ChunkedLossWrapper"
-                self.loss_fn.set_lm_head(lm_head)  # pyrefly: ignore[bad-argument-type]
+                chunked_loss_fn.set_lm_head(lm_head)  # pyrefly: ignore[bad-argument-type]
                 self.model_parts[
                     0
                 ]._skip_lm_head = True  # pyrefly: ignore[bad-argument-type]
