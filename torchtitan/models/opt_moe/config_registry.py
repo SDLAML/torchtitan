@@ -43,6 +43,12 @@ def moe_template_config() -> Trainer.Config:
             local_batch_size=4,
             seq_len=4096,
             steps=100,
+            # CUDA graphs require fixed shapes and no host sync inside the
+            # captured region. OPT MoE's token-choice routing computes
+            # per-expert token counts on the host for the grouped-GEMM offsets,
+            # so the capture is invalid -- upstream notes the same limitation
+            # for EP backends that synchronize during dispatch.
+            disable_cuda_graphs=True,
         ),
         checkpoint=CheckpointManager.Config(
             interval=50,
