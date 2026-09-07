@@ -219,7 +219,7 @@ class OPTMoETransformerBlock(TransformerBlock):
             mlp_output, lbl_loss = self.moe(self.ffn_norm(h), loss_mask)
         else:
             mlp_output = self.feed_forward(self.ffn_norm(h))
-            lbl_loss = h.new_zeros(())
+            lbl_loss = None
 
         return self.identity_scale * h + self.block_scale * mlp_output, lbl_loss
 

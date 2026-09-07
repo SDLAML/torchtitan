@@ -596,12 +596,22 @@ class CheckpointManager(BaseCheckpointManager):
         # resumes continue exactly. If world size changes, omit it during load and
         # keep each rank's newly initialized RNG stream.
         states = self._states_to_load(model_only)
+        # An optional component enabled now but absent from the checkpoint (EMA
+        # turned on for a resume, or a checkpoint predating it) would make DCP's
+        # load planner raise "Missing key in checkpoint state_dict" before any
+        # component's own load_state_dict runs. Drop it here and cold-start it
+        # from the resumed weights afterwards.
+        reseed_optional = self._exclude_missing_optional_states(
+            states, checkpoint_id, model_only
+        )
         self.dcp_load(
             states,
             checkpoint_id=checkpoint_id,
             from_hf=from_hf,
             from_quantized=from_quantized,
         )
+        for key in reseed_optional:
+            self.states[key].load_state_dict({})
 
         GarbageCollection.collect("GC collection for checkpoint loading.")
         logger.info(
@@ -692,6 +702,41 @@ class CheckpointManager(BaseCheckpointManager):
         if MODEL in states:
             sd.update(states[MODEL].state_dict())
         return sd
+
+    _OPTIONAL_RESUME_STATES: tuple[str, ...] = ("ema_optimizer",)
+    """States that may legitimately be absent from an existing checkpoint."""
+
+    def _checkpoint_has_prefix(self, checkpoint_id: str, prefix: str) -> bool:
+        """Whether the on-disk checkpoint has any key starting with ``prefix``."""
+        try:
+            metadata = dcp.FileSystemReader(checkpoint_id).read_metadata()
+            return any(k.startswith(prefix) for k in metadata.state_dict_metadata)
+        except Exception:
+            return False
+
+    def _exclude_missing_optional_states(
+        self, states_to_load: dict[str, Any], checkpoint_id: str, model_only: bool
+    ) -> list[str]:
+        """Drop optional states absent from this checkpoint, in place.
+
+        Returns the keys the caller must reseed (via ``load_state_dict({})``)
+        once the model is loaded, so they cold-start from the resumed weights.
+        A model-only load never carries them in the first place.
+        """
+        if model_only:
+            return []
+        reseed = []
+        for key in self._OPTIONAL_RESUME_STATES:
+            if key in states_to_load and not self._checkpoint_has_prefix(
+                checkpoint_id, f"{key}."
+            ):
+                del states_to_load[key]
+                reseed.append(key)
+                logger.info(
+                    f"Checkpoint has no '{key}' state; it will be initialized "
+                    "from the loaded model weights."
+                )
+        return reseed
 
     def _states_to_load(self, model_only: bool) -> dict[str, Any]:
         """Determine which state objects should be restored during loading.
