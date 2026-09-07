@@ -7,7 +7,7 @@
 import copy
 import functools
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -49,6 +49,20 @@ class LRSchedulersContainer(Stateful, Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
+        schedule_type: Literal["wsd", "aus"] = "wsd"
+        """
+        Top-level schedule family. 'wsd' preserves the existing
+        warmup/stable/decay behavior. 'aus' applies the shared
+        inverse-square-root Angular Update Size schedule.
+        """
+
+        aus_coefficient: float = 0.5
+        """
+        Shared AUS coefficient. With the AUS schedule, every corrected
+        parameter group uses AUS(t) = aus_coefficient / sqrt(t). Per-group
+        coefficients are intentionally not supported by this prototype.
+        """
+
         warmup_steps: int = 200
         """
         Steps for lr scheduler warmup, normally 1/5 of --training.steps
@@ -97,6 +111,48 @@ class LRSchedulersContainer(Stateful, Configurable):
             Returns:
                 A LRSchedulersContainer for the given optimizers.
             """
+            optimizer_list = list(optimizers)
+            aus_group_flags = [
+                bool(group.get("aus_enabled", False))
+                for optimizer in optimizer_list
+                for group in optimizer.param_groups
+            ]
+
+            if self.schedule_type == "aus":
+                if not aus_group_flags or not all(aus_group_flags):
+                    raise ValueError(
+                        "lr_scheduler.schedule_type='aus' requires "
+                        "optimizer.aus_enabled=true for every parameter group."
+                    )
+                if (
+                    not math.isfinite(self.aus_coefficient)
+                    or self.aus_coefficient <= 0
+                ):
+                    raise ValueError("lr_scheduler.aus_coefficient must be positive.")
+
+                # This prototype deliberately has one shared AUS schedule. Reset
+                # every group's base LR before LambdaLR snapshots its base_lrs.
+                for optimizer in optimizer_list:
+                    for group in optimizer.param_groups:
+                        group["lr"] = self.aus_coefficient
+                        group.pop("initial_lr", None)
+
+                def aus_inverse_sqrt(current_step: int) -> float:
+                    # LambdaLR indexes the first optimizer update with zero.
+                    return 1.0 / math.sqrt(current_step + 1)
+
+                return LRSchedulersContainer(
+                    optimizer_list,
+                    aus_inverse_sqrt,
+                    aus_coefficient=self.aus_coefficient,
+                )
+
+            if any(aus_group_flags):
+                raise ValueError(
+                    "optimizer.aus_enabled=true requires "
+                    "lr_scheduler.schedule_type='aus'."
+                )
+
             # Use total_steps from config if set, otherwise fall back to training_steps
             total_steps = (
                 self.total_steps if self.total_steps is not None else training_steps
@@ -191,16 +247,25 @@ class LRSchedulersContainer(Stateful, Configurable):
                 lr_decay_type=lr_decay_type,
                 min_lr_factor=min_lr_factor,
             )
-            return LRSchedulersContainer(optimizers, lr_lambda)
+            return LRSchedulersContainer(optimizer_list, lr_lambda)
 
     schedulers: list[LRScheduler]
 
-    def __init__(self, optimizers: OptimizersContainer, lr_lambda: Callable) -> None:
+    def __init__(
+        self,
+        optimizers: OptimizersContainer | Sequence[Any],
+        lr_lambda: Callable,
+        *,
+        aus_coefficient: float | None = None,
+    ) -> None:
         assert len(optimizers) > 0, (
             "Must have at least one optimizer to create LRScheduler"
         )
 
         self.preserve_lrs_when_loading = False
+        # Keep this on the container, outside the serialized LambdaLR state,
+        # so old WSD checkpoints need no additional scheduler keys.
+        self.aus_coefficient = aus_coefficient
         self.schedulers = [LambdaLR(optimizer, lr_lambda) for optimizer in optimizers]
 
     def __iter__(self) -> Iterator[LRScheduler]:
@@ -220,6 +285,21 @@ class LRSchedulersContainer(Stateful, Configurable):
         return self.schedulers[0].state_dict()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if self.aus_coefficient is not None:
+            # Optimizer state is loaded before scheduler state. Resume the
+            # saved step, but always use this run's shared AUS coefficient,
+            # including on the very first update after loading WSD/AUS state.
+            for scheduler in self.schedulers:
+                scheduler.load_state_dict(copy.deepcopy(state_dict))
+                groups = scheduler.optimizer.param_groups
+                scheduler.base_lrs = [self.aus_coefficient] * len(groups)
+                lr = self.aus_coefficient / math.sqrt(scheduler.last_epoch + 1)
+                for group in groups:
+                    group["initial_lr"] = self.aus_coefficient
+                    group["lr"] = lr
+                scheduler._last_lr = [lr] * len(groups)
+            return
+
         if self.preserve_lrs_when_loading:
             # Store current learning rates
             prev_lrs = [sched.base_lrs for sched in self.schedulers]

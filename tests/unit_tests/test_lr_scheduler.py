@@ -37,6 +37,7 @@ class TestLRScheduler(unittest.TestCase):
         decay_ratio=None,
         decay_type=None,
         min_lr_factor=None,
+        schedule_type=None,
     ):
         # Create a trainer config with the specified parameters
         args = [
@@ -48,6 +49,11 @@ class TestLRScheduler(unittest.TestCase):
             str(training_steps),
         ]
 
+        args += (
+            ["--lr_scheduler.schedule_type", schedule_type]
+            if schedule_type is not None
+            else []
+        )
         args += (
             ["--lr_scheduler.warmup_steps", str(warmup_steps)]
             if warmup_steps is not None
@@ -72,6 +78,43 @@ class TestLRScheduler(unittest.TestCase):
         config = config_manager.parse_args(args)
 
         return config
+
+    def test_aus_inverse_sqrt(self):
+        """AUS enforces the shared coefficient and bypasses WSD."""
+        config = self.create_trainer_config(
+            training_steps=5,
+            schedule_type="aus",
+        )
+        self.optimizer.param_groups[0]["lr"] = 0.123
+        self.optimizer.param_groups[0]["aus_enabled"] = True
+        lr_scheduler = config.lr_scheduler.build(
+            optimizers=self.optimizer_container,
+            training_steps=config.training.steps,
+        )
+
+        for update_number in range(1, 6):
+            expected_aus = 0.5 / torch.sqrt(torch.tensor(float(update_number)))
+            self.assertAlmostEqual(
+                self.optimizer.param_groups[0]["lr"],
+                expected_aus.item(),
+                places=6,
+                msg=(
+                    f"Update {update_number}: expected AUS {expected_aus.item()}, "
+                    f"got {self.optimizer.param_groups[0]['lr']}"
+                ),
+            )
+            lr_scheduler.step()
+
+    def test_aus_requires_optimizer_correction(self):
+        config = self.create_trainer_config(
+            training_steps=5,
+            schedule_type="aus",
+        )
+        with self.assertRaisesRegex(ValueError, "optimizer.aus_enabled=true"):
+            config.lr_scheduler.build(
+                optimizers=self.optimizer_container,
+                training_steps=config.training.steps,
+            )
 
     def test_linear_warmup_decay(self):
         """Test the linear warmup followed by linear decay schedule."""

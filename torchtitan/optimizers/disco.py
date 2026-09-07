@@ -30,9 +30,11 @@ from .pre_norm_helper import (
     PRE_NORM_SHARDED_APPLY_FUNCTIONS,
 )
 from .radial_helper import (
+    calculate_aus_correction,
     calculate_radial_metrics,
     new_radial_state,
     RADIAL_METRIC_NAMES,
+    resolve_aus_geometry,
 )
 from .utils import remove_orig_mod_and_weight_for_p_name
 
@@ -235,6 +237,7 @@ class DiSCO(AbstractDiSCO):
         communication_dtype=torch.bfloat16,
         extra_reduce_for_HSDP=False,
         experts_weights_layout="G-D_out-D_in",
+        aus_enabled=False,
     ):
         env_vars = parse_env_var()
         logger.info(f"[DiSCO] Environment variables: {env_vars}")
@@ -259,6 +262,7 @@ class DiSCO(AbstractDiSCO):
             eps=eps,
             norm_factor=norm_factor if not debug_mode else "none",
             pre_norm=pre_norm,
+            aus_enabled=aus_enabled,
             backend=backend if not debug_mode else "identity",
             backend_steps=backend_steps,
             splits_into=None,  # should be explicitly set in the extra_param_group_split_rules
@@ -307,6 +311,15 @@ class DiSCO(AbstractDiSCO):
                 group["norm_factor"] = "none"
                 group["backend"] = "identity"
 
+        self.aus_enabled = any(group["aus_enabled"] for group in self.param_groups)
+        self._validate_aus_configuration()
+        if self.aus_enabled and communication_dtype != torch.float32:
+            logger.warning(
+                "[DiSCO][AUS] Overriding communication_dtype to float32 for "
+                "the DDP research prototype."
+            )
+            communication_dtype = torch.float32
+
         self.communication_dtype = communication_dtype
         self.groups_info = {}
         self.groups_pre_norm: dict[int, str] = {}
@@ -345,6 +358,136 @@ class DiSCO(AbstractDiSCO):
         self.expert_params, self.expert_param_names = [], []
         # build once now
         self._build_param_lists()
+
+    def _validate_aus_configuration(self) -> None:
+        if not self.aus_enabled:
+            return
+
+        unsupported_parallelism = []
+        if self.fsdp_enabled:
+            unsupported_parallelism.append("FSDP")
+        if self.tp_enabled:
+            unsupported_parallelism.append("TP")
+        if self.expert_enabled:
+            unsupported_parallelism.append("expert/MoE")
+        if unsupported_parallelism:
+            raise NotImplementedError(
+                "The AUS research prototype supports replicated dense DDP only; "
+                f"disable {', '.join(unsupported_parallelism)}."
+            )
+
+        invalid_groups: list[str] = []
+        for group_idx, group in enumerate(self.param_groups):
+            if not group["aus_enabled"]:
+                continue
+            unsupported_ranks = sorted(
+                {p.ndim for p in group["params"] if p.ndim > 2}
+            )
+            if unsupported_ranks:
+                invalid_groups.append(
+                    f"group {group_idx}: tensor ranks {unsupported_ranks} "
+                    "are not supported"
+                )
+                continue
+            if group["splits_into"] is not None or group["splits_dim"] is not None:
+                invalid_groups.append(
+                    f"group {group_idx}: split logical matrices are not supported"
+                )
+                continue
+            try:
+                resolve_aus_geometry(group["norm_factor"])
+            except ValueError as exc:
+                # Vector/scalar-only groups use the nominal AUS directly and do
+                # not require a matrix geometry.
+                if any(p.ndim == 2 for p in group["params"]):
+                    invalid_groups.append(f"group {group_idx}: {exc}")
+
+        if invalid_groups:
+            raise ValueError("Invalid AUS configuration: " + "; ".join(invalid_groups))
+
+    def _build_aus_displacement(
+        self,
+        p: torch.Tensor,
+        u: torch.Tensor | None,
+        group_idx: int,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Build delta = eta * (U + weight_decay * W) for one parameter."""
+        group = self.param_groups[group_idx]
+        w = self._get_param_local_view(p)
+        nominal_aus = torch.as_tensor(
+            group["lr"], dtype=torch.float32, device=w.device
+        )
+        correction = torch.ones_like(nominal_aus)
+        valid = torch.zeros_like(nominal_aus, dtype=torch.bool)
+        finite = torch.isfinite(w).all()
+        if u is not None:
+            finite = finite & torch.isfinite(u).all()
+
+        if u is not None and w.ndim == 2:
+            geometry, transpose = resolve_aus_geometry(group["norm_factor"])
+            result = calculate_aus_correction(
+                w,
+                u,
+                geometry,
+                transpose=transpose,
+            )
+            correction = result["correction"]
+            valid = result["valid"]
+            finite = result["finite"]
+
+        eta = nominal_aus * correction
+        finite = finite & torch.isfinite(eta)
+        if u is None:
+            if group["weight_decay"] == 0.0:
+                return None, correction, eta, valid, finite
+            displacement = w.detach().to(torch.float32) * (
+                eta * group["weight_decay"]
+            )
+        else:
+            displacement = u.detach().to(torch.float32) * eta
+            if group["weight_decay"] != 0.0:
+                displacement.add_(
+                    w.detach().to(torch.float32)
+                    * (eta * group["weight_decay"])
+                )
+
+        finite = finite & torch.isfinite(displacement).all()
+        return displacement, correction, eta, valid, finite
+
+    def _raise_if_any_aus_nonfinite(
+        self,
+        finiteness: list[torch.Tensor | None],
+        *,
+        device: torch.device,
+    ) -> None:
+        nonfinite_flags = [
+            torch.logical_not(finite).to(torch.int32)
+            for finite in finiteness
+            if finite is not None
+        ]
+        any_nonfinite = (
+            torch.stack(nonfinite_flags).amax()
+            if nonfinite_flags
+            else torch.zeros((), dtype=torch.int32, device=device)
+        )
+        dp_mesh = (
+            self.parallel_dims.get_optional_mesh("dp_replicate")
+            if self.dp_replicate_enabled
+            else None
+        )
+        if dp_mesh is not None and dp_mesh.size() > 1:
+            dist.all_reduce(any_nonfinite, op=dist.ReduceOp.MAX, group=dp_mesh.get_group())
+        if bool(any_nonfinite.item()):
+            raise FloatingPointError(
+                "[DiSCO][AUS] non-finite input or correction calculation detected; "
+                "no parameter weights were updated. Momentum buffers may have advanced."
+            )
 
     def _ensure_default_param_state(self):
         """
@@ -517,6 +660,7 @@ class DiSCO(AbstractDiSCO):
         "splits_into",
         "splits_dim",
         "pre_norm",
+        "aus_enabled",
     )
 
     def load_state_dict(self, state_dict):
@@ -559,13 +703,21 @@ class DiSCO(AbstractDiSCO):
            there is no way to keep momentum while dropping only radial_state
            short of relaxing allow_partial_load checkpoint-wide.
         """
-        # "pre_norm" is optional elsewhere (group.get("pre_norm", "identity")
-        # at _build_param_lists/step()), so it isn't guaranteed to be a key
-        # on every group -- match that default here rather than a bare
-        # group[k], which would KeyError on a group that omits it.
+        optional_config_defaults = {
+            "pre_norm": "identity",
+            # Checkpoints created before the AUS prototype do not have this
+            # group key. The current run's value is restored below.
+            "aus_enabled": False,
+        }
+
+        def config_group_value(group, key):
+            if key in optional_config_defaults:
+                return group.get(key, optional_config_defaults[key])
+            return group[key]
+
         pre_load = [
             {
-                k: group.get(k, "identity") if k == "pre_norm" else group[k]
+                k: config_group_value(group, k)
                 for k in self._CONFIG_ONLY_GROUP_KEYS
             }
             for group in self.param_groups
@@ -577,9 +729,7 @@ class DiSCO(AbstractDiSCO):
             zip(self.param_groups, pre_load)
         ):
             for key, config_val in config_kwargs.items():
-                checkpoint_val = (
-                    group.get(key, "identity") if key == "pre_norm" else group[key]
-                )
+                checkpoint_val = config_group_value(group, key)
                 if checkpoint_val != config_val:
                     logger.warning(
                         f"[DiSCO] group_idx {group_idx}: checkpoint's "
@@ -2504,6 +2654,7 @@ class DiSCO(AbstractDiSCO):
         ) in self._embed_update_plan:
             lr, _, _, wd, _ = self.groups_info[group_idx]
 
+            aus_enabled = self.param_groups[group_idx]["aus_enabled"]
             active_locals: list[torch.Tensor] = []
             active_updates: list[torch.Tensor] = []
             for j, param_idx in enumerate(param_indices):
@@ -2532,9 +2683,12 @@ class DiSCO(AbstractDiSCO):
             if not active_locals:
                 continue
 
-            if wd != 0.0:
-                torch._foreach_mul_(active_locals, 1.0 - wd * lr)
-            torch._foreach_add_(active_locals, active_updates, alpha=-lr)
+            if aus_enabled:
+                torch._foreach_add_(active_locals, active_updates, alpha=-1.0)
+            else:
+                if wd != 0.0:
+                    torch._foreach_mul_(active_locals, 1.0 - wd * lr)
+                torch._foreach_add_(active_locals, active_updates, alpha=-lr)
 
     @record_function("disco.update_ddp_params_fast")
     def _update_ddp_params_fast(self, apply_updates):
@@ -2550,6 +2704,7 @@ class DiSCO(AbstractDiSCO):
             locals_bucket,
         ) in self._ddp_update_plan:
             lr, _, _, wd, _ = self.groups_info[group_idx]
+            aus_enabled = self.param_groups[group_idx]["aus_enabled"]
 
             active_locals: list[torch.Tensor] = []
             active_updates: list[torch.Tensor] = []
@@ -2583,9 +2738,12 @@ class DiSCO(AbstractDiSCO):
             if not active_locals:
                 continue
 
-            if wd != 0.0:
-                torch._foreach_mul_(active_locals, 1.0 - wd * lr)
-            torch._foreach_add_(active_locals, active_updates, alpha=-lr)
+            if aus_enabled:
+                torch._foreach_add_(active_locals, active_updates, alpha=-1.0)
+            else:
+                if wd != 0.0:
+                    torch._foreach_mul_(active_locals, 1.0 - wd * lr)
+                torch._foreach_add_(active_locals, active_updates, alpha=-lr)
 
     @record_function("disco.update_expert_params_fast")
     def _update_expert_params_fast(self, expert_params, all_updates):
@@ -2815,9 +2973,13 @@ class DiSCO(AbstractDiSCO):
             else None
         )
 
+        deferred_embed_updates = None
         if self.embed_params:
-            self.step_embedding(
-                self.embed_params, self.embed_param_names, embed_workspace
+            deferred_embed_updates = self.step_embedding(
+                self.embed_params,
+                self.embed_param_names,
+                embed_workspace,
+                defer_update=self.aus_enabled,
             )
 
         # Expert LMO launches are coordinated inside step_experts.
@@ -2841,6 +3003,12 @@ class DiSCO(AbstractDiSCO):
                 self.ddp_param_names,
                 workspace=ddp_workspace,
             )
+
+        # In AUS mode, both embedding and dense matrix validation must
+        # succeed before any weights are applied. step_ddp validates its
+        # entire owner batch (across ranks) before applying dense updates.
+        if deferred_embed_updates is not None:
+            self._update_embed_params_fast(*deferred_embed_updates)
 
         if self.scale_params:
             self.step_scalar(self.scale_params, self.scale_param_names)
@@ -2905,6 +3073,8 @@ class DiSCO(AbstractDiSCO):
         embed_param_names,
         workspace,
         skip_update=False,
+        *,
+        defer_update=False,
     ):
         # Reuse pre-allocated Python lists (reset before use)
         effective_grads: list = workspace["effective_grads"]
@@ -3009,6 +3179,40 @@ class DiSCO(AbstractDiSCO):
                 else:
                     updates[valid_idx[0]] = self.lmo(valid_grads[0], **param_kwargs)
 
+        aus_corrections: list[torch.Tensor | None] = [None] * len(embed_params)
+        aus_etas: list[torch.Tensor | None] = [None] * len(embed_params)
+        aus_validity: list[torch.Tensor | None] = [None] * len(embed_params)
+        aus_finiteness: list[torch.Tensor | None] = [None] * len(embed_params)
+        if self.aus_enabled:
+            # Batched embedding LMOs normally bypass updates[]. Materialize only
+            # AUS-enabled shape groups so each matrix gets its own correction.
+            for shape in list(big_us_by_shape):
+                group_idx = self._embed_shape_group_gidx[shape]
+                if not self.param_groups[group_idx]["aus_enabled"]:
+                    continue
+                indices = self._embed_extra_shape_groups[shape]
+                for param_idx, u in zip(
+                    indices, big_us_by_shape[shape].unbind(0), strict=True
+                ):
+                    updates[param_idx] = u
+                del big_us_by_shape[shape]
+
+            for i, p in enumerate(embed_params):
+                group_idx = self.parameters_to_groups[id(p)]
+                if not self.param_groups[group_idx]["aus_enabled"]:
+                    continue
+                (
+                    displacement,
+                    aus_corrections[i],
+                    aus_etas[i],
+                    aus_validity[i],
+                    aus_finiteness[i],
+                ) = self._build_aus_displacement(p, updates[i], group_idx)
+                updates[i] = displacement
+            self._raise_if_any_aus_nonfinite(
+                aus_finiteness, device=embed_params[0].device
+            )
+
         #  Norm/Gram Calculation (on full tensors for correctness). Runs
         # BEFORE the real update is applied (see below) so `p` here is
         # genuinely pre-update -- needed so calculate_gram_metrics gets W and
@@ -3031,6 +3235,7 @@ class DiSCO(AbstractDiSCO):
                 original_pid = id(p)
                 group_idx = self.parameters_to_groups[id(p)]
                 lr, nesterov, momentum, wd, param_kwargs = self.groups_info[group_idx]
+                aus_for_group = self.param_groups[group_idx]["aus_enabled"]
 
                 # Gather full tensor for norm calculation
                 g = self.get_momentum_or_grad(
@@ -3042,14 +3247,17 @@ class DiSCO(AbstractDiSCO):
 
                 # Use pre-alloc float32 scratch to avoid -lr*u temp allocation (extras only)
                 scratch = norm_scratch[i]
+                applied_lr = aus_etas[i] if aus_for_group else lr
+                if applied_lr is None:
+                    applied_lr = lr
                 if scratch is not None and scratch.shape == u.shape:
-                    torch.mul(u, -lr, out=scratch)
+                    torch.mul(u, -applied_lr, out=scratch)
                     upd_norms = calculate_norm(
                         scratch, self.norms_to_log, transpose=need_T
                     )
                 else:
                     upd_norms = calculate_norm(
-                        -lr * u, self.norms_to_log, transpose=need_T
+                        -applied_lr * u, self.norms_to_log, transpose=need_T
                     )
                 upd_spectrum = upd_norms.pop("spectrum")
 
@@ -3059,7 +3267,13 @@ class DiSCO(AbstractDiSCO):
                 if isinstance(p, DTensor):
                     p = p.full_tensor()
 
-                pseudo_w = _pseudo_post_update_weight(p, u, lr, wd)
+                if aus_for_group:
+                    displacement = updates[i]
+                    if displacement is None:
+                        displacement = torch.zeros_like(p)
+                    pseudo_w = p - displacement
+                else:
+                    pseudo_w = _pseudo_post_update_weight(p, u, lr, wd)
                 wnorm = calculate_norm(pseudo_w, self.norms_to_log, transpose=need_T)
                 w_spectrum = wnorm.pop("spectrum")
 
@@ -3100,6 +3314,22 @@ class DiSCO(AbstractDiSCO):
                     final_norms[f"track_param_{norm_name}/{cleaned_p_name}"] = wnorm[
                         norm_name
                     ]
+                if aus_for_group:
+                    correction = aus_corrections[i]
+                    eta = aus_etas[i]
+                    valid = aus_validity[i]
+                    if (
+                        correction is not None
+                        and eta is not None
+                        and valid is not None
+                    ):
+                        final_norms[
+                            f"track_aus_correction/{cleaned_p_name}"
+                        ] = correction
+                        final_norms[f"track_aus_eta/{cleaned_p_name}"] = eta
+                        final_norms[f"track_aus_valid/{cleaned_p_name}"] = (
+                            valid.to(torch.float32)
+                        )
                 for gram_name, val in gram_metrics.items():
                     final_norms[f"track_gram_{gram_name}/{gram_p_name}"] = val
                 for radial_name, val in radial_metrics.items():
@@ -3121,6 +3351,8 @@ class DiSCO(AbstractDiSCO):
         # Unconditional on need_to_calculate_norm -- the update must happen
         # every step regardless of whether norm-logging ran this step.
         if not skip_update:
+            if defer_update:
+                return updates, big_us_by_shape
             self._update_embed_params_fast(updates, big_us_by_shape)
 
     @record_function("disco.step_experts")
@@ -3616,6 +3848,11 @@ class DiSCO(AbstractDiSCO):
 
         # -------- Phase A: precompute local LMO updates (no comm) --------
         local_updates: list[torch.Tensor | None] = [None] * len(ddp_params)
+        local_displacements: list[torch.Tensor | None] = [None] * len(ddp_params)
+        local_aus_corrections: list[torch.Tensor | None] = [None] * len(ddp_params)
+        local_aus_etas: list[torch.Tensor | None] = [None] * len(ddp_params)
+        local_aus_validity: list[torch.Tensor | None] = [None] * len(ddp_params)
+        local_aus_finiteness: list[torch.Tensor | None] = [None] * len(ddp_params)
         lmo_inputs = self._prepare_ddp_lmo(
             ddp_params,
             workspace,
@@ -3623,14 +3860,36 @@ class DiSCO(AbstractDiSCO):
             tp_world_size=tp_world_size,
         )
         for i in self._ddp_owned_indices:
+            group_idx = self._ddp_param_group_idx[i]
             g = lmo_inputs[i]
             if g is None:
                 local_updates[i] = None
+                if self.param_groups[group_idx]["aus_enabled"]:
+                    (
+                        local_displacements[i],
+                        local_aus_corrections[i],
+                        local_aus_etas[i],
+                        local_aus_validity[i],
+                        local_aus_finiteness[i],
+                    ) = self._build_aus_displacement(ddp_params[i], None, group_idx)
                 continue
-            group_idx = self._ddp_param_group_idx[i]
             param_kwargs = self.groups_info[group_idx][-1]
             u = self.lmo(g, **param_kwargs)
             local_updates[i] = u
+            if self.param_groups[group_idx]["aus_enabled"]:
+                (
+                    local_displacements[i],
+                    local_aus_corrections[i],
+                    local_aus_etas[i],
+                    local_aus_validity[i],
+                    local_aus_finiteness[i],
+                ) = self._build_aus_displacement(ddp_params[i], u, group_idx)
+            else:
+                local_displacements[i] = u
+        if self.aus_enabled:
+            self._raise_if_any_aus_nonfinite(
+                local_aus_finiteness, device=device
+            )
 
         # -------- Phase B: DDP communication (one-shot flat all_gather) and global updates --------
         (global_updates, global_update_bufs, zero_by_shape, norm_scratch) = (
@@ -3660,7 +3919,7 @@ class DiSCO(AbstractDiSCO):
 
                 pack_src_views: list[torch.Tensor] = []
                 for param_idx in self._ddp_owned_indices:
-                    u = local_updates[param_idx]
+                    u = local_displacements[param_idx]
                     if u is None:
                         ref = ddp_params[param_idx]
                         u = zero_by_shape[(tuple(ref.shape), cast_dtype)]
@@ -3688,7 +3947,7 @@ class DiSCO(AbstractDiSCO):
                     global_updates[param_idx] = buf
             else:
                 for param_idx, p in enumerate(ddp_params):
-                    u = local_updates[param_idx]
+                    u = local_displacements[param_idx]
                     if u is None:
                         global_updates[param_idx] = zero_by_shape[
                             (tuple(p.shape), cast_dtype)
@@ -3752,6 +4011,36 @@ class DiSCO(AbstractDiSCO):
                 )
                 workspace["radial_local_flat"] = radial_local_flat
             radial_local_flat.zero_()
+
+        # AUS correction, effective eta, and fallback validity are tiny scalar
+        # diagnostics. They share the owner-bucket metric gather on logging steps.
+        aus_local_flat = None
+        if need_to_calculate_norm and self.aus_enabled:
+            required_aus_elems = total_buckets * 3
+            aus_local_flat = workspace.get("aus_local_flat")
+            if (
+                aus_local_flat is None
+                or aus_local_flat.numel() != required_aus_elems
+            ):
+                aus_local_flat = torch.zeros(
+                    required_aus_elems, dtype=torch.float32, device=device
+                )
+                workspace["aus_local_flat"] = aus_local_flat
+            aus_local_flat.zero_()
+            for my_idx in self._ddp_owned_indices:
+                group_idx = self._ddp_param_group_idx[my_idx]
+                if not self.param_groups[group_idx]["aus_enabled"]:
+                    continue
+                correction = local_aus_corrections[my_idx]
+                eta = local_aus_etas[my_idx]
+                valid = local_aus_validity[my_idx]
+                if correction is None or eta is None or valid is None:
+                    continue
+                owner_bucket = self._ddp_owner_bucket_by_param[my_idx]
+                aus_base = owner_bucket * 3
+                aus_local_flat[aus_base : aus_base + 3].copy_(
+                    torch.stack((correction, eta, valid.to(correction.dtype)))
+                )
 
         # Singular-value spectrum: a separate flat buffer padded to the largest
         # per-rank total across all ranks (`_ddp_spectrum_max_total`), since
@@ -3822,7 +4111,13 @@ class DiSCO(AbstractDiSCO):
                 scratch = norm_scratch[my_idx]
                 if scratch is None:
                     raise ValueError("Missing DDP norm scratch buffer for owned index.")
-                torch.mul(u, -lr, out=scratch)
+                if self.param_groups[group_idx]["aus_enabled"]:
+                    eta = local_aus_etas[my_idx]
+                    if eta is None:
+                        continue
+                    torch.mul(u, -eta, out=scratch)
+                else:
+                    torch.mul(u, -lr, out=scratch)
                 upd_norms = calculate_norm(scratch, self.norms_to_log)
                 upd_spectrum = upd_norms.pop("spectrum")
                 owner_bucket = self._ddp_owner_bucket_by_param[my_idx]
@@ -3877,7 +4172,13 @@ class DiSCO(AbstractDiSCO):
                 if u is None:
                     u = torch.zeros_like(w)
 
-                pseudo_w = _pseudo_post_update_weight(w, u, lr, wd)
+                if self.param_groups[group_idx]["aus_enabled"]:
+                    displacement = local_displacements[my_idx]
+                    if displacement is None:
+                        displacement = torch.zeros_like(w)
+                    pseudo_w = w - displacement
+                else:
+                    pseudo_w = _pseudo_post_update_weight(w, u, lr, wd)
                 w_norms = calculate_norm(pseudo_w, self.norms_to_log)
                 w_spectrum = w_norms.pop("spectrum")
                 owner_bucket = self._ddp_owner_bucket_by_param[my_idx]
@@ -3961,6 +4262,7 @@ class DiSCO(AbstractDiSCO):
                 ("gram", gram_norm_local_flat),
                 ("gram_vec", gram_vec_local_flat),
                 ("radial", radial_local_flat),
+                ("aus", aus_local_flat),
                 ("upd_spec", upd_spectrum_local_flat),
                 ("w_spec", w_spectrum_local_flat),
             ]
@@ -4020,6 +4322,22 @@ class DiSCO(AbstractDiSCO):
                         final_norms[f"track_radial_{radial_name}/{cleaned}"] = gathered[
                             rank_base + radial_base + rk
                         ]
+                if (
+                    "aus" in offsets
+                    and self.param_groups[
+                        self._ddp_param_group_idx[param_idx]
+                    ]["aus_enabled"]
+                ):
+                    aus_base = offsets["aus"] + owner_bucket * 3
+                    final_norms[f"track_aus_correction/{cleaned}"] = gathered[
+                        rank_base + aus_base
+                    ]
+                    final_norms[f"track_aus_eta/{cleaned}"] = gathered[
+                        rank_base + aus_base + 1
+                    ]
+                    final_norms[f"track_aus_valid/{cleaned}"] = gathered[
+                        rank_base + aus_base + 2
+                    ]
 
             if "gram_vec" in offsets:
                 gram_vec_lens = (

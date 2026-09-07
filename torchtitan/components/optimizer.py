@@ -108,6 +108,15 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         norm_factor: str = "spectral"
         """Which norm factor to use"""
 
+        aus_enabled: bool = False
+        """
+        Apply the per-matrix Angular Update Size correction in DiSCO. This
+        research implementation supports replicated dense DDP parameters only;
+        FSDP, TP, expert/MoE parameters, and split logical matrices are rejected.
+        The paired AUS scheduler sets every corrected parameter group's LR to
+        its shared nominal AUS value before each optimizer update.
+        """
+
         pre_norm: str = "identity"
         """
         Pre-norm applied to the effective gradient before any communication
@@ -275,7 +284,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         for optimizer in self.optimizers:
             optimizer.zero_grad(*args, **kwargs)
 
-    def state_dict(self) -> dict[str, Any]:
+    def _get_state_dict_with_aus_config(self) -> dict[str, Any]:
         func = functools.partial(
             get_optimizer_state_dict,
             options=StateDictOptions(flatten_optimizer_state_dict=True),
@@ -286,7 +295,27 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             for k, v in sd.items()
         }
 
+    def state_dict(self) -> dict[str, Any]:
+        # AUS enablement belongs to this run's config. Do not make it a
+        # required DCP key: older checkpoints must pass strict load planning.
+        return {
+            k: v
+            for k, v in self._get_state_dict_with_aus_config().items()
+            if not (k.startswith("param_groups.") and k.endswith(".aus_enabled"))
+        }
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # PyTorch's flattened-state reconstruction expects every current
+        # group key. Supply this config-only field before reconstruction,
+        # also overriding any value saved by the initial AUS prototype.
+        state_dict = dict(state_dict)
+        state_dict.update(
+            {
+                k: v
+                for k, v in self._get_state_dict_with_aus_config().items()
+                if k.startswith("param_groups.") and k.endswith(".aus_enabled")
+            }
+        )
         if self.preserve_lrs_when_loading:
             # Store current learning rates
             prev_lrs = []

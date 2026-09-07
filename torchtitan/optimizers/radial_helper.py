@@ -72,6 +72,7 @@ RMS -> RMS, and the first argmax row/column for the max-row/max-column
 geometries.
 """
 
+import math
 from collections.abc import Iterable
 
 import torch
@@ -180,6 +181,162 @@ def _geometry_norm(W: torch.Tensor, geometry: str) -> torch.Tensor:
     if geometry == "l1_to_rms":
         return l1_to_rms_norm(W)
     raise AssertionError(f"Unhandled update-radiality geometry: {geometry}")
+
+
+_AUS_GEOMETRY_BY_NORM_FACTOR: dict[str, tuple[str, bool]] = {
+    "spectral": ("rms_to_rms", False),
+    "rmnp_row_norm_rms_rms": ("rms_to_rms", False),
+    "rmnp_row_norm": ("rms_to_inf", False),
+    # Embedding weights are stored as [vocab, hidden], but the corresponding
+    # l1 -> RMS operator maps vocabulary coordinates to hidden coordinates.
+    "embed_linear": ("l1_to_rms", True),
+    "embed_sqrt": ("l1_to_rms", True),
+    "unembed_linear": ("rms_to_inf", False),
+    "unembed_sqrt": ("rms_to_inf", False),
+}
+
+
+def resolve_aus_geometry(norm_factor: str) -> tuple[str, bool]:
+    """Resolve a DiSCO norm factor to its AUS primal matrix geometry.
+
+    The boolean in the result says whether the stored matrix must be
+    transposed before applying the geometry. This intentionally supports
+    only norm factors whose primal geometry is unambiguous. Research runs
+    should fail at configuration time instead of silently applying a
+    correction for the wrong norm.
+    """
+    try:
+        return _AUS_GEOMETRY_BY_NORM_FACTOR[norm_factor]
+    except KeyError as exc:
+        supported = ", ".join(sorted(_AUS_GEOMETRY_BY_NORM_FACTOR))
+        raise ValueError(
+            f"AUS does not have a geometry for norm_factor={norm_factor!r}. "
+            f"Supported norm factors: {supported}."
+        ) from exc
+
+
+@torch.no_grad()
+def calculate_aus_correction(
+    W: torch.Tensor,
+    U: torch.Tensor,
+    geometry: str,
+    *,
+    transpose: bool = False,
+    tangent_rel_eps: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Calculate the matrix-specific multiplier for a nominal AUS value.
+
+    For r = N(W) and a norming functional phi at W / r, this computes
+
+        T = U - (W / r) * phi(U),    correction = r / N(T).
+
+    U is the raw, pre-learning-rate DiSCO LMO direction. All matrix
+    calculations are performed in float32. Degenerate or non-finite inputs
+    and points where the selected norm is not differentiable return
+    valid=False and a correction of one, leaving the caller's nominal AUS
+    value unchanged. In particular, a purely radial update cannot realize
+    a nonzero angular target with a finite learning rate.
+    """
+    if W.ndim != 2 or U.ndim != 2 or W.shape != U.shape:
+        raise ValueError(
+            "AUS correction expects equally shaped 2-D weight/update tensors; "
+            f"got W={tuple(W.shape)}, U={tuple(U.shape)}."
+        )
+    if tangent_rel_eps <= 0:
+        raise ValueError("tangent_rel_eps must be positive.")
+
+    W_fp32 = W.detach().to(torch.float32)
+    U_fp32 = U.detach().to(torch.float32)
+    if transpose:
+        W_fp32 = W_fp32.transpose(0, 1).contiguous()
+        U_fp32 = U_fp32.transpose(0, 1).contiguous()
+
+    finite_inputs = torch.isfinite(W_fp32).all() & torch.isfinite(U_fp32).all()
+    # LAPACK/SVD may raise on NaN/Inf before a tensor-valued validity check can
+    # select the fallback. Sanitizing is harmless because finite_inputs keeps
+    # the resulting candidate invalid.
+    W_safe = torch.nan_to_num(W_fp32, nan=0.0, posinf=0.0, neginf=0.0)
+    U_safe = torch.nan_to_num(U_fp32, nan=0.0, posinf=0.0, neginf=0.0)
+    tiny = torch.finfo(torch.float32).tiny
+
+    if geometry == "rms_to_rms":
+        left, singular_values, right_t = torch.linalg.svd(
+            W_safe, full_matrices=False
+        )
+        scale = math.sqrt(W_safe.shape[1] / W_safe.shape[0])
+        radius = singular_values[0] * scale
+        phi_update = scale * (left[:, 0] @ (U_safe @ right_t[0, :]))
+        norm_differentiable = torch.ones_like(radius, dtype=torch.bool)
+        if singular_values.numel() > 1:
+            norm_differentiable = singular_values[0] > singular_values[1]
+    elif geometry == "rms_to_inf":
+        row_norms = torch.linalg.vector_norm(W_safe, ord=2, dim=1)
+        max_row_norm, row_idx = torch.max(row_norms, dim=0)
+        scale = math.sqrt(W_safe.shape[1])
+        radius = max_row_norm * scale
+        phi_update = (
+            scale
+            * torch.dot(W_safe[row_idx, :], U_safe[row_idx, :])
+            / max_row_norm.clamp_min(tiny)
+        )
+        norm_differentiable = torch.count_nonzero(row_norms == max_row_norm) == 1
+    elif geometry == "l1_to_rms":
+        col_norms = torch.linalg.vector_norm(W_safe, ord=2, dim=0)
+        max_col_norm, col_idx = torch.max(col_norms, dim=0)
+        scale = 1.0 / math.sqrt(W_safe.shape[0])
+        radius = max_col_norm * scale
+        phi_update = (
+            scale
+            * torch.dot(W_safe[:, col_idx], U_safe[:, col_idx])
+            / max_col_norm.clamp_min(tiny)
+        )
+        norm_differentiable = torch.count_nonzero(col_norms == max_col_norm) == 1
+    else:
+        supported = ", ".join(UPDATE_RADIALITY_GEOMETRIES)
+        raise ValueError(
+            f"Unknown AUS geometry {geometry!r}. Supported geometries: {supported}."
+        )
+
+    tangent = U_safe - W_safe * (phi_update / radius.clamp_min(tiny))
+    update_norm = _geometry_norm(U_safe, geometry)
+    tangent_norm = _geometry_norm(tangent, geometry)
+
+    finite_outputs = (
+        torch.isfinite(radius)
+        & torch.isfinite(phi_update)
+        & torch.isfinite(update_norm)
+        & torch.isfinite(tangent_norm)
+    )
+    finite = finite_inputs & finite_outputs
+    eligible = (
+        finite
+        & norm_differentiable
+        & (radius > 0)
+        & (update_norm > 0)
+        & (tangent_norm > tangent_rel_eps * update_norm)
+    )
+    # Select safe operands BEFORE dividing. A zero/radial update has no
+    # angular solution; dividing its radius by float32.tiny can overflow
+    # even for ordinary finite weights and must not turn a fallback into
+    # a non-finite-input failure.
+    raw_correction = torch.where(eligible, radius, torch.ones_like(radius)) / (
+        torch.where(eligible, tangent_norm, torch.ones_like(tangent_norm))
+    )
+    finite = finite & torch.isfinite(raw_correction)
+    valid = eligible & finite
+    correction = torch.where(valid, raw_correction, torch.ones_like(raw_correction))
+
+    return {
+        "correction": correction,
+        "raw_correction": raw_correction,
+        "radius": radius,
+        "phi_update": phi_update,
+        "update_norm": update_norm,
+        "tangent_norm": tangent_norm,
+        "valid": valid,
+        "finite": finite,
+        "norm_differentiable": norm_differentiable,
+    }
 
 
 def _directional_separation(

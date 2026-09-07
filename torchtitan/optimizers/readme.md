@@ -6,6 +6,56 @@ gradient, it computes an LMO ("linear minimization oracle") update via `Abstract
 gradient matrix (or a cheaper per-row normalization for embeddings, see below) — then applies
 `w = w*(1 - wd*lr) - lr*u`.
 
+## DDP-only AUS research prototype
+
+The optional AUS path replaces the scalar DiSCO learning rate for each 2-D
+matrix with
+
+`eta_t = AUS(t) * N(W_t) / N(U_t - (W_t / N(W_t)) * phi_t(U_t))`.
+
+AUS is a first-order angular target. At a finite learning rate, the actual
+change in normalized weight direction need not equal the scheduled AUS.
+
+Enable the paired optimizer and scheduler settings:
+
+```text
+--optimizer.aus_enabled
+--lr_scheduler.schedule_type aus
+--lr_scheduler.aus_coefficient 0.5
+```
+
+The coefficient defaults to `0.5`, giving the shared schedule
+`AUS(t) = 0.5 / sqrt(t)` with `t=1` for the first optimizer update. The
+scheduler deliberately resets every corrected parameter group to this shared
+coefficient; separate coefficients per group are not part of this prototype.
+
+When resuming a full checkpoint, the saved step number is retained and the
+current run's `aus_coefficient` determines the LR, including the first resumed
+update. This also applies when switching from WSD or changing the coefficient;
+`checkpoint.reconfigure_lrs` is not required for AUS.
+
+`aus_enabled` is taken from the current run's configuration and is omitted
+from TorchTitan's flattened optimizer checkpoint schema, so checkpoints
+predating AUS do not need this field. Other existing checkpoint requirements
+(such as momentum and radial state) still apply.
+
+The correction is recomputed from the current weight and post-LMO update
+immediately before every update. `spectral`/`rmnp_row_norm_rms_rms` use the
+RMS-to-RMS operator norm, `rmnp_row_norm` and `unembed_*` use RMS-to-infinity,
+and `embed_*` uses l1-to-RMS on the logical transposed embedding matrix. Vector
+and scalar parameters use the nominal AUS directly.
+
+This path intentionally supports only dense replicated DDP (or a single
+process): FSDP, TP, expert/MoE tensors, split logical matrices, and tensors
+above rank 2 fail during optimizer construction. Corrected DDP displacements
+are communicated in float32. On norm-logging steps, `track_aus_correction/*`,
+`track_aus_eta/*`, and `track_aus_valid/*` expose the chosen values. A validity
+of zero means the norm was nondifferentiable or the tangent was degenerate
+(including zero and purely radial updates), so the correction fell back to
+one. Non-finite matrix inputs or correction calculations fail before any
+parameter weights are updated, including embeddings. Momentum preparation
+has already run at that point; a failed step must not be retried in place.
+
 This file documents **how DiSCO handles different parameter types under different parallelism
 strategies**, which is most of what's structurally interesting about `disco.py`. Norm/gram/spectrum
 tracking (a secondary concern layered on top) is covered at the end.
