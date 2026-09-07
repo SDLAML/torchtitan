@@ -567,19 +567,30 @@ class OPTMoEModel(Decoder):
         assert attn_config is not None
         base_attn = self.config.layer.attention
         assert isinstance(base_attn, GatedNormSWAttention.Config)
-        mask_mods = [get_causal_mask_mod()]
         if base_attn.attn_mask_type == "block_causal":
-            mask_mods.append(
-                get_efficient_causal_mask_mod_for_packed_document(positions)
+            # Upstream's helper is the reference for causal + packed-document
+            # masking; use it rather than re-deriving the mask mods here.
+            mask_mods = [
+                get_causal_mask_mod(),
+                get_efficient_causal_mask_mod_for_packed_document(positions),
+            ]
+            full_mask = self._create_flex_attention_mask_for_document(
+                positions, attn_config
             )
-        elif base_attn.attn_mask_type != "causal":
+        elif base_attn.attn_mask_type == "causal":
+            mask_mods = [get_causal_mask_mod()]
+            full_mask = self._create_flex_attention_mask(
+                positions, attn_config, mask_mods
+            )
+        else:
             raise ValueError(
                 f"Unknown attn_mask_type: {base_attn.attn_mask_type!r}"
             )
-        full_mask = self._create_flex_attention_mask(positions, attn_config, mask_mods)
         if not has_swa:
             return {"full": full_mask}
 
+        # No upstream helper composes a sliding window with the document mask,
+        # so the SWA variant is assembled from the same mods plus the window.
         swa_mask = self._create_flex_attention_mask(
             positions,
             attn_config,
