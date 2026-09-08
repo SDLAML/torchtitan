@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.optim.lr_scheduler import LambdaLR, LRScheduler
+from torch.optim.lr_scheduler import LambdaLR
 
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable
@@ -52,9 +52,9 @@ class LRSchedulersContainer(Stateful, Configurable):
         schedule_type: Literal["wsd", "aus"] = "wsd"
         """
         Top-level schedule family. 'wsd' preserves the existing
-        warmup/stable/decay behavior. 'aus' applies an inverse-square-root
-        Angular Update Size schedule using each optimizer parameter group's
-        aus_coefficient (default 0.5).
+        warmup/stable/decay behavior. 'aus' applies a power-law Angular Update
+        Size schedule using each optimizer parameter group's aus_coefficient
+        and aus_alpha (both default to 0.5): AUS(t) = aus_coefficient / t**aus_alpha.
         """
 
         warmup_steps: int = 200
@@ -126,6 +126,12 @@ class LRSchedulersContainer(Stateful, Configurable):
                                 "aus_coefficient must be finite and positive "
                                 f"for optimizer {optimizer_index}, group {group_index}."
                             )
+                        alpha = group.get("aus_alpha", 0.5)
+                        if not math.isfinite(alpha):
+                            raise ValueError(
+                                "aus_alpha must be finite "
+                                f"for optimizer {optimizer_index}, group {group_index}."
+                            )
 
                 # Reset each group's base LR before LambdaLR snapshots it.
                 for optimizer in optimizer_list:
@@ -133,13 +139,25 @@ class LRSchedulersContainer(Stateful, Configurable):
                         group["lr"] = group.get("aus_coefficient", 0.5)
                         group.pop("initial_lr", None)
 
-                def aus_inverse_sqrt(current_step: int) -> float:
-                    # LambdaLR indexes the first optimizer update with zero.
-                    return 1.0 / math.sqrt(current_step + 1)
+                def aus_power_law(alpha: float) -> Callable[[int], float]:
+                    # Capture this run's exponent, independently of optimizer
+                    # checkpoint loads. Plain functions have no LambdaLR state.
+                    def factor(current_step: int) -> float:
+                        # LambdaLR indexes the first optimizer update with zero.
+                        return (current_step + 1) ** -alpha
 
+                    return factor
+
+                group_lambdas = [
+                    [
+                        aus_power_law(group.get("aus_alpha", 0.5))
+                        for group in optimizer.param_groups
+                    ]
+                    for optimizer in optimizer_list
+                ]
                 return LRSchedulersContainer(
                     optimizer_list,
-                    aus_inverse_sqrt,
+                    group_lambdas,
                     aus_enabled=True,
                 )
 
@@ -245,12 +263,12 @@ class LRSchedulersContainer(Stateful, Configurable):
             )
             return LRSchedulersContainer(optimizer_list, lr_lambda)
 
-    schedulers: list[LRScheduler]
+    schedulers: list[LambdaLR]
 
     def __init__(
         self,
         optimizers: OptimizersContainer | Sequence[Any],
-        lr_lambda: Callable,
+        lr_lambda: Callable | Sequence[Sequence[Callable]],
         *,
         aus_enabled: bool = False,
     ) -> None:
@@ -259,7 +277,13 @@ class LRSchedulersContainer(Stateful, Configurable):
         )
 
         self.preserve_lrs_when_loading = False
-        self.schedulers = [LambdaLR(optimizer, lr_lambda) for optimizer in optimizers]
+        if callable(lr_lambda):
+            self.schedulers = [LambdaLR(optimizer, lr_lambda) for optimizer in optimizers]
+        else:
+            self.schedulers = [
+                LambdaLR(optimizer, list(group_lambdas))
+                for optimizer, group_lambdas in zip(optimizers, lr_lambda, strict=True)
+            ]
         # Snapshot this run's coefficients outside the serialized LambdaLR
         # state, so optimizer/scheduler checkpoint loads cannot replace them.
         self._aus_base_lrs = (
@@ -268,7 +292,7 @@ class LRSchedulersContainer(Stateful, Configurable):
             else None
         )
 
-    def __iter__(self) -> Iterator[LRScheduler]:
+    def __iter__(self) -> Iterator[LambdaLR]:
         return iter(self.schedulers)
 
     def __len__(self) -> int:
@@ -281,24 +305,33 @@ class LRSchedulersContainer(Stateful, Configurable):
     def state_dict(self) -> dict[str, Any]:
         # While there may be multiple schedulers, we only save the first one because
         # schedule step is the same for all. AUS restores each optimizer's
-        # configured base LRs separately. See the limitations in the docstring.
+        # configured base LRs and functions separately. See the docstring.
         return self.schedulers[0].state_dict()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         if self._aus_base_lrs is not None:
             # Optimizer state is loaded before scheduler state. Resume the
-            # saved step using this run's per-group AUS coefficients, including
-            # on the very first update after loading WSD/AUS state.
+            # saved step using this run's per-group coefficients and exponents,
+            # including on the very first update after loading WSD/AUS state.
             for scheduler, coefficients in zip(self.schedulers, self._aus_base_lrs):
-                scheduler.load_state_dict(copy.deepcopy(state_dict))
+                saved_state = copy.deepcopy(state_dict)
+                # Keep configured functions, even when loading WSD callable
+                # state or a scheduler with a different number of groups.
+                saved_state["lr_lambdas"] = [None] * len(scheduler.lr_lambdas)
+                scheduler.load_state_dict(saved_state)
                 scheduler.base_lrs = list(coefficients)
-                factor = 1.0 / math.sqrt(scheduler.last_epoch + 1)
-                for group, coefficient in zip(
-                    scheduler.optimizer.param_groups, coefficients
+                lrs = [
+                    coefficient * factor(scheduler.last_epoch)
+                    for coefficient, factor in zip(
+                        coefficients, scheduler.lr_lambdas, strict=True
+                    )
+                ]
+                for group, coefficient, lr in zip(
+                    scheduler.optimizer.param_groups, coefficients, lrs, strict=True
                 ):
                     group["initial_lr"] = coefficient
-                    group["lr"] = coefficient * factor
-                scheduler._last_lr = [c * factor for c in coefficients]
+                    group["lr"] = lr
+                scheduler._last_lr = lrs
             return
 
         if self.preserve_lrs_when_loading:

@@ -119,9 +119,17 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
         aus_coefficient: float = 0.5
         """
-        Default per-group AUS coefficient: AUS(t) = aus_coefficient / sqrt(t).
+        Default per-group AUS coefficient: AUS(t) = aus_coefficient / t**aus_alpha.
         Override in extra_param_group_split_rules for individual groups.
         Must be finite and positive when using the AUS schedule.
+        """
+
+        aus_alpha: float = 0.5
+        """
+        Default per-group power-law exponent: AUS(t) = aus_coefficient / t**aus_alpha.
+        Override in extra_param_group_split_rules for individual groups.
+        Must be finite. Positive values decay, zero is constant, and negative
+        values grow. The default preserves the inverse-square-root schedule.
         """
 
         pre_norm: str = "identity"
@@ -310,7 +318,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             for k, v in self._get_state_dict_with_aus_config().items()
             if not (
                 k.startswith("param_groups.")
-                and k.endswith((".aus_enabled", ".aus_coefficient"))
+                and k.endswith((".aus_enabled", ".aus_coefficient", ".aus_alpha"))
             )
         }
 
@@ -324,7 +332,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
                 k: v
                 for k, v in self._get_state_dict_with_aus_config().items()
                 if k.startswith("param_groups.")
-                and k.endswith((".aus_enabled", ".aus_coefficient"))
+                and k.endswith((".aus_enabled", ".aus_coefficient", ".aus_alpha"))
             }
         )
         if self.preserve_lrs_when_loading:

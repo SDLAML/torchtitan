@@ -108,18 +108,23 @@ class TestLRScheduler(unittest.TestCase):
             )
             lr_scheduler.step()
 
-    def test_aus_group_coefficients_across_optimizers_and_resume(self):
+    def test_aus_group_power_laws_across_optimizers_and_resume(self):
         optimizers = [
             Adam(
                 [
-                    {"params": [self.model.weight], "aus_coefficient": 0.2},
-                    {"params": [self.model.bias]},  # Default coefficient is 0.5.
+                    {
+                        "params": [self.model.weight],
+                        "aus_coefficient": 0.2,
+                        "aus_alpha": 1.0,
+                    },
+                    {"params": [self.model.bias]},  # Both defaults are 0.5.
                 ],
                 lr=0.123,
             ),
             Adam([torch.nn.Parameter(torch.ones(1))], lr=0.9),
         ]
         optimizers[1].param_groups[0]["aus_coefficient"] = 0.8
+        optimizers[1].param_groups[0]["aus_alpha"] = 0.0
         for optimizer in optimizers:
             optimizer._opt_called = True
             for group in optimizer.param_groups:
@@ -128,40 +133,82 @@ class TestLRScheduler(unittest.TestCase):
         config = LRSchedulersContainer.Config(schedule_type="aus")
         scheduler = config.build(optimizers=optimizers, training_steps=5)
         coefficients = [[0.2, 0.5], [0.8]]
-        for update_number in range(1, 4):
-            for optimizer, group_coefficients in zip(optimizers, coefficients):
-                for group, coefficient in zip(
-                    optimizer.param_groups, group_coefficients
+        alphas = [[1.0, 0.5], [0.0]]
+
+        def assert_lrs(container, update_number):
+            for child, group_coefficients, group_alphas in zip(
+                container, coefficients, alphas, strict=True
+            ):
+                self.assertEqual(child.last_epoch, update_number - 1)
+                self.assertEqual(child.base_lrs, group_coefficients)
+                for group, coefficient, alpha, reported_lr in zip(
+                    child.optimizer.param_groups,
+                    group_coefficients,
+                    group_alphas,
+                    child.get_last_lr(),
+                    strict=True,
                 ):
-                    self.assertAlmostEqual(
-                        group["lr"], coefficient / math.sqrt(update_number)
-                    )
+                    expected = coefficient / update_number**alpha
+                    self.assertEqual(group["initial_lr"], coefficient)
+                    self.assertAlmostEqual(group["lr"], expected)
+                    self.assertAlmostEqual(reported_lr, expected)
+
+        for update_number in range(1, 4):
+            assert_lrs(scheduler, update_number)
             scheduler.step()
 
         saved = copy.deepcopy(scheduler.state_dict())
         original_saved = copy.deepcopy(saved)
         optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        # Reconfigure one group, then simulate optimizer state being loaded first.
+        # Change coefficient and exponent independently of checkpoint state.
         optimizers[0].param_groups[0]["aus_coefficient"] = 0.6
         coefficients[0][0] = 0.6
+        optimizers[0].param_groups[0]["aus_alpha"] = 1.5
+        alphas[0][0] = 1.5
+        optimizers[1].param_groups[0]["aus_alpha"] = -0.5
+        alphas[1][0] = -0.5
         resumed = config.build(optimizers=optimizers, training_steps=5)
         for optimizer, state in zip(optimizers, optimizer_states):
             optimizer.load_state_dict(state)
         resumed.load_state_dict(saved)
         self.assertEqual(saved, original_saved)
-        for child, group_coefficients in zip(resumed, coefficients):
-            self.assertEqual(child.last_epoch, 3)
-            self.assertEqual(child.base_lrs, group_coefficients)
-            self.assertEqual(child.get_last_lr(), [c / 2 for c in group_coefficients])
-            for group, coefficient in zip(
-                child.optimizer.param_groups, group_coefficients
-            ):
-                self.assertEqual(group["initial_lr"], coefficient)
-                self.assertEqual(group["lr"], coefficient / 2)
+        assert_lrs(resumed, 4)
         resumed.step()
-        for optimizer, group_coefficients in zip(optimizers, coefficients):
-            for group, coefficient in zip(optimizer.param_groups, group_coefficients):
-                self.assertAlmostEqual(group["lr"], coefficient / math.sqrt(5))
+        assert_lrs(resumed, 5)
+
+    def test_aus_alpha_cli_config(self):
+        config = ConfigManager().parse_args(
+            [
+                "--module",
+                "llama3",
+                "--config",
+                "llama3_debugmodel",
+                "--optimizer.aus_alpha",
+                "0.75",
+            ]
+        )
+        self.assertEqual(config.optimizer.aus_alpha, 0.75)
+
+    def test_aus_rejects_nonfinite_group_alphas_before_changing_lrs(self):
+        for alpha in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(alpha=alpha):
+                optimizer = Adam(
+                    [
+                        {"params": [self.model.weight], "aus_alpha": 0.75},
+                        {"params": [self.model.bias], "aus_alpha": alpha},
+                    ],
+                    lr=0.123,
+                )
+                for group in optimizer.param_groups:
+                    group["aus_enabled"] = True
+                    group["initial_lr"] = 0.456
+                with self.assertRaisesRegex(ValueError, "aus_alpha.*group 1"):
+                    LRSchedulersContainer.Config(schedule_type="aus").build(
+                        optimizers=[optimizer], training_steps=5
+                    )
+                for group in optimizer.param_groups:
+                    self.assertEqual(group["lr"], 0.123)
+                    self.assertEqual(group["initial_lr"], 0.456)
 
     def test_aus_rejects_invalid_group_coefficients_before_changing_lrs(self):
         for coefficient in (0.0, -0.1, float("inf"), float("-inf"), float("nan")):

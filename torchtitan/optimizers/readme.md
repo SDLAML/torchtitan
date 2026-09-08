@@ -22,35 +22,56 @@ Enable the paired optimizer and scheduler settings:
 --optimizer.aus_enabled
 --lr_scheduler.schedule_type aus
 --optimizer.aus_coefficient 0.5
+--optimizer.aus_alpha 0.5
 ```
 
-Each parameter group uses `AUS(t) = aus_coefficient / sqrt(t)`, with `t=1`
-for the first optimizer update. `optimizer.aus_coefficient` supplies the default
-(`0.5`); override it in `optimizer.extra_param_group_split_rules` for individual
-groups, using the same regex matching as other DiSCO group settings:
+Each parameter group uses `AUS(t) = aus_coefficient / t**aus_alpha`, with `t=1`
+for the first optimizer update. `optimizer.aus_coefficient` and
+`optimizer.aus_alpha` supply the defaults (both `0.5`, preserving the existing
+inverse-square-root schedule). Override either independently in
+`optimizer.extra_param_group_split_rules`, using the same regex matching as
+other DiSCO group settings:
 
 ```python
 config.optimizer.aus_coefficient = 0.5
+config.optimizer.aus_alpha = 0.5
 config.optimizer.extra_param_group_split_rules = [
-    {"str_match": "tok_embeddings", "norm_factor": "embed_sqrt", "aus_coefficient": 0.2},
-    {"str_match": "output", "norm_factor": "unembed_sqrt", "aus_coefficient": 0.3},
+    {
+        "str_match": "tok_embeddings",
+        "norm_factor": "embed_sqrt",
+        "aus_coefficient": 0.2,
+        "aus_alpha": 0.5,
+    },
+    {
+        "str_match": "output",
+        "norm_factor": "unembed_sqrt",
+        "aus_coefficient": 0.3,
+        "aus_alpha": 1.0,
+    },
 ]
 ```
 
-Unmatched parameters use `0.5` in this example. Every coefficient must be finite
-and positive. The AUS scheduler sets each group's nominal LR from its coefficient;
+This trains embeddings with `0.2 / sqrt(t)`, output with `0.3 / t`, and unmatched
+parameters with `0.5 / sqrt(t)`. Rules use first-match precedence; for example,
+`r"^layers\.3\."` targets one transformer block. Every coefficient must be finite
+and positive, and every exponent must be finite. Positive exponents decay,
+`aus_alpha=0` gives constant AUS, and negative exponents give increasing AUS.
+The AUS scheduler sets each group's nominal LR from its coefficient and exponent;
 `lr` overrides do not affect AUS. The former `lr_scheduler.aus_coefficient` setting
 has moved to `optimizer.aus_coefficient`.
 
 When resuming a full checkpoint, the saved step number is retained and the
-current run's per-group coefficients determine the LRs, including the first
-resumed update. This also applies when switching from WSD or changing coefficients;
-`checkpoint.reconfigure_lrs` is not required for AUS.
+current run's per-group coefficients and exponents determine the LRs, including
+the first resumed update. This also applies when switching from WSD or changing
+coefficients or exponents; `checkpoint.reconfigure_lrs` is not required for AUS.
+For example, resuming after 100 updates with `aus_alpha=1` uses `C / 101` next,
+even if the checkpoint was trained with `aus_alpha=0.5`.
 
-`aus_enabled` and `aus_coefficient` are taken from the current run's configuration
-and are omitted from TorchTitan's flattened optimizer checkpoint schema, so
-checkpoints predating AUS do not need these fields. Other existing checkpoint
-requirements (such as momentum and radial state) still apply.
+`aus_enabled`, `aus_coefficient`, and `aus_alpha` are taken from the current run's
+configuration and are omitted from TorchTitan's flattened optimizer checkpoint
+schema, so checkpoints predating AUS or configurable exponents do not need these
+fields. Other existing checkpoint requirements (such as momentum and radial state)
+still apply.
 
 The correction is recomputed from the current weight and post-LMO update
 immediately before every update. `spectral`/`rmnp_row_norm_rms_rms` use the
