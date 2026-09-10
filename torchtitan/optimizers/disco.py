@@ -21,8 +21,8 @@ from torchtitan.distributed.utils import (
     metrics_shard_rank,
     rank_owns_metrics_shard,
 )
-from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import logger
+from torchtitan.observability import structured_logger as sl
 
 from . import gram_helper, norm_helper, power_iteration
 from .abstract_disco import AbstractDiSCO
@@ -154,6 +154,32 @@ def _is_fsdp_row_sharded(p) -> bool:
         return False
     placement = p.placements[idx]
     return isinstance(placement, Shard) and placement.dim == 0
+
+
+def _fsdp_shard_dim(p) -> int | None:
+    """Tensor dim that `p` is FSDP-sharded on, or None if it is not FSDP-sharded.
+
+    Sibling of `_is_fsdp_row_sharded`, which answers only "is it dim 0?" and so
+    reports False for a genuinely sharded Shard(1) param -- indistinguishable
+    from replicated. `step_experts` needs the dim itself, because a non-zero
+    shard dim invalidates its no-gather LMO.
+    """
+    if not isinstance(p, DTensor):
+        return None
+    mesh_dim_names = p.device_mesh.mesh_dim_names
+    if not mesh_dim_names:
+        return None
+    axis = next(
+        (n for n in ("fsdp", "dp_shard_cp", "dp_shard") if n in mesh_dim_names),
+        None,
+    )
+    if axis is None:
+        return None
+    idx = mesh_dim_names.index(axis)
+    if p.device_mesh.size(idx) <= 1:
+        return None
+    placement = p.placements[idx]
+    return placement.dim if isinstance(placement, Shard) else None
 
 
 def _pseudo_post_update_weight(w, u, lr, wd):
@@ -1477,9 +1503,43 @@ class DiSCO(AbstractDiSCO):
             blocks.append((start, total))
             self._expert_blocks = blocks
 
-        self._expert_ep_per_rank = math.ceil(
-            self.expert_params[0].shape[0] / world_size
-        )
+        # step_experts calls `self.lmo` on each rank's LOCAL expert buffer with
+        # no gather. That is the true LMO only when a rank owns WHOLE expert
+        # matrices, i.e. Shard(0). Under Shard(1) (which FSDP picks when the
+        # shard degree exceeds num_experts -- see distributed/fsdp.py) a rank
+        # holds a row-block of every expert, and orthogonalizing a row-block is
+        # not orthogonalizing the matrix. Fail here rather than produce a wrong
+        # update; opt_moe pins Shard(0) via `expert_shard_dim=0`.
+        p0 = self.expert_params[0]
+        shard_dim = _fsdp_shard_dim(p0)
+        if shard_dim is not None and shard_dim != 0:
+            raise ValueError(
+                f"DiSCO's expert path requires routed experts sharded on dim 0, "
+                f"but {self.expert_param_names[0]} is Shard({shard_dim}) over the "
+                f"FSDP axis (num_experts={int(p0.shape[0])}, shard degree="
+                f"{world_size}). FSDP falls back to Shard(1) when the shard "
+                f"degree exceeds num_experts; pass expert_shard_dim=0 to "
+                f"apply_fsdp_to_decoder, raise num_experts, lower "
+                f"data_parallel_shard_degree, or enable expert parallelism so "
+                f"that the per-rank expert count is >= 1."
+            )
+        # ceil, not the local shape: it must be UNIFORM across ranks (the
+        # spectrum/norm buffers are gathered with one collective, see
+        # _precompute_experts_metadata's comments). Under an uneven Shard(0)
+        # -- E=2 over 4 shard ranks -- ranks past the end own no expert and
+        # contribute zeros; `_prepare_experts_lmo_per_block` skips them via its
+        # `g_local.shape[0] == 0` branch.
+        self._expert_ep_per_rank = math.ceil(p0.shape[0] / world_size)
+        loc0 = self._get_param_local_view(p0)
+        if loc0.shape[0] not in (0, self._expert_ep_per_rank):
+            raise ValueError(
+                f"Expert local view has {int(loc0.shape[0])} experts but "
+                f"ep_per_rank is {self._expert_ep_per_rank} "
+                f"(num_experts={int(p0.shape[0])}, shard degree={world_size}). "
+                f"The expert big_g buffers are sized from ep_per_rank, so this "
+                f"would fail in _foreach_copy_. Check the FSDP shard placement "
+                f"for routed experts."
+            )
         self._expert_kinds_of_norms = len(self.norms_to_log)
         self._expert_transpose = self.experts_need_transpose
 

@@ -38,7 +38,9 @@ ignores ``topk_weights`` in expand mode anyway).
 
 from dataclasses import dataclass
 
+
 import torch
+
 from torch.distributed import ProcessGroup
 
 try:
@@ -90,17 +92,44 @@ _lib = torch.library.Library("deepep", "DEF")
 # recv_topk_idx is the per-received-token local-expert assignment, used by the compact
 # path to gather tokens into expert-major order (it is an empty placeholder in expand mode,
 # whose static layout is already expert-grouped).
+# ``dynamic_output_shape`` declares what is true of the compact layout: the received-token
+# count is host-synced and data-dependent, so the fake impl below returns an unbacked
+# symint. This is the same tag nonzero/unique/item carry.
+#
+# NOTE it is NOT sufficient to make this op compile -- see the block above
+# _dispatch_setup_context; see the block above it for how the handle lookup is kept
+# out of tracing.
 _lib.define(
     "dispatch(Tensor x, Tensor topk_idx, Tensor topk_weights, "
-    "int num_experts, int num_tokens_per_rank, bool cudagraphable) "
-    "-> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+    "int num_experts, int num_local_experts, int num_tokens_per_rank, "
+    "bool cudagraphable) -> (Tensor, Tensor, Tensor, Tensor, Tensor)",
+    tags=(torch.Tag.dynamic_output_shape,),
 )
 # combine returns: combined_x. ``will_backward`` is the caller's outer grad state
 # (torch.is_grad_enabled() evaluated before the op): it is the only reliable signal for
 # whether a backward will consume the cached handle, since inside a custom-op forward
 # autograd disables grad regardless of the outer context. When False (generator no_grad /
 # inference), the op frees the handle itself (setup_context never runs).
-_lib.define("combine(Tensor x, Tensor handle_id, bool will_backward) -> Tensor")
+_lib.define(
+    "combine(Tensor x, Tensor handle_id, int num_tokens, bool will_backward) -> Tensor"
+)
+# The backwards are ops in their own right so the opaque-handle lookup happens in a CUDA
+# impl AT RUNTIME rather than in setup_context DURING TRACING. Looking it up while tracing
+# is what made compile impossible: `_handle_cache[handle_id.item()]` needs `.item()`, which
+# under tracing is an unbacked SymInt and cannot be a dict key
+# ("TypeError: unhashable type: non-nested SymInt").
+#
+# `like_x` / `like_recv` are shape carriers: each backward's output has the shape of a
+# tensor the forward already produced, so the fakes below derive their sizes from an input
+# instead of minting a new unbacked size. hybridep and minimal_async_ep are built the same
+# way, and both compile.
+_lib.define(
+    "dispatch_backward(Tensor grad_recv_x, Tensor grad_recv_scores, Tensor handle_id, "
+    "Tensor like_x, Tensor like_scores) -> (Tensor, Tensor)"
+)
+_lib.define(
+    "combine_backward(Tensor grad_combined, Tensor handle_id, Tensor like_recv) -> Tensor"
+)
 
 
 # Fallback dispatch/combine SM count when deep_ep's bandwidth heuristic cannot run
@@ -132,6 +161,7 @@ def _dispatch_op_impl(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     num_experts: int,
+    num_local_experts: int,
     num_tokens_per_rank: int,
     cudagraphable: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -151,6 +181,9 @@ def _dispatch_op_impl(
     global _buffer
     buffer = _buffer
     assert buffer is not None, "Buffer must be initialized before dispatch"
+    # num_local_experts is carried only so the fake impl can size num_recv_per_expert;
+    # the real counts come from the handle.
+    del num_local_experts
 
     # Resolve num_sms ourselves and pass it explicitly: the resolver calls deep_ep's
     # bandwidth heuristic but catches its multi-node RDMA-bandwidth divide-by-zero, so
@@ -194,11 +227,45 @@ def _dispatch_op_impl(
     return recv_x, recv_topk_idx, recv_scores, num_recv_per_expert, handle_id
 
 
+# ---------------------------------------------------------------------------
+# HOW THIS BACKEND COMPILES
+#
+# The opaque EPHandle cannot be a graph value, so dispatch returns an integer
+# ``handle_id`` tensor and the handle itself lives in a module-level dict, ``_handle_cache``.
+# Resolving it needs ``handle_id.item()``, and WHERE that happens decides whether the
+# backend compiles:
+#
+#   setup_context  -> runs DURING TRACING. There ``.item()`` is an unbacked SymInt, and a
+#                     SymInt cannot be a dict key:
+#                         File "torch/__init__.py", in __hash__
+#                             raise TypeError("unhashable type: non-nested SymInt")
+#                     dynamo surfaces this as a misleading "RuntimeError when making fake
+#                     tensor call ..." naming deepep.dispatch with every argument shown as
+#                     concrete, which is why it took three attempts to find.
+#   a CUDA impl    -> runs AT RUNTIME on a real tensor, where ``.item()`` is a real int.
+#
+# So the backwards are custom ops of their own (``dispatch_backward`` / ``combine_backward``)
+# and the setup_contexts save only TENSORS: the handle_id plus shape carriers for the
+# outputs. Fakes for all four ops let dynamo trace the whole region, forward and backward.
+# hybridep.py and minimal_async_ep/api.py are built the same way and compile for the same
+# reason.
+#
+# Verified under FakeTensorMode(shape_env=ShapeEnv()) with requires_grad=True inputs -- the
+# login-node repro that finds this class of bug in seconds instead of an sbatch cycle --
+# both with capture_dynamic_output_shape_ops left False (dynamo graph-breaks at the
+# data-dependent dispatch; deepep runs eager, everything around it compiles) and True
+# (dynamo traces straight through). Both reach backward and produce correctly shaped grads.
+# ---------------------------------------------------------------------------
+
+
 def _dispatch_setup_context(ctx, inputs, output):
-    x, *_ = inputs
+    # NO .item() here. This runs during tracing, where handle_id.item() is an unbacked
+    # SymInt and cannot key a dict. The tensor is saved instead and resolved inside the
+    # backward OP's CUDA impl, which only ever runs eagerly.
+    x, _topk_idx, topk_weights, *_ = inputs
     *_, handle_id = output
     ctx.input_dtype = x.dtype
-    ctx.saved_handle = _handle_cache.get(handle_id.item())
+    ctx.save_for_backward(handle_id, x, topk_weights)
 
 
 def _dispatch_backward(
@@ -211,43 +278,44 @@ def _dispatch_backward(
 ):
     """Backward for dispatch: a combine of the gradients.
 
-    The combine reduces grad_recv_x back to the original tokens (grad for x); passing
-    grad_recv_scores as the combine's topk_weights yields the gradient for the
-    dispatched routing scores (DeepEP combine returns the reduced weights too).
     recv_topk_idx is non-differentiable, so grad_recv_topk_idx is ignored.
     """
-    global _buffer
+    handle_id, like_x, like_scores = ctx.saved_tensors
     if grad_recv_x is None:
-        return None, None, None, None, None, None
+        # The op below is what normally frees the handle; skipping it would leak.
+        # Guarded because .item() is only legal outside tracing -- and under
+        # AOTAutograd grad_recv_x is never None, so this branch is eager-only.
+        if not torch.compiler.is_compiling():
+            _handle_cache.pop(handle_id.item(), None)
+        return None, None, None, None, None, None, None
 
-    buffer = _buffer
-    assert buffer is not None, "Buffer must be initialized before combine"
-
-    handle = ctx.saved_handle
-    assert handle is not None
-
-    grad_x, grad_scores, _event = buffer.combine(
-        grad_recv_x,
-        handle=handle,
-        topk_weights=grad_recv_scores.float() if grad_recv_scores is not None else None,
-    )
-    grad_x = grad_x.to(ctx.input_dtype)
-    grad_topk_weights = (
-        grad_scores.to(ctx.input_dtype) if grad_scores is not None else None
+    if grad_recv_scores is None:
+        grad_recv_scores = torch.zeros_like(like_scores)
+    grad_x, grad_scores = torch.ops.deepep.dispatch_backward(
+        grad_recv_x, grad_recv_scores, handle_id, like_x, like_scores
     )
     # Order matches op inputs: x, topk_idx, topk_weights, num_experts,
-    # num_tokens_per_rank, cudagraphable.
-    # Backward only runs on the compact (cudagraphable=False) path; the expand layout is
-    # inference-only ("must not be backward").
-    return grad_x, None, grad_topk_weights, None, None, None
+    # num_local_experts, num_tokens_per_rank, cudagraphable.
+    return (
+        grad_x.to(ctx.input_dtype),
+        None,
+        grad_scores.to(ctx.input_dtype),
+        None,
+        None,
+        None,
+        None,
+    )
 
 
 @torch.library.impl(_lib, "combine", "CUDA")
 def _combine_op_impl(
-    x: torch.Tensor, handle_id: torch.Tensor, will_backward: bool
+    x: torch.Tensor, handle_id: torch.Tensor, num_tokens: int, will_backward: bool
 ) -> torch.Tensor:
     """Execute DeepEP v2 combine (pure reduction; scores already applied upstream)."""
     global _buffer, _pending_combine_event
+    # num_tokens is carried only so the fake impl can size the output; the real
+    # reduction length comes from the handle.
+    del num_tokens
     buffer = _buffer
     assert buffer is not None, "Buffer must be initialized before combine"
 
@@ -269,39 +337,186 @@ def _combine_op_impl(
         topk_weights=None,
         async_with_compute_stream=True,
     )
-    # Record completion so the dispatcher can synchronize before returning.
-    _pending_combine_event = after_event
+    # DeepEP's contract for async_with_compute_stream=True (their docstring: "the
+    # current stream will not wait for the communication kernels to be finished if
+    # set", "event ... valid only if async_with_compute_stream is set") is that the
+    # CALLER must wait on the returned event before consuming `combined`.
+    #
+    # That wait used to live only in sync_combine(), which returns early under
+    # torch.compile because CUDA event ops are not traceable. Once dynamo started
+    # tracing THROUGH deepep (it graph-broke before the fakes existed, which is why
+    # 0.4.0 was unaffected), the wait silently disappeared and a compiled graph read
+    # `combined` while the comm kernel was still in flight -> non-finite loss at
+    # step 2.
+    #
+    # Waiting inside the op honours the contract in BOTH paths, because a custom-op
+    # impl always runs eagerly at runtime. It does NOT disable DeepEP's overlap:
+    # async_with_compute_stream stays True, the kernels still launch on the comm
+    # stream, and work already queued on the compute stream still overlaps. Eager
+    # stream order is unchanged too -- the sole caller (token_dispatcher.combine)
+    # calls sync_combine() on the very next statement, so nothing was ever enqueued
+    # between the two points.
+    if after_event is not None:
+        after_event.current_stream_wait()
+    _pending_combine_event = None
     return combined
 
 
 def _combine_setup_context(ctx, inputs, output):
-    _, handle_id, _will_backward = inputs
-    ctx.saved_handle = _handle_cache.pop(handle_id.item(), None)
+    # As above: save the tensor, resolve it inside the backward op at runtime.
+    x, handle_id, _num_tokens, _will_backward = inputs
+    ctx.save_for_backward(handle_id, x)
 
 
 def _combine_backward(ctx, grad_combined):
     """Backward for combine: a dispatch of the gradient (reuses the cached handle).
 
-    Returns grads for op inputs (x, handle_id, will_backward); only x is differentiable.
+    Returns grads for op inputs (x, handle_id, num_tokens, will_backward); only x is
+    differentiable.
     """
-    global _buffer
+    handle_id, like_recv = ctx.saved_tensors
+    grad_x = torch.ops.deepep.combine_backward(grad_combined, handle_id, like_recv)
+    return grad_x, None, None, None
+
+
+# ---------------------------------------------------------------------------
+# Fake (meta) impls -- required for torch.compile / AOTAutograd tracing.
+#
+# Unlike hybridep and minimal_async_ep, whose dispatch outputs are STATICALLY sized
+# (x.shape[0] / receive_capacity), the compact training layout is deduplicated: the
+# received-token count is a host-synced, data-dependent quantity. It is therefore an
+# unbacked symint (``new_dynamic_size()``). See the note below on why that means dynamo
+# graph-breaks here, and why that is the correct outcome rather than a problem to fix.
+# ---------------------------------------------------------------------------
+
+
+# DO NOT set torch._dynamo.config.capture_dynamic_output_shape_ops here.
+#
+# These fakes return an unbacked (data-dependent) row count, so dynamo cannot trace the
+# ops and GRAPH-BREAKS on them: the deepep region runs eager while everything around it
+# still compiles. The model compile path is not fullgraph, so that break is legal, and it
+# is what 0.4.0 did -- which is why the 100B EP=4 proposal runs worked with
+# `compile.enable = True` (launch_scripts/2026-proposal/100b-32-nodes.sbatch).
+#
+# Setting the flag makes dynamo trace through instead of breaking. It then reaches
+# `_handle_cache[handle_id.item()]`, where under tracing `.item()` is an unbacked SymInt
+# and cannot be a dict key -- "TypeError: unhashable type: non-nested SymInt". So the flag
+# converts a working graph break into a hard failure, and being global it would change how
+# every dynamic-output-shape op in the model is handled, not just these two.
+#
+# The real fix is to promote `dispatch_backward` / `combine_backward` to custom ops with
+# their own fakes, so the cache lookup happens in a CUDA impl at runtime. Both sibling
+# backends are built that way and do compile: `hybridep.py` passes the handle as a
+# first-class op value; `minimal_async_ep/api.py` uses save_for_backward.
+
+
+@torch.library.register_fake("deepep::dispatch")
+def _dispatch_fake(
+    x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    num_local_experts: int,
+    num_tokens_per_rank: int,
+    cudagraphable: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if cudagraphable:
+        # The expand layout's row count is computed inside the DeepEP kernel and is not
+        # reproducible here; guessing it would silently mis-size the traced graph. That
+        # path is inference-only (no_grad) and is not compiled today, so refuse loudly.
+        raise NotImplementedError(
+            "deepep::dispatch has no fake impl for the expand (cudagraphable=True) "
+            "layout; run the generator eagerly or use cudagraphable=False."
+        )
+
+    ctx = torch.library.get_ctx()
+    # One row per UNIQUE received token: bounded above by num_tokens_per_rank * ep_size,
+    # but the exact value needs the host sync, so it is unbacked.
+    num_recv = ctx.new_dynamic_size()
+    topk = topk_idx.shape[1]
+
+    recv_x = x.new_empty(num_recv, x.shape[1])
+    recv_topk_idx = topk_idx.new_empty(num_recv, topk)
+    recv_scores = topk_weights.new_empty(num_recv, topk)
+    # Compact mode returns the per-local-expert counts on CPU (they come from the
+    # host sync); dispatch_tokens immediately moves them to the device.
+    num_recv_per_expert = torch.empty(
+        num_local_experts, dtype=torch.int32, device="cpu"
+    )
+    handle_id = torch.empty(1, dtype=torch.int64, device="cpu")
+    return recv_x, recv_topk_idx, recv_scores, num_recv_per_expert, handle_id
+
+
+@torch.library.register_fake("deepep::combine")
+def _combine_fake(
+    x: torch.Tensor, handle_id: torch.Tensor, num_tokens: int, will_backward: bool
+) -> torch.Tensor:
+    """Combine reduces back to the caller's original local token count."""
+    return x.new_empty(num_tokens, x.shape[1])
+
+
+# ---------------------------------------------------------------------------
+# Backward ops: CUDA impls (the handle lookup lives HERE, at runtime) + fakes.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.impl(_lib, "dispatch_backward", "CUDA")
+def _dispatch_backward_impl(
+    grad_recv_x: torch.Tensor,
+    grad_recv_scores: torch.Tensor,
+    handle_id: torch.Tensor,
+    like_x: torch.Tensor,
+    like_scores: torch.Tensor,
+):
+    """dispatch's backward IS a combine of the gradients.
+
+    `.item()` is safe here: this runs eagerly on a real CPU tensor, never under tracing.
+    That is the entire point of promoting the backward to an op.
+    """
+    del like_x, like_scores
+    buffer = _buffer
+    assert buffer is not None, "Buffer must be initialized before combine"
+    # pop: this is the last consumer of the handle in a training step
+    # (combine_backward ran first and only read it), so free it here or the
+    # cache grows without bound.
+    handle = _handle_cache.pop(handle_id.item(), None)
+    assert handle is not None, "Handle not found in dispatch backward"
+    grad_x, grad_scores, _event = buffer.combine(
+        grad_recv_x, handle=handle, topk_weights=grad_recv_scores.float()
+    )
+    return grad_x, grad_scores
+
+
+@torch.library.register_fake("deepep::dispatch_backward")
+def _dispatch_backward_fake(
+    grad_recv_x, grad_recv_scores, handle_id, like_x, like_scores
+):
+    # Shapes come from the forward's own tensors, so no NEW unbacked size is minted.
+    return torch.empty_like(like_x), torch.empty_like(like_scores)
+
+
+@torch.library.impl(_lib, "combine_backward", "CUDA")
+def _combine_backward_impl(grad_combined, handle_id, like_recv):
+    """combine's backward IS a dispatch of the gradient, reusing the cached handle."""
+    del like_recv
     buffer = _buffer
     assert buffer is not None, "Buffer must be initialized before dispatch"
-
-    handle = ctx.saved_handle
+    # get, NOT pop: backward runs in reverse, so this fires BEFORE
+    # dispatch_backward, which needs the same handle. dispatch_backward is the
+    # last consumer and frees it.
+    handle = _handle_cache.get(handle_id.item())
     assert handle is not None, "Handle not found in combine backward"
-
-    # Reuse the dispatch layout via the cached handle (no CPU sync, topk_idx/weights None).
-    # Pass num_sms from the handle: with a cached handle, dispatch's automatic
-    # get_theoretical_num_sms(num_experts, ...) runs BEFORE num_experts is inferred from the
-    # handle, so it would hit num_experts=None. handle.num_sms reuses the dispatch SM count.
+    # num_sms from the handle: with a cached handle, dispatch's automatic
+    # get_theoretical_num_sms runs BEFORE num_experts is inferred from it.
     grad_x, _idx, _scores, _handle, _event = buffer.dispatch(
-        grad_combined,
-        handle=handle,
-        num_sms=handle.num_sms,
-        do_cpu_sync=False,
+        grad_combined, handle=handle, num_sms=handle.num_sms, do_cpu_sync=False
     )
-    return grad_x, None, None
+    return grad_x
+
+
+@torch.library.register_fake("deepep::combine_backward")
+def _combine_backward_fake(grad_combined, handle_id, like_recv):
+    return torch.empty_like(like_recv)
 
 
 torch.library.register_autograd(
@@ -315,9 +530,11 @@ torch.library.register_autograd(
 def sync_combine() -> None:
     """Wait the current CUDA stream on the pending async combine.
 
-    MUST be called before using a combine result. Guarded under compile (CUDA event
-    ops are not traceable); during make_fx tracing _pending_combine_event is None
-    (no real combine ran), so the body is a no-op. Safe to call multiple times.
+    Kept for callers that follow DeepEP's documented "wait before you read" contract,
+    but the wait now happens inside the combine op itself (see _combine_op_impl), so
+    this is normally a no-op. It has to be: under torch.compile this function returns
+    early -- CUDA event ops are not traceable -- so it cannot be the only place the
+    wait happens. Safe to call multiple times.
     """
     global _pending_combine_event
     if torch.compiler.is_compiling():
@@ -410,8 +627,11 @@ def _permute_tokens(
 
     # Repeat each token by its valid count and select tokens in expert order.
     sort_order = torch.argsort(valid_expert_ids, stable=True)
+    # size(0), not len(): under torch.compile the received-token count is an unbacked
+    # symint (the compact dispatch layout is data-dependent), and len() forces it to a
+    # Python int, which raises GuardOnDataDependentSymNode.
     permuted_indices = torch.arange(
-        len(hidden_states), device=hidden_states.device
+        hidden_states.size(0), device=hidden_states.device
     ).repeat_interleave(mask.sum(dim=1))[sort_order]
     permuted_hidden_states = hidden_states.index_select(0, permuted_indices)
     permuted_scores = valid_scores[sort_order]
@@ -443,6 +663,9 @@ class DispatchState:
 
     handle_id: torch.Tensor  # CPU tensor used to retrieve the cached EPHandle
     num_recv_tokens: int
+    # Original local token count (combine's output length; not recoverable from the
+    # permuted/deduplicated combine input, so it is carried explicitly for the fake impl).
+    num_tokens: int
     cudagraphable: bool = False
     # Compact path (cudagraphable=False): gather/scatter mapping for the grouped GEMM.
     permuted_indices: torch.Tensor | None = None
@@ -489,8 +712,6 @@ def dispatch_tokens(
     Returns:
         (routed_tokens [num_recv, hidden], tokens_per_expert [num_local_experts], state)
     """
-    del num_local_experts  # counts come from the handle, not this hint
-
     # The expand layout is inference-only ("must not be backward"), so gate it on a
     # no-grad context. With a single model_spec shared by trainer and generator, this
     # auto-selects: the trainer (autograd enabled) takes the compact path, while the
@@ -501,6 +722,12 @@ def dispatch_tokens(
 
     buffer = _buffer
     assert buffer is not None, "Buffer must be initialized before dispatch"
+    # Callers pass x.shape[0]. Pin it to a Python int before it crosses the op boundary:
+    # the schema declares an int, and this value indexes a buffer preallocated to a fixed
+    # num_max_tokens_per_rank, so a symbolic token count could not be served anyway. (The
+    # unhashable-SymInt failure under compile came from the OUTPUT, not this argument --
+    # see the dynamic_output_shape tag on the schema.)
+    num_tokens_per_rank = int(num_tokens_per_rank)
     assert num_tokens_per_rank <= buffer.num_max_tokens_per_rank, (
         "DeepEP current token count "
         f"{num_tokens_per_rank} exceeds the "
@@ -525,6 +752,7 @@ def dispatch_tokens(
         selected_experts_indices,
         top_scores,
         num_experts=num_experts,
+        num_local_experts=num_local_experts,
         num_tokens_per_rank=num_tokens_per_rank,
         cudagraphable=cudagraphable,
     )
@@ -536,6 +764,7 @@ def dispatch_tokens(
         state = DispatchState(
             handle_id=handle_id,
             num_recv_tokens=recv_x.shape[0],
+            num_tokens=num_tokens_per_rank,
             cudagraphable=True,
             recv_scores=recv_scores,
         )
@@ -550,6 +779,7 @@ def dispatch_tokens(
     state = DispatchState(
         handle_id=handle_id,
         num_recv_tokens=num_recv_tokens,
+        num_tokens=num_tokens_per_rank,
         cudagraphable=False,
         permuted_indices=permuted_indices,
         permuted_scores=permuted_scores,
@@ -592,7 +822,9 @@ def combine_tokens(
         hidden_states = _unpermute_tokens(
             hidden_states, state.permuted_indices, state.num_recv_tokens
         )
-        return torch.ops.deepep.combine(hidden_states, state.handle_id, will_backward)
+        return torch.ops.deepep.combine(
+            hidden_states, state.handle_id, state.num_tokens, will_backward
+        )
 
     if state.recv_scores is not None:
         # One routing score per received row (each row is one token->expert assignment).
@@ -602,4 +834,6 @@ def combine_tokens(
             dim=-1, keepdim=True
         )
         hidden_states = hidden_states * per_row_score.to(hidden_states.dtype)
-    return torch.ops.deepep.combine(hidden_states, state.handle_id, will_backward)
+    return torch.ops.deepep.combine(
+        hidden_states, state.handle_id, state.num_tokens, will_backward
+    )

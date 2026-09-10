@@ -127,6 +127,14 @@ def parallelize_opt_moe(
         dp_mesh_dims=dp_mesh_dims,
         edp_mesh_dims=edp_mesh_dims,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        # Pin routed experts to Shard(0). DiSCO's step_experts runs the LMO on
+        # each rank's LOCAL expert buffer with no gather, which is only the true
+        # LMO when a rank owns whole expert matrices. Under Shard(1) a rank holds
+        # a row-block of every expert instead, so the result would be silently
+        # wrong (and today it crashes in _foreach_copy_ on the shape mismatch).
+        # 0.4.0 had this implicitly: its Shard(1) branch was gated on
+        # ep_degree > 1, so opt_moe always got Shard(0).
+        expert_shard_dim=0,
     )
 
     return model

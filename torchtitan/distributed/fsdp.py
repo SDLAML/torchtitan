@@ -165,6 +165,34 @@ def apply_fsdp_to_vision_encoder(
     )
 
 
+def _fsdp_shard_degree(mesh: DeviceMesh, mesh_dims: Any | None) -> int:
+    """Number of ranks a parameter is actually SHARDED over.
+
+    NOT ``mesh.size()``. Under HSDP the FSDP mesh also carries ``dp_replicate``,
+    which replicates rather than shards, so ``mesh.size()`` overstates the degree
+    by the replicate factor. That mattered: the expert placement rule below
+    compares this against ``num_experts``, so an HSDP run with dp_replicate=2 and
+    dp_shard == num_experts flipped to Shard(1) even though Shard(0) divides
+    evenly, and DiSCO's expert path (which assumes whole expert matrices per rank)
+    died in ``_foreach_copy_``. 0.4.0 never hit this because its equivalent branch
+    read ``edp_mesh["efsdp"].size()`` -- the shard axis -- and only ran under EP.
+    """
+    if mesh_dims is not None:
+        # spmd_types: DataParallelMeshDims names the shard axes explicitly.
+        shard = mesh_dims.shard
+        axes: tuple[str, ...] = (shard,) if isinstance(shard, str) else tuple(shard)
+    else:
+        # partial_dtensor: the mesh is ["dp_replicate", "fsdp"] or ["fsdp"].
+        names = mesh.mesh_dim_names or ()
+        axes = tuple(n for n in names if n != "dp_replicate")
+        if not axes:
+            return mesh.size()
+    degree = 1
+    for axis in axes:
+        degree *= mesh[axis].size()
+    return degree
+
+
 def apply_fsdp_to_decoder(
     model: "Decoder",
     dp_mesh: DeviceMesh,
@@ -178,6 +206,7 @@ def apply_fsdp_to_decoder(
     dp_mesh_dims: "DataParallelMeshDims | None" = None,
     edp_mesh_dims: "DataParallelMeshDims | None" = None,
     enable_symm_mem: bool = False,
+    expert_shard_dim: int | None = None,
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -219,6 +248,17 @@ def apply_fsdp_to_decoder(
             used by routed experts. ``None`` under partial_dtensor.
         enable_symm_mem (bool): Whether to enable symmetric-memory FSDP
             communication.
+        expert_shard_dim (int | None): Pin routed-expert params to this shard
+            dim instead of choosing one by heuristic. ``None`` (default) keeps
+            the heuristic: ``Shard(1)`` when the shard degree exceeds
+            ``num_experts``, else ``Shard(0)``. ``opt_moe`` pins ``0`` because
+            DiSCO's expert path does the LMO on each rank's LOCAL buffer with
+            no gather, which is only the true LMO when a rank owns WHOLE expert
+            matrices -- i.e. under ``Shard(0)``. Under ``Shard(1)`` each rank
+            holds a row-block of every expert, so orthogonalizing it is not
+            orthogonalizing the matrix. This mirrors 0.4.0, where the
+            ``Shard(1)`` branch existed only under ``ep_degree > 1`` and
+            opt_moe therefore always got ``Shard(0)``.
     """
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
@@ -264,12 +304,14 @@ def apply_fsdp_to_decoder(
                 reshard_after_forward=reshard_after_forward_policy == "always",
             )
 
+    warned_expert_pad = False
     for layer_id, transformer_block in model.layers.items():
         # NOTE: In an MoE layer, we use shard_placement_fn to apply different
         # FSDP mesh and shard placement to different parameters:
         # - When EP > 1: routed experts use edp_mesh, other params use dp_mesh
         # - When EP = 1: all params use the same FSDP mesh, but experts may
-        #   use Shard(1) when FSDP degree > num_experts to avoid padding
+        #   use Shard(1) when the SHARD DEGREE exceeds num_experts, to avoid
+        #   padding -- unless the caller pinned a dim via expert_shard_dim.
         # Dense blocks (no ``moe_enabled``) fall through to a plain fully_shard.
         if getattr(transformer_block, "moe_enabled", False):
             assert hasattr(transformer_block, "moe")
@@ -287,19 +329,56 @@ def apply_fsdp_to_decoder(
             expert_params = set(experts.parameters())
             num_experts = experts.num_experts
 
+            # How many pieces dim 0 (num_experts) gets cut into -- the ONLY thing the
+            # placement rule below needs. EP cuts it `ep_degree` ways and FSDP cuts
+            # each of those `efsdp` ways; without EP it is just the FSDP shard degree.
+            # Upstream calls both branches "efsdp_ep_size" and computes the ep==1 one
+            # as fsdp_config["mesh"].size(), which under HSDP multiplies in
+            # dp_replicate -- an axis that REPLICATES and never cuts dim 0.
             if ep_degree > 1:
                 assert edp_mesh is not None
-                efsdp_ep_size = edp_mesh["efsdp"].size() * ep_degree
+                expert_dim0_cuts = edp_mesh["efsdp"].size() * ep_degree
             else:
-                efsdp_ep_size = fsdp_config["mesh"].size()
+                expert_dim0_cuts = _fsdp_shard_degree(
+                    fsdp_config["mesh"], dp_mesh_dims
+                )
 
-            if efsdp_ep_size > num_experts:
+            if expert_shard_dim == 0 and expert_dim0_cuts > num_experts:
+                # Shard(0) still WORKS here -- torch.chunk gives the surplus
+                # ranks an empty [0, F, D] local view, and DiSCO skips those --
+                # but it is expensive: only num_experts of the shard ranks own
+                # anything, and each owns a WHOLE expert, so per-rank expert
+                # memory is (shard_degree / num_experts) x what Shard(1) would
+                # use. Warn rather than refuse (the caller pinned dim 0 on
+                # purpose), once per model rather than once per layer.
+                if not warned_expert_pad:
+                    warned_expert_pad = True
+                    logger.warning(
+                        f"Routed experts are pinned to Shard(0) but the FSDP "
+                        f"shard degree ({expert_dim0_cuts}) exceeds num_experts "
+                        f"({num_experts}): {expert_dim0_cuts - num_experts} of "
+                        f"{expert_dim0_cuts} shard ranks will own no expert, and "
+                        f"each owner holds a whole one -- about "
+                        f"{expert_dim0_cuts // num_experts}x the per-rank expert "
+                        f"memory of a dim-1 shard. Raise "
+                        f"data_parallel_replicate_degree, lower "
+                        f"data_parallel_shard_degree, or use a flavor with more "
+                        f"experts to keep shard_degree <= num_experts."
+                    )
+            if expert_shard_dim is not None:
+                # Caller pinned the dim (see the arg docstring). Shard(0) with
+                # shard_degree > num_experts is still correct -- FSDP2 pads, and
+                # DiSCO already skips zero-expert local shards -- it just costs
+                # some padding, which is the deliberate trade for a valid LMO.
+                expert_shard_placement = Shard(expert_shard_dim)
+            elif expert_dim0_cuts > num_experts:
                 expert_shard_placement = Shard(1)
             else:
                 expert_shard_placement = Shard(0)
 
-            # When ep_degree == 1 and no Shard(1) override needed, skip
-            # shard_placement_fn entirely for simplicity
+            # When ep_degree == 1 and the placement is plain Shard(0), skip
+            # shard_placement_fn entirely for simplicity -- Shard(0) is exactly
+            # what fully_shard does by default.
             if ep_degree == 1 and expert_shard_placement == Shard(0):
                 fully_shard(
                     transformer_block,
@@ -307,13 +386,15 @@ def apply_fsdp_to_decoder(
                     reshard_after_forward=reshard_after_forward,
                 )
             elif ep_degree == 1:
-                # ep_degree == 1 but need Shard(1) for experts to avoid padding
+                # ep_degree == 1 and experts need a non-default placement
+                # (heuristic Shard(1), or whatever the caller pinned).
                 def _experts_shard_placement_fn(
                     param: nn.Parameter,
                     _expert_params: set = expert_params,
+                    _placement: Shard = expert_shard_placement,
                 ) -> Shard | None:
                     if param in _expert_params:
-                        return Shard(1)
+                        return _placement
                     return None
 
                 fully_shard(
