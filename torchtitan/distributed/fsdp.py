@@ -366,14 +366,19 @@ def apply_fsdp_to_decoder(
                     logger.warning(
                         f"Routed experts are pinned to Shard(0) but the FSDP "
                         f"shard degree ({expert_dim0_cuts}) exceeds num_experts "
-                        f"({num_experts}): {expert_dim0_cuts - num_experts} of "
-                        f"{expert_dim0_cuts} shard ranks will own no expert, and "
+                        f"({num_experts}): "
+                        f"{expert_dim0_cuts - num_experts} of "
+                        f"{expert_dim0_cuts} shard ranks own no expert, and "
                         f"each owner holds a whole one -- about "
-                        f"{expert_dim0_cuts // num_experts}x the per-rank expert "
-                        f"memory of a dim-1 shard. Raise "
-                        f"data_parallel_replicate_degree, lower "
-                        f"data_parallel_shard_degree, or use a flavor with more "
-                        f"experts to keep shard_degree <= num_experts."
+                        f"{expert_dim0_cuts // num_experts}x the per-rank "
+                        f"expert memory of a dim-1 shard.\n"
+                        f"Checkpoints from this config DO resume: DiSCO's "
+                        f"per-expert `radial_state` is a DTensor sharded like "
+                        f"the param, so DCP round-trips the uneven split. That "
+                        f"was not always true -- it used to be a plain tensor "
+                        f"sized by each rank's LOCAL expert count, which saved "
+                        f"as [1,..,0,..] and failed on load. Only the memory "
+                        f"cost above remains."
                     )
             if expert_shard_dim is not None:
                 # Caller pinned the dim (see the arg docstring). Shard(0) with

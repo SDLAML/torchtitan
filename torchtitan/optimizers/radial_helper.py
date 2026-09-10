@@ -107,6 +107,9 @@ _MATRIX_METRIC_NAMES: tuple[str, ...] = (
 )
 
 _ACCUMULATOR_NAMES: tuple[str, ...] = ("raw_A2", "angular_A1", "angular_A2", "R1")
+# Public alias: disco builds these as DTensors for sharded expert params,
+# so it needs the names without reaching for a private symbol.
+RADIAL_ACCUMULATOR_NAMES = _ACCUMULATOR_NAMES
 
 # a_t below this fraction of r_t is treated as a degenerate (no real update)
 # step -- see the valid_wu comment in calculate_radial_metrics for why a

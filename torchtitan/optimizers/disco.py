@@ -38,6 +38,7 @@ from .pre_norm_helper import (
 from .radial_helper import (
     calculate_radial_metrics,
     new_radial_state,
+    RADIAL_ACCUMULATOR_NAMES,
     RADIAL_METRIC_NAMES,
     SpectralInputs,
 )
@@ -576,14 +577,32 @@ class DiSCO(AbstractDiSCO):
                 # (the way `momentum_buffer` already is, via `zeros_like`)
                 # would fix that properly -- see readme.md.
                 if "radial_state" not in self.state[p]:
-                    if p.ndim == 3:
-                        p_loc = p.to_local() if isinstance(p, DTensor) else p
-                        accum_shape = (p_loc.shape[0],)
+                    if p.ndim == 3 and isinstance(p, DTensor):
+                        # DTensor over the FULL expert axis, carrying the same
+                        # placements as `p`, exactly as `momentum_buffer` does.
+                        # A plain per-rank tensor sized by the LOCAL expert
+                        # count is what the comment above warns about: DCP has
+                        # no placement for it, so an uneven split saves
+                        # [1,..,0,..] and resume dies with "Size mismatch
+                        # between saved torch.Size([0]) and current:
+                        # torch.Size([1])", while a resume at a different
+                        # dp_shard silently reattaches each expert's history to
+                        # the wrong expert. Declaring the placement fixes both.
+                        self.state[p]["radial_state"] = {
+                            name: torch.distributed.tensor.distribute_tensor(
+                                torch.zeros(
+                                    p.shape[0], device=p.device, dtype=torch.float32
+                                ),
+                                p.device_mesh,
+                                p.placements,
+                            )
+                            for name in RADIAL_ACCUMULATOR_NAMES
+                        }
                     else:
-                        accum_shape = ()
-                    self.state[p]["radial_state"] = new_radial_state(
-                        p.device, shape=accum_shape
-                    )
+                        accum_shape = (p.shape[0],) if p.ndim == 3 else ()
+                        self.state[p]["radial_state"] = new_radial_state(
+                            p.device, shape=accum_shape
+                        )
 
     def _build_param_lists(self):
         self._ensure_default_param_state()
@@ -3977,8 +3996,12 @@ class DiSCO(AbstractDiSCO):
                     # [ep_idx] for ep_idx < n_ep. It is a view, so the in-place
                     # add_ inside calculate_radial_metrics still writes through
                     # to self.state[p].
+                    # `.to_local()` first when the accumulators are DTensors:
+                    # the compute below is rank-local and mutates in place, and
+                    # a local view writes straight through to the DTensor's
+                    # storage, so nothing about the arithmetic changes.
                     radial_state_for_p = {
-                        k: v[:n_ep]
+                        k: (v.to_local() if isinstance(v, DTensor) else v)[:n_ep]
                         for k, v in self._radial_state_by_param_id[id(p)].items()
                     }
                     if batched_spec is not None:
