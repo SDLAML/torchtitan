@@ -85,6 +85,7 @@ def maybe_update_minimal_async_ep_config(model_config: Any, config: Any) -> None
     """Validate and fill MinimalAsyncEP dispatcher configs from runtime config."""
     from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP
     from torchtitan.distributed.activation_checkpoint import FullAC
+    from torchtitan.models.common.moe import MoE
     from torchtitan.models.common.token_dispatcher import MinimalAsyncEPTokenDispatcher
 
     assert hasattr(
@@ -97,22 +98,14 @@ def maybe_update_minimal_async_ep_config(model_config: Any, config: Any) -> None
     )
 
     dispatcher_cfgs = []
-    for layer_cfg in model_config.layers:
-        moe_cfg = getattr(layer_cfg, "moe", None)
-        if moe_cfg is None:
-            continue
-        # Defensive: a MoE config without `routed_experts` has no token
-        # dispatcher to configure. NOTE the original rationale ("models with
-        # their own MoE have no routed_experts") no longer holds for opt_moe --
-        # its EXPANDED per-layer NormMoE.Config does carry `routed_experts`, so
-        # this never skips today. Kept because upstream added the identical
-        # guard in `token_dispatcher.py::update_ep_token_dispatcher_config`, so
-        # this is now aligned with upstream rather than a fork divergence.
-        # If it ever DOES skip, EP is silently left unconfigured -- worth a
-        # raise rather than a continue if a caller can be shown to depend on it.
-        routed_experts_cfg = getattr(moe_cfg, "routed_experts", None)
-        if routed_experts_cfg is None:
-            continue
+    # Union traversal: upstream's traverse(MoE.Config) alone skips opt_moe, and
+    # walking model_config.layers alone misses MTP-nested MoEs. See
+    # token_dispatcher._iter_routed_expert_configs for the measured rationale.
+    from torchtitan.models.common.token_dispatcher import (
+        _iter_routed_expert_configs,
+    )
+
+    for routed_experts_cfg in _iter_routed_expert_configs(model_config):
         token_dispatcher_cfg = routed_experts_cfg.token_dispatcher
         if isinstance(token_dispatcher_cfg, MinimalAsyncEPTokenDispatcher.Config):
             dispatcher_cfgs.append(token_dispatcher_cfg)

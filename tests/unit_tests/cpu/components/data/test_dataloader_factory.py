@@ -122,8 +122,9 @@ def test_validator_config_builds_and_iterates(tmp_path):
         num_tokens_per_batch=32,
     )
     try:
-        batch, labels = next(iter(loader))
+        batch = next(iter(loader))  # #4572: one dict, labels included
         assert batch["input"].numel() == 32
+        assert "labels" in batch
         assert batch["num_valid_tokens"] > 0
     finally:
         loader.close()

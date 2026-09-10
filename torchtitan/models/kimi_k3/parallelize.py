@@ -33,6 +33,7 @@ def parallelize_kimi_k3(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ) -> nn.Module:
     """Apply FSDP2 to the Kimi K3 decoder and vision encoder."""
 
@@ -55,9 +56,8 @@ def parallelize_kimi_k3(
 
     assert isinstance(model, KimiK3Model)
     if parallelism.spmd_backend == "spmd_types":
-        # Kimi K3 only declares layouts for its MoE modules. Seed replicated
-        # layouts for the remaining decoder and vision parameters before the
-        # MoE declarations replace the expert parameters with sparse shards.
+        # Seed replicated layouts for parameters outside the explicit expert
+        # declarations. Vision buffers declare their DP layouts separately.
         annotate_replicated_parameters(model, parallel_dims)
 
     if parallelism.spmd_backend == "spmd_types" or parallel_dims.ep_enabled:
@@ -65,6 +65,18 @@ def parallelize_kimi_k3(
         # (default), deepep and minimal_async_ep run on this model; hybridep
         # needs GB200-class hardware.
         model.parallelize(parallel_dims)
+
+    if ac_config is not None:
+        ac_policy = ac_config.build(dump_folder=dump_folder)
+        ac_policy.apply(model)
+        if model.vision_encoder is not None:
+            ac_policy.apply(model.vision_encoder)
+
+    # Skip FSDP wrapper for inference. FSDP's forward hooks
+    # are incompatible with torch.inference_mode() used by vLLM.
+    # AC and compile are disabled via config (mode="none", enable=False).
+    if skip_dp:
+        return model
 
     if parallelism.spmd_backend == "spmd_types":
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
@@ -85,12 +97,6 @@ def parallelize_kimi_k3(
             )
             edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
-    if ac_config is not None:
-        ac_policy = ac_config.build(dump_folder=dump_folder)
-        ac_policy.apply(model)
-        if model.vision_encoder is not None:
-            ac_policy.apply(model.vision_encoder)
-
     vision_encoder = model.vision_encoder
     if vision_encoder is not None:
         # TODO: An image batch on one DP rank and a text-only batch on another
@@ -103,6 +109,7 @@ def parallelize_kimi_k3(
             reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
             reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
             pp_enabled=False,
+            cpu_offload=training.enable_cpu_offload,
             dp_mesh_dims=dp_mesh_dims,
         )
 

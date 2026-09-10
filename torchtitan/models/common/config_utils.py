@@ -35,6 +35,7 @@ from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear, RouterGateLinear
 from torchtitan.models.common.moe import (
     GroupedExperts,
+    MicrobatchWiseLoadBalanceLoss,
     MoE,
     RoutedExperts,
     TokenChoiceTopKRouter,
@@ -50,6 +51,9 @@ from torchtitan.models.common.token_dispatcher import (
 )
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
+
+
+DEFAULT_DEBUG_MODEL_SEQ_LEN = 2048
 
 
 def decoder_vocab_size(model_spec: ModelSpec) -> int:
@@ -191,7 +195,7 @@ def make_gqa_config(
     wqkv_param_init: dict[str, Callable],
     wo_param_init: dict[str, Callable],
     inner_attention: Module.Config,
-    rope: RoPE.Config,
+    rope: RoPE.Config | None,
     n_kv_heads: int | None = None,
     head_dim: int | None = None,
     fuse_qkv: bool = False,
@@ -199,6 +203,9 @@ def make_gqa_config(
     tp_gemm_backend: TpGemmBackend = "default",
 ) -> GQAttention.Config:
     """Build a fully-specified GQAttention.Config.
+
+    ``rope=None`` builds a NoPE layer (no positional encoding); see
+    :class:`GQAttention`.
 
     ``tp_gemm_backend`` selects which implementation runs the QKV and output
     projections. ``"default"`` leaves the TP collectives to the framework, either
@@ -213,7 +220,7 @@ def make_gqa_config(
     """
     n_kv = n_kv_heads if n_kv_heads is not None else n_heads
     per_head_dim = head_dim if head_dim is not None else dim // n_heads
-    rope = dataclasses.replace(rope)
+    rope = dataclasses.replace(rope) if rope is not None else None
 
     # The backend picks the classes; everything below builds the same shapes into
     # whichever was chosen.
@@ -313,8 +320,14 @@ def make_moe_config(
     routed_experts: RoutedExperts.Config,
     shared_experts: FeedForward.Config | None = None,
     load_balance_coeff: float | None = 1e-3,
+    aux_loss_coeff: float | None = None,
 ) -> MoE.Config:
     """Build a fully-specified MoE.Config."""
+    if aux_loss_coeff is not None:
+        router = dataclasses.replace(
+            router,
+            aux_loss=MicrobatchWiseLoadBalanceLoss.Config(coeff=aux_loss_coeff),
+        )
     return MoE.Config(
         num_experts=num_experts,
         load_balance_coeff=load_balance_coeff,

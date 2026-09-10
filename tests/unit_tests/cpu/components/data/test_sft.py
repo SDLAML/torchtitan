@@ -156,7 +156,10 @@ def test_output_feeds_upstream_packing_and_collation():
         for _ in range(3)
     ]
     collator = TextCollator.Config().build(context=CONTEXT)
-    batch, labels = collator(sequences)
+    # Upstream #4572 merged labels into the batch dict; the collator no longer
+    # returns a (batch, labels) tuple.
+    batch = collator(sequences)
+    labels = batch["labels"]
 
     assert batch["input"].numel() == CONTEXT.num_tokens_per_batch
     assert batch["num_valid_tokens"] > 0
@@ -320,7 +323,7 @@ def test_a_rejected_conversation_does_not_kill_the_run(tmp_path):
     try:
         iterator = iter(loader)
         for _ in range(5):
-            batch, _ = next(iterator)
+            batch = next(iterator)  # #4572: one dict, labels included
             assert batch["input"].numel() == 64
     finally:
         loader.close()

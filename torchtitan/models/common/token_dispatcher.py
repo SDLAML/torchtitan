@@ -1183,20 +1183,45 @@ class MinimalAsyncEPTokenDispatcher(BaseEPTokenDispatcher):
         return combined_TD
 
 
+def _iter_routed_expert_configs(model_config: Any):
+    """Yield every routed-experts config, from upstream layouts AND ours.
+
+    Neither traversal alone is sufficient, and both failures are silent:
+
+    * ``model_config.traverse(MoE.Config)`` (upstream) type-filters to
+      ``common.moe.MoE.Config``. opt_moe's expanded per-layer config is a
+      ``NormMoE.Config`` -- MEASURED: ``isinstance(MoE.Config)`` is False, yet it
+      DOES carry ``routed_experts`` -- so upstream's version leaves opt_moe's EP
+      dispatcher unconfigured.
+    * Walking ``model_config.layers`` (ours) is duck-typed and catches opt_moe,
+      but misses MoE configs nested elsewhere, e.g. DeepSeek V4's MTP layers.
+      That showed up as ``None != 256`` in test_deepseek_v4_mtp.
+
+    So take the union, de-duplicated by identity.
+    """
+    from torchtitan.models.common.moe import MoE
+
+    seen: set[int] = set()
+    for _, moe_cfg, _, _ in model_config.traverse(MoE.Config):
+        routed = getattr(moe_cfg, "routed_experts", None)
+        if routed is not None and id(routed) not in seen:
+            seen.add(id(routed))
+            yield routed
+    for layer_cfg in getattr(model_config, "layers", ()) or ():
+        moe_cfg = getattr(layer_cfg, "moe", None)
+        if moe_cfg is None:
+            continue
+        routed = getattr(moe_cfg, "routed_experts", None)
+        if routed is not None and id(routed) not in seen:
+            seen.add(id(routed))
+            yield routed
+
+
 def update_ep_token_dispatcher_config(model_config: Any, config: Any) -> None:
     """Validate and fill EP token dispatcher configs from runtime config."""
     parallelism = config.parallelism
     dispatcher_cfgs = []
-    for layer_cfg in model_config.layers:
-        moe_cfg = getattr(layer_cfg, "moe", None)
-        if moe_cfg is None:
-            continue
-        # A model may supply its own MoE rather than common.moe.MoE (OPT MoE
-        # does, with its own routing and no token dispatcher). Those configs
-        # have no routed_experts, and there is nothing here to fill in for them.
-        routed_experts_cfg = getattr(moe_cfg, "routed_experts", None)
-        if routed_experts_cfg is None:
-            continue
+    for routed_experts_cfg in _iter_routed_expert_configs(model_config):
         token_dispatcher_cfg = routed_experts_cfg.token_dispatcher
         if not isinstance(
             token_dispatcher_cfg,

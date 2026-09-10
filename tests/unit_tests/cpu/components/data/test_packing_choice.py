@@ -93,8 +93,15 @@ def _tokens_emitted(packed) -> int:
     return sum(int((row.labels != IGNORE_INDEX).sum()) for row in packed)
 
 
-def test_first_fit_drops_documents_longer_than_the_batch(tmp_path):
-    """The dominant cost on a long-document corpus, and it is silent."""
+def test_first_fit_drop_threshold_is_max_context_length_not_the_row_width(tmp_path):
+    """Upstream #4156 removed first-fit's silent drop; it now SPLITS instead.
+
+    This test used to assert the drop (emitted == 30) and called it "the dominant
+    cost on a long-document corpus, and it is silent". Upstream deleted the
+    `TODO(data-overflow-policy)` that documented the divergence and made first-fit
+    chunk long documents the way concat-then-split already did. Kept as a
+    regression guard so the drop cannot come back.
+    """
     lengths = [10, 10, NUM_TOKENS_PER_BATCH + 1, 10]
 
     packed = list(
@@ -104,8 +111,7 @@ def test_first_fit_drops_documents_longer_than_the_batch(tmp_path):
     )
 
     emitted = _tokens_emitted(packed)
-    assert emitted == 30, f"the oversized document is dropped entirely, got {emitted}"
-    assert emitted < sum(lengths)
+    assert emitted == sum(lengths), f"no document may be dropped, got {emitted}"
 
 
 def test_concat_then_split_keeps_oversized_documents_by_splitting(tmp_path):
@@ -167,7 +173,11 @@ def test_first_fit_drop_threshold_is_max_context_length_not_the_row_width():
         )
     )
 
-    assert _tokens_emitted(packed) == 20, "the 40-token document is dropped"
+    # Was 20 (the 40-token document dropped). Upstream #4156 splits it at
+    # max_context_length instead -- 10..42 then 42..50 -- so nothing is lost.
+    assert _tokens_emitted(packed) == sum(
+        lengths
+    ), "a document between max_context_length and the row width must not be dropped"
 
 
 def test_concat_then_split_restarts_positions_every_max_context_length():

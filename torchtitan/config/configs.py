@@ -273,15 +273,15 @@ class ParallelismConfig:
                 "context_parallel_load_balancer cannot be an empty string. "
                 "Use None to disable load balancing."
             )
-        # Ported from upstream b2dfff6a77 (#4506). The name was only validated
-        # at CP setup time, so a typo like "head-tail" was silently ignored on
-        # any job with context_parallel_degree == 1 -- and then picked the
-        # wrong balancer the moment CP was turned on. Reject it up front.
-        _allowed_cp_balancers = frozenset({None, "headtail", "ptrr"})
-        if self.context_parallel_load_balancer not in _allowed_cp_balancers:
+        # Upstream #4506. The name was only validated at CP setup time, so a
+        # typo like "head-tail" was silently ignored on any job with
+        # context_parallel_degree == 1 -- and then picked the wrong balancer the
+        # moment CP was turned on. Reject it up front.
+        allowed = frozenset({None, "headtail", "ptrr"})
+        if self.context_parallel_load_balancer not in allowed:
             raise ValueError(
                 "parallelism.context_parallel_load_balancer must be one of: "
-                "None, 'headtail', 'ptrr' "
+                f"None, 'headtail', 'ptrr' "
                 f"(got {self.context_parallel_load_balancer!r})"
             )
         if self.enable_fsdp_symm_mem and (
@@ -295,6 +295,16 @@ class ParallelismConfig:
                 "For NVIDIA GPUs, parallelism.enable_fsdp_symm_mem is only supported "
                 "for compute capability 9.0 or newer."
             )
+        # Import lazily so loading configs.py does not pull in pipelining.
+        from torch.distributed.pipelining.schedules import get_schedule_class
+
+        try:
+            get_schedule_class(self.pipeline_parallel_schedule)
+        except ValueError as e:
+            raise ValueError(
+                "Invalid parallelism.pipeline_parallel_schedule "
+                f"{self.pipeline_parallel_schedule!r}: {e}"
+            ) from e
 
     expert_parallel_degree: int = 1
     """
