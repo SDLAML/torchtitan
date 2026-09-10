@@ -756,7 +756,7 @@ def register_moe_load_balancing_hook(
                 # `moe_load_balance_loss/L-*` breakdown survives the migration --
                 # upstream's own `collect_aux_loss_metrics` only reports the mean
                 # over layers. Falls back to a zero scalar when the layer has no
-                # aux loss (load_balance_loss_weight == 0).
+                # aux loss (moe.aux_loss is None).
                 aux = getattr(moe, "aux_loss", None)
                 load_balance_loss_buffers.append(
                     aux.instance_acc.reshape(1)

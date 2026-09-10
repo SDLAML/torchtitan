@@ -73,7 +73,7 @@ def test_coefficient_scales_the_gradient_not_the_metric():
 
     ``inject`` applies ``coeff`` to the injected gradient but accumulates the
     metric unscaled, so the logged load-balance loss stays comparable across
-    ``load_balance_loss_weight`` settings -- the property the old straight-through
+    ``coeff`` settings -- the property the old straight-through
     ``loss + (aux - aux.detach())`` also had.
     """
     AuxLoss.set_step_denominator(torch.tensor(1024.0))

@@ -137,7 +137,6 @@ def case(name, t_len, n_exp, top_k, positions, loss_mask=None, seed=0, tol=2e-6)
         B=1,
         S=t_len,
         top_k=top_k,
-        aux_loss_alpha=1.0,
         loss_mask=loss_mask,
         positions=positions,
     )
@@ -205,7 +204,7 @@ def main():
             bounds.append(range(off, off + L))
             off += L
         got = sequence_wise_aux_loss(
-            sc2, ix2, B=1, S=t_len, top_k=2, aux_loss_alpha=1.0, positions=pos2
+            sc2, ix2, B=1, S=t_len, top_k=2, positions=pos2
         )
         exp = reference(sc2, ix2, 2, 1.0, None, None, segs=bounds)
         rel = abs(got.double().item() - exp.item()) / abs(exp.item())
@@ -224,7 +223,7 @@ def main():
     t_len = 2048
     scores = torch.rand(t_len, n_exp, generator=g) + 0.01
     indices = scores.topk(top_k, dim=-1).indices
-    kw = dict(B=1, S=t_len, top_k=top_k, aux_loss_alpha=1.0)
+    kw = dict(B=1, S=t_len, top_k=top_k)
 
     one_doc = sequence_wise_aux_loss(
         scores, indices, positions=torch.arange(t_len), **kw
@@ -254,7 +253,6 @@ def main():
         B=1,
         S=long_len * n_long,
         top_k=top_k,
-        aux_loss_alpha=1.0,
         positions=pos[: long_len * n_long],
     ).item()
     check(
@@ -340,7 +338,7 @@ def main():
             bounds.append((start, len(gidx)))
             pos_true = torch.cat([torch.arange(b - a) for a, b in bounds])
             exp = reference(sc, ix, top_k, 1.0, None, pos_true).item()
-            kwr = dict(B=1, S=len(gidx), top_k=top_k, aux_loss_alpha=1.0, positions=pos)
+            kwr = dict(B=1, S=len(gidx), top_k=top_k, positions=pos)
             both = sequence_wise_aux_loss(sc, ix, doc_id=did, **kwr).item()
             check(
                 f"{label} rank {rank}: matches ground truth",
@@ -366,7 +364,6 @@ def main():
                 B=1,
                 S=len(gidx),
                 top_k=top_k,
-                aux_loss_alpha=1.0,
                 positions=synth,
             ).item()
             if abs(pos_only - exp) / exp > 1e-4 or abs(id_only - exp) / exp > 1e-4:
@@ -387,7 +384,7 @@ def main():
     )
     pos = torch.cat([torch.arange(8) for _ in range(3)])
     fn64 = lambda x: sequence_wise_aux_loss(  # noqa: E731
-        x, idx, B=1, S=t_len, top_k=top_k, aux_loss_alpha=1.0, positions=pos
+        x, idx, B=1, S=t_len, top_k=top_k, positions=pos
     )
     check(
         "gradcheck float64",
@@ -397,7 +394,7 @@ def main():
     for dt in (torch.float32, torch.bfloat16, torch.float16):
         x = (torch.rand(t_len, n_exp, generator=g) + 0.01).to(dt)
         out = sequence_wise_aux_loss(
-            x, idx, B=1, S=t_len, top_k=top_k, aux_loss_alpha=1.0, positions=pos
+            x, idx, B=1, S=t_len, top_k=top_k, positions=pos
         )
         check(f"output dtype tracks {dt}", out.dtype == dt)
 
@@ -407,7 +404,6 @@ def main():
         B=1,
         S=t_len,
         top_k=top_k,
-        aux_loss_alpha=1.0,
         positions=pos,
         loss_mask=torch.zeros(t_len, dtype=torch.bool),
     )
@@ -432,7 +428,7 @@ def main():
         sc_bf = (torch.rand(t_bf, n_bf, generator=gb) + 0.01).cuda()
         ix_bf = sc_bf.topk(k_bf, dim=-1).indices
         pos_bf = torch.arange(t_bf, device="cuda")  # ONE long document
-        kwb = dict(B=1, S=t_bf, top_k=k_bf, aux_loss_alpha=1.0, positions=pos_bf)
+        kwb = dict(B=1, S=t_bf, top_k=k_bf, positions=pos_bf)
         ref_bf = sequence_wise_aux_loss(sc_bf.double(), ix_bf, **kwb).item()
         got_bf = sequence_wise_aux_loss(sc_bf.bfloat16(), ix_bf, **kwb).double().item()
         check(
@@ -449,7 +445,7 @@ def main():
             [torch.randperm(n_exp, generator=g)[:top_k] for _ in range(t_len)]
         ).to(dev)
         pos = torch.cat([torch.arange(32) for _ in range(8)]).to(dev)
-        kw = dict(B=1, S=t_len, top_k=top_k, aux_loss_alpha=1.0, positions=pos)
+        kw = dict(B=1, S=t_len, top_k=top_k, positions=pos)
         a = sequence_wise_aux_loss(sc, ix, **kw)
         b = torch.compile(sequence_wise_aux_loss, fullgraph=True)(sc, ix, **kw)
         check("fullgraph compile bit-identical", torch.equal(a, b))

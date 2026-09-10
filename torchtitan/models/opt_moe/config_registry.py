@@ -24,8 +24,9 @@ def moe_template_config() -> Trainer.Config:
         # `components/data/mix.make_pretrain_dataloader_config`, and a template default
         # that no run uses is a trap: it decides the shape of anything that forgets to.
         optimizer=OptimizersContainer.Config(lr=8e-4),
-        # OPT MoE returns (logits, load_balance_loss); this unpacks the tuple and
-        # adds the auxiliary term straight-through.
+        # Plain chunked cross-entropy. The load-balance term is no longer added
+        # here: NormMoE injects its gradient at the layer via LoadBalanceLoss,
+        # so the model returns logits alone.
         # ChunkedLossWrapper splits the token dim and runs lm_head + CE per
         # chunk, so the [T, vocab] logits never exist all at once. With
         # vocab=201088 that is the single largest activation in the step.
