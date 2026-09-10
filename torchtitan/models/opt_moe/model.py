@@ -689,6 +689,12 @@ class OPTMoEModel(Decoder):
         *,
         parallel_dims,
         parallelism,
+        # Added by upstream #4156 (cudagraph for varlen pretrain). Accepted and
+        # forwarded rather than dropped: the base uses them to size the
+        # document-aware packing path, and omitting them from this override made
+        # the trainer raise `unexpected keyword argument 'max_num_documents'`.
+        max_num_documents: int | None = None,
+        max_context_length: int | None = None,
     ):
         """Build masks/CP shards, then add the MoE token mask.
 
@@ -722,7 +728,11 @@ class OPTMoEModel(Decoder):
             )
 
         inputs, labels, extra_kwargs = super().preprocess_inputs(
-            input_dict, parallel_dims=parallel_dims, parallelism=parallelism
+            input_dict,
+            parallel_dims=parallel_dims,
+            parallelism=parallelism,
+            max_num_documents=max_num_documents,
+            max_context_length=max_context_length
         )
         if self.config.enable_token_mask_for_moe:
             from torchtitan.components.loss import IGNORE_INDEX
