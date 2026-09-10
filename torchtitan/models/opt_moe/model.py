@@ -596,6 +596,13 @@ class OPTMoEModel(Decoder):
     def get_attention_masks(
         self,
         positions: torch.Tensor,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        # Added by upstream #4156, and the base's preprocess_inputs passes all
+        # three positionally-by-keyword. Accepted and forwarded rather than
+        # dropped, for the same reason as preprocess_inputs above.
+        max_num_documents: int | None = None,
+        max_context_length: int | None = None,
     ) -> "AttentionMasksType | None":
         """Return attention masks appropriate for the mix of layer backends.
 
@@ -620,7 +627,12 @@ class OPTMoEModel(Decoder):
         if has_varlen and has_swa:
             raise ValueError("SWA is not supported with varlen attention.")
         if has_varlen:
-            return super().get_attention_masks(positions)
+            return super().get_attention_masks(
+                positions,
+                padding_mask=padding_mask,
+                max_num_documents=max_num_documents,
+                max_context_length=max_context_length,
+            )
         if not has_flex:
             # All SDPA -- PyTorch handles causal masking internally, which can
             # only ever be plain causal. SDPA cannot express a document mask,
