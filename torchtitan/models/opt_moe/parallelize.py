@@ -12,6 +12,8 @@
 # resolves TP/EP from the declarative ShardingConfig set in sharding.py and
 # provides a shared FSDP application for decoders.
 
+import logging
+
 from torchtitan.config import (
     CompileConfig,
     ParallelismConfig,
@@ -29,6 +31,9 @@ from torchtitan.distributed.fsdp import (
 from torchtitan.models.opt_moe.model import OPTMoEModel
 
 
+logger = logging.getLogger(__name__)
+
+
 def parallelize_opt_moe(
     model: OPTMoEModel,
     *,
@@ -43,6 +48,29 @@ def parallelize_opt_moe(
     model_compile_enabled = (
         compile_config.enable and "model" in compile_config.components
     )
+
+    if parallel_dims.cp_enabled:
+        # CP is wired but NOT validated on real hardware. In place:
+        # `sharding.py` installs the inner-attention local_map (k/v Replicate on
+        # the CP axis so they are all-gathered to match the BlockMask's kv dim)
+        # and stamps a ShardingConfig on every Linear and on the MoE expert
+        # state, so `fully_shard(dp_mesh_dims=...)` accepts the params under
+        # spmd_types. Verified with a FAKE process group only -- dense and MoE
+        # both reach 100% DTensor params at dp_shard=2/cp=2 -- so no collective
+        # has actually run.
+        #
+        # The spmd_types requirement is enforced upstream by
+        # `context_parallel/api.py::validate_cp_backend`, which
+        # `models/common/decoder.py` calls while BUILDING the model -- i.e.
+        # before this function runs, but at model-build time, not config-parse
+        # time. Re-raising it here would be dead code.
+        #
+        # KNOWN GAP: `rope.cache` stays a plain tensor (see sharding.py).
+        logger.warning(
+            "Context Parallel is enabled for OPT MoE. This path is newly wired "
+            "and has NOT been validated on multiple GPUs -- verify loss against "
+            "a cp=1 run before trusting it."
+        )
 
     if (
         parallelism.spmd_backend == "spmd_types"

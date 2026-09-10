@@ -18,9 +18,13 @@ LR scheduler on a 4-GPU job, minutes of queue time later.
 
 Cheap structural smoke test: no distributed init, no CUDA required.
 """
+import os as _os
 import sys
 
-sys.path.insert(0, "resources/torchtitan")
+_REPO = _os.path.abspath(
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "..")
+)
+sys.path.insert(0, _REPO)
 import os
 
 import torch

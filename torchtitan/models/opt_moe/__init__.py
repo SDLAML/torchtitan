@@ -6,9 +6,10 @@
 
 import copy
 
-from torchtitan.optimizers.container import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common.rope import CosSinRoPE
+
+from torchtitan.optimizers.container import register_moe_load_balancing_hook
 
 from torchtitan.protocols.model_spec import ModelSpec
 from .gated_norm_swattention import GatedNormSWAttention
@@ -2054,6 +2055,32 @@ moe_opt_moe_configs = {
             theta=10000.0,
         ),
     ),
+    "gauge-d16-w512-embeddings-norm": OPTMoEModel.Config(
+        n_layers=16,
+        dim=512,
+        use_embeddings_norm=True,
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=16,
+            feed_forward=FeedForward.Config(
+                hidden_dim=2048,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+            attention=GatedNormSWAttention.Config(
+                n_heads=8,
+                n_kv_heads=8,
+                head_dim=128,
+                qk_norm=True,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+        ),
+        rope=CosSinRoPE.Config(
+            dim=128,
+            max_context_length=4096,
+            theta=10000.0,
+        ),
+    ),
     "gauge-d20-w640": OPTMoEModel.Config(
         n_layers=20,
         dim=640,
@@ -2229,6 +2256,32 @@ moe_opt_moe_configs = {
             theta=10000.0,
         ),
     ),
+    "gauge-d16-w256-embeddings-norm": OPTMoEModel.Config(
+        n_layers=16,
+        dim=256,
+        use_embeddings_norm=True,
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=16,
+            feed_forward=FeedForward.Config(
+                hidden_dim=1024,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+            attention=GatedNormSWAttention.Config(
+                n_heads=4,
+                n_kv_heads=4,
+                head_dim=128,
+                qk_norm=True,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+        ),
+        rope=CosSinRoPE.Config(
+            dim=128,
+            max_context_length=4096,
+            theta=10000.0,
+        ),
+    ),
     "gauge-d16-w384": OPTMoEModel.Config(
         n_layers=16,
         dim=384,
@@ -2254,9 +2307,61 @@ moe_opt_moe_configs = {
             theta=10000.0,
         ),
     ),
+    "gauge-d16-w384-embeddings-norm": OPTMoEModel.Config(
+        n_layers=16,
+        dim=384,
+        use_embeddings_norm=True,
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=16,
+            feed_forward=FeedForward.Config(
+                hidden_dim=1536,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+            attention=GatedNormSWAttention.Config(
+                n_heads=6,
+                n_kv_heads=6,
+                head_dim=128,
+                qk_norm=True,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+        ),
+        rope=CosSinRoPE.Config(
+            dim=128,
+            max_context_length=4096,
+            theta=10000.0,
+        ),
+    ),
     "gauge-d16-w640": OPTMoEModel.Config(
         n_layers=16,
         dim=640,
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=16,
+            feed_forward=FeedForward.Config(
+                hidden_dim=2560,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+            attention=GatedNormSWAttention.Config(
+                n_heads=10,
+                n_kv_heads=10,
+                head_dim=128,
+                qk_norm=True,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+        ),
+        rope=CosSinRoPE.Config(
+            dim=128,
+            max_context_length=4096,
+            theta=10000.0,
+        ),
+    ),
+    "gauge-d16-w640-embeddings-norm": OPTMoEModel.Config(
+        n_layers=16,
+        dim=640,
+        use_embeddings_norm=True,
         layer=OPTMoETransformerBlock.Config(
             n_dense_layers=16,
             feed_forward=FeedForward.Config(
@@ -2305,6 +2410,33 @@ moe_opt_moe_configs = {
         ),
     ),
     # with v-norm
+    "gauge-d16-w768-embeddings-norm": OPTMoEModel.Config(
+        n_layers=16,
+        dim=768,
+        use_embeddings_norm=True,
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=16,
+            feed_forward=FeedForward.Config(
+                hidden_dim=3072,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+            attention=GatedNormSWAttention.Config(
+                n_heads=12,
+                n_kv_heads=12,
+                head_dim=128,
+                qk_norm=True,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+        ),
+        rope=CosSinRoPE.Config(
+            dim=128,
+            max_context_length=4096,
+            theta=10000.0,
+        ),
+    ),
+    # norm-everywhere
     "gauge-d16-w256-vnorm": OPTMoEModel.Config(
         n_layers=16,
         dim=256,
@@ -2693,137 +2825,6 @@ moe_opt_moe_configs = {
         ),
     ),
     # embedding-norms
-    "gauge-d16-w256-embeddings-norm": OPTMoEModel.Config(
-        n_layers=16,
-        dim=256,
-        use_embeddings_norm=True,
-        layer=OPTMoETransformerBlock.Config(
-            n_dense_layers=16,
-            feed_forward=FeedForward.Config(
-                hidden_dim=1024,
-                norm_everywhere=False,
-                norm_eps=1e-30,
-            ),
-            attention=GatedNormSWAttention.Config(
-                n_heads=4,
-                n_kv_heads=4,
-                head_dim=128,
-                qk_norm=True,
-                norm_everywhere=False,
-                norm_eps=1e-30,
-            ),
-        ),
-        rope=CosSinRoPE.Config(
-            dim=128,
-            max_context_length=4096,
-            theta=10000.0,
-        ),
-    ),
-    "gauge-d16-w384-embeddings-norm": OPTMoEModel.Config(
-        n_layers=16,
-        dim=384,
-        use_embeddings_norm=True,
-        layer=OPTMoETransformerBlock.Config(
-            n_dense_layers=16,
-            feed_forward=FeedForward.Config(
-                hidden_dim=1536,
-                norm_everywhere=False,
-                norm_eps=1e-30,
-            ),
-            attention=GatedNormSWAttention.Config(
-                n_heads=6,
-                n_kv_heads=6,
-                head_dim=128,
-                qk_norm=True,
-                norm_everywhere=False,
-                norm_eps=1e-30,
-            ),
-        ),
-        rope=CosSinRoPE.Config(
-            dim=128,
-            max_context_length=4096,
-            theta=10000.0,
-        ),
-    ),
-    "gauge-d16-w512-embeddings-norm": OPTMoEModel.Config(
-        n_layers=16,
-        dim=512,
-        use_embeddings_norm=True,
-        layer=OPTMoETransformerBlock.Config(
-            n_dense_layers=16,
-            feed_forward=FeedForward.Config(
-                hidden_dim=2048,
-                norm_everywhere=False,
-                norm_eps=1e-30,
-            ),
-            attention=GatedNormSWAttention.Config(
-                n_heads=8,
-                n_kv_heads=8,
-                head_dim=128,
-                qk_norm=True,
-                norm_everywhere=False,
-                norm_eps=1e-30,
-            ),
-        ),
-        rope=CosSinRoPE.Config(
-            dim=128,
-            max_context_length=4096,
-            theta=10000.0,
-        ),
-    ),
-    "gauge-d16-w640-embeddings-norm": OPTMoEModel.Config(
-        n_layers=16,
-        dim=640,
-        use_embeddings_norm=True,
-        layer=OPTMoETransformerBlock.Config(
-            n_dense_layers=16,
-            feed_forward=FeedForward.Config(
-                hidden_dim=2560,
-                norm_everywhere=False,
-                norm_eps=1e-30,
-            ),
-            attention=GatedNormSWAttention.Config(
-                n_heads=10,
-                n_kv_heads=10,
-                head_dim=128,
-                qk_norm=True,
-                norm_everywhere=False,
-                norm_eps=1e-30,
-            ),
-        ),
-        rope=CosSinRoPE.Config(
-            dim=128,
-            max_context_length=4096,
-            theta=10000.0,
-        ),
-    ),
-    "gauge-d16-w768-embeddings-norm": OPTMoEModel.Config(
-        n_layers=16,
-        dim=768,
-        use_embeddings_norm=True,
-        layer=OPTMoETransformerBlock.Config(
-            n_dense_layers=16,
-            feed_forward=FeedForward.Config(
-                hidden_dim=3072,
-                norm_everywhere=False,
-                norm_eps=1e-30,
-            ),
-            attention=GatedNormSWAttention.Config(
-                n_heads=12,
-                n_kv_heads=12,
-                head_dim=128,
-                qk_norm=True,
-                norm_everywhere=False,
-                norm_eps=1e-30,
-            ),
-        ),
-        rope=CosSinRoPE.Config(
-            dim=128,
-            max_context_length=4096,
-            theta=10000.0,
-        ),
-    ),
-    # norm-everywhere
     "gauge-d16-w256-norm-everywhere": OPTMoEModel.Config(
         n_layers=16,
         dim=256,

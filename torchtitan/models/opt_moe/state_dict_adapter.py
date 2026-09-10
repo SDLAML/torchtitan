@@ -26,13 +26,19 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
         super().__init__(model_config, hf_assets_path)
         # self.model_config and self.hf_assets_path already set by MoEStateDictAdapter
 
+        # NOTE: these native FQNs must track the model. The 0.5.0 port
+        # ("Rebuild OPT MoE attention on upstream's GQAttention") moved q/k/v
+        # under `qkv_linear`, renamed `output` -> `lm_head`, and moved experts
+        # under `routed_experts.inner_experts` with shape-suffixed names -- the
+        # map was not updated and to_hf silently dropped every one of them
+        # (21 tensors in, 10 out) behind a root-logger warning.
         self.from_hf_map = {
             "model.embed_tokens.weight": "tok_embeddings.weight",
             "model.norm.weight": "norm.weight",
-            "lm_head.weight": "output.weight",
-            "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
-            "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
-            "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
+            "lm_head.weight": "lm_head.weight",
+            "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.qkv_linear.wq.weight",
+            "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.qkv_linear.wk.weight",
+            "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.qkv_linear.wv.weight",
             "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
             "model.layers.{}.self_attn.gate_proj.weight": "layers.{}.attention.gate_proj.weight",
             "model.layers.{}.self_attn.rotary_emb.inv_freq": None,
@@ -42,11 +48,11 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
             "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
             "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
             # MoE
-            "model.layers.{}.mlp.experts.{}.gate_proj.weight": "layers.{}.moe.experts.w1",
-            "model.layers.{}.mlp.experts.{}.up_proj.weight": "layers.{}.moe.experts.w3",
-            "model.layers.{}.mlp.experts.{}.down_proj.weight": "layers.{}.moe.experts.w2",
+            "model.layers.{}.mlp.experts.{}.gate_proj.weight": "layers.{}.moe.routed_experts.inner_experts.w1_EFD",
+            "model.layers.{}.mlp.experts.{}.up_proj.weight": "layers.{}.moe.routed_experts.inner_experts.w3_EFD",
+            "model.layers.{}.mlp.experts.{}.down_proj.weight": "layers.{}.moe.routed_experts.inner_experts.w2_EDF",
             "model.layers.{}.mlp.router.gate.weight": "layers.{}.moe.router.gate.weight",
-            "model.layers.{}.mlp.expert_bias": "layers.{}.moe.expert_bias",
+            "model.layers.{}.mlp.expert_bias": "layers.{}.moe.expert_bias_E",
             "model.layers.{}.mlp.shared_experts.gate_proj.weight": "layers.{}.moe.shared_experts.w1.weight",
             "model.layers.{}.mlp.shared_experts.up_proj.weight": "layers.{}.moe.shared_experts.w3.weight",
             "model.layers.{}.mlp.shared_experts.down_proj.weight": "layers.{}.moe.shared_experts.w2.weight",
@@ -58,7 +64,7 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
             re.match(
                 r"layers\.\d+\.(attention\.(q_norm|k_norm|v_norm|mid_norm)"
                 r"|feed_forward\.mid_norm"
-                r"|moe\.experts\.mid_norm"
+                r"|moe\.routed_experts\.inner_experts\.mid_norm"
                 r"|moe\.shared_experts\.mid_norm)\.",
                 key,
             )
@@ -97,7 +103,7 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
 
                 new_key = to_hf_map[abstract_key]
 
-                if "moe.experts" in key:
+                if "routed_experts.inner_experts" in key:
                     # Store the GroupedExperts Weight metadata for from_hf()
                     if isinstance(value, DTensor):
                         self.grouped_expert_weight_placements[

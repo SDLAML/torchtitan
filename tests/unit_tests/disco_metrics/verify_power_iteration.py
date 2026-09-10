@@ -15,9 +15,13 @@ Section 2 (ACCURACY) is the acceptance test for a real implementation. It is
 skipped while `power_iteration.IS_STUB` is True and runs automatically once
 that flag is flipped, so whoever replaces the stub gets an immediate verdict.
 """
+import os as _os
 import sys
 
-sys.path.insert(0, "resources/torchtitan")
+_REPO = _os.path.abspath(
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "..")
+)
+sys.path.insert(0, _REPO)
 import torch
 from torchtitan.optimizers import power_iteration as pi
 from torchtitan.optimizers.power_iteration import spectral_norm, top_singular_pair

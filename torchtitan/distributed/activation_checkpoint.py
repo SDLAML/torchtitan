@@ -208,28 +208,27 @@ class SelectiveAC(ActivationCheckpointing):
         """
 
         mm_save_frequency: int = 2
-        """How often a matmul output is saved rather than recomputed: save one
-        in every N. 2 is upstream's "save every other matmul"; 1 saves all of
-        them (most memory, least recompute); 0 recomputes all of them (least
-        memory, most recompute).
+        """RECOMPUTE one matmul in every N; save the other N-1.
 
-        ``TORCHTITAN_SAC_SAVE_MM_FREQUENCY`` overrides this when set, so existing
-        launch scripts keep working.
-        """
+        This generalises upstream's rule, which is hardcoded to N=2
+        ("save all compute/comm ops, except every second mm/linear"). Upstream
+        0.5.0 exposes no knob at all -- the frequency is a fork addition.
 
-        mm_save_frequency_ops: list[str] = field(
-            default_factory=lambda: ["mm", "mm_dtype", "linear"]
-        )
-        """Which matmul-like ops ``mm_save_frequency`` governs. Anything not
-        listed here is saved whenever it is in the save set, unconditionally.
+            N = 0   recompute every gated matmul   (least memory, most recompute)
+            N = 1   recompute every gated matmul   (same as 0; count % 1 == 0 always)
+            N = 2   recompute every 2nd            (DEFAULT, identical to upstream)
+            N = 3   recompute every 3rd, save 2 of every 3
+            N large approaches "save them all"     (most memory, least recompute)
 
-        Valid entries: "mm" (aten.mm.default), "mm_dtype" (aten.mm.dtype),
-        "linear" (aten.linear.default). Most backends decompose aten.linear into
-        aten.mm, but some register it as a leaf, which is why it is separable.
+        Memory is monotonically NON-DECREASING in N, so larger N always means
+        more memory and less recompute. Recompute is exact, so N is numerically
+        neutral -- it moves only the memory/compute trade-off.
 
-        llm-0.4.0 gated only aten.mm.default; set this to ["mm"] to reproduce
-        that exactly. The choice is numerically neutral -- recompute is exact --
-        so it only moves the memory/compute trade-off.
+        Note the sense is inverted relative to llm-0.4.0, whose rule was
+        ``count % N == 1`` -- SAVE one in every N. The two agree at N = 0, 1
+        and 2 (the only values any recipe in this repo uses) and diverge from
+        N = 3 up, where 0.4.0 saved 1/N and this saves (N-1)/N.
+
         """
 
     def get_save_ops(self) -> set:
@@ -264,37 +263,18 @@ class SelectiveAC(ActivationCheckpointing):
 
         # Some backends (e.g. PrivateUse1) register aten.linear as a leaf op
         # instead of decomposing it into aten.mm, so we must handle both.
-        # `mm_ops` is what the matmul counter advances on; `gated_mm_ops` is the
-        # subset the save frequency actually governs (see mm_save_frequency_ops).
-        _MM_OP_BY_NAME = {
-            "mm": torch.ops.aten.mm.default,
-            "mm_dtype": torch.ops.aten.mm.dtype,
-            "linear": torch.ops.aten.linear.default,
-        }
-        mm_ops = tuple(_MM_OP_BY_NAME.values())
-        unknown = set(config.mm_save_frequency_ops) - set(_MM_OP_BY_NAME)
-        if unknown:
-            raise ValueError(
-                f"Unknown entries in activation_checkpoint.mm_save_frequency_ops: "
-                f"{sorted(unknown)}. Valid: {sorted(_MM_OP_BY_NAME)}."
-            )
-        gated_mm_ops = tuple(
-            _MM_OP_BY_NAME[name] for name in config.mm_save_frequency_ops
+        mm_ops = (
+            torch.ops.aten.mm.default,
+            torch.ops.aten.mm.dtype,
+            torch.ops.aten.linear.default,
         )
 
-        # Resolved here rather than inside _get_custom_policy so a bad value is
-        # rejected when the model is wrapped, not on the first forward. The env
-        # var stays authoritative so launch scripts that export it keep working
-        # without editing their configs.
-        mm_save_every = int(
-            os.environ.get(
-                "TORCHTITAN_SAC_SAVE_MM_FREQUENCY", config.mm_save_frequency
-            )
-        )
+        # Validated here rather than inside _get_custom_policy so a bad value is
+        # rejected when the model is wrapped, not on the first forward.
+        mm_save_every = config.mm_save_frequency
         if mm_save_every < 0:
             raise ValueError(
-                "activation_checkpoint.mm_save_frequency (or "
-                "TORCHTITAN_SAC_SAVE_MM_FREQUENCY) must be >= 0, "
+                "activation_checkpoint.mm_save_frequency must be >= 0, "
                 f"got {mm_save_every}"
             )
 
@@ -324,29 +304,20 @@ class SelectiveAC(ActivationCheckpointing):
                         return CheckpointPolicy.PREFER_RECOMPUTE
                     meta[mm_count_key] += 1
 
-                # Save all compute/comm ops, except the mm/linear ops the save
-                # frequency skips. TORCHTITAN_SAC_SAVE_MM_FREQUENCY tunes the
-                # memory/compute trade-off: the default 2 keeps upstream's
-                # "save every other mm", 0 recomputes every mm (most memory
-                # saved), 1 saves all of them.
-                #
-                # SCOPE CHANGE vs llm-0.4.0: there the frequency gated only
-                # aten.mm.default, so aten.linear.default and aten.mm.dtype were
-                # always saved. Upstream groups all three as mm_ops precisely
-                # because some backends keep aten.linear as a leaf instead of
-                # decomposing it to aten.mm, so gating only mm.default would
-                # miss those. The gate therefore covers mm_ops here.
-                #
-                # Recompute is exact, so this is numerically neutral -- it only
-                # shifts the memory/speed trade-off. At frequency 0 it saves
-                # strictly less than 0.4.0 did.
+                # Save all compute/comm ops, except every Nth mm/linear, which
+                # is recomputed. This is upstream's own rule with its hardcoded
+                # 2 replaced by mm_save_every; at N=2 the two are identical
+                # (upstream recomputes on count % 2 == 0). See
+                # Config.mm_save_frequency.
                 if func in save_ops:
-                    if func in gated_mm_ops:
-                        save_mm = (
-                            mm_save_every != 0
-                            and meta[mm_count_key] % mm_save_every == 1
-                        )
-                        if not save_mm:
+                    if func in mm_ops:
+                        # N == 0 is the explicit "recompute all" sentinel (it
+                        # would otherwise divide by zero); N == 1 lands on the
+                        # same behaviour naturally, since every count is 0 mod 1.
+                        if (
+                            mm_save_every == 0
+                            or meta[mm_count_key] % mm_save_every == 0
+                        ):
                             return CheckpointPolicy.PREFER_RECOMPUTE
                     return CheckpointPolicy.MUST_SAVE
                 return CheckpointPolicy.PREFER_RECOMPUTE

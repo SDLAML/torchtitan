@@ -34,27 +34,6 @@ import torch
 
 @dataclass(kw_only=True, slots=True)
 class TrainingConfig:
-    # --- sequence-shaped batch sizing (fork extension) ---
-    # Upstream sizes batches purely in tokens. Every launch script and recipe
-    # here is written in sequences, so these three are kept as the authoring
-    # surface and converted to the token fields in __post_init__. Leave them at
-    # -1 to configure the token fields directly.
-    local_batch_size: int = -1
-    """Sequences per data-parallel rank per microbatch. Converted to
-    num_tokens_per_microbatch_per_dp_rank = local_batch_size * seq_len."""
-
-    global_batch_size: int = -1
-    """Total sequences per optimizer step across DP ranks. Converted to
-    num_tokens_per_train_step = global_batch_size * seq_len. -1 means one
-    gradient accumulation step."""
-
-    seq_len: int = -1
-    """Sequence length. Converted to max_context_length."""
-
-    all_tokens_valid: bool = False
-    """Assert every label position is a real token, so the padding-fraction
-    metric can be computed without scanning for IGNORE_INDEX."""
-
     enable_token_mask_for_moe: bool = False
     """Pass a token validity mask into the MoE router so padding does not
     contribute to load-balance statistics."""
@@ -77,22 +56,6 @@ class TrainingConfig:
     """Maximum logical context length used for training."""
 
     def __post_init__(self) -> None:
-        if self.seq_len > 0:
-            self.max_context_length = self.seq_len
-            if self.local_batch_size > 0:
-                self.num_tokens_per_microbatch_per_dp_rank = (
-                    self.local_batch_size * self.seq_len
-                )
-            if self.global_batch_size > 0:
-                self.num_tokens_per_train_step = (
-                    self.global_batch_size * self.seq_len
-                )
-        elif self.local_batch_size > 0 or self.global_batch_size > 0:
-            raise ValueError(
-                "training.local_batch_size / global_batch_size are expressed in "
-                "sequences and need training.seq_len to convert to tokens."
-            )
-
         if self.num_tokens_per_microbatch_per_dp_rank <= 0:
             raise ValueError(
                 "num_tokens_per_microbatch_per_dp_rank must be greater than 0."
@@ -309,6 +272,17 @@ class ParallelismConfig:
             raise ValueError(
                 "context_parallel_load_balancer cannot be an empty string. "
                 "Use None to disable load balancing."
+            )
+        # Ported from upstream b2dfff6a77 (#4506). The name was only validated
+        # at CP setup time, so a typo like "head-tail" was silently ignored on
+        # any job with context_parallel_degree == 1 -- and then picked the
+        # wrong balancer the moment CP was turned on. Reject it up front.
+        _allowed_cp_balancers = frozenset({None, "headtail", "ptrr"})
+        if self.context_parallel_load_balancer not in _allowed_cp_balancers:
+            raise ValueError(
+                "parallelism.context_parallel_load_balancer must be one of: "
+                "None, 'headtail', 'ptrr' "
+                f"(got {self.context_parallel_load_balancer!r})"
             )
         if self.enable_fsdp_symm_mem and (
             not torch.cuda.is_available()

@@ -16,6 +16,12 @@ import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 
 from torchtitan.components.checkpointer import ModelWrapper
+from torchtitan.components.data.mix import DatasetSpec
+from torchtitan.components.data.parquet_manifest import (
+    build_manifest,
+    MANIFEST_FILENAME,
+    write_manifest,
+)
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.evaluation.config import (
     EvaluationConfigError,
@@ -37,7 +43,6 @@ from torchtitan.evaluation.runtime import (
     result_row,
     upsert_result,
 )
-from torchtitan.hf_datasets.mixed_text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.llama3.config_registry import llama3_debugmodel
 
 
@@ -91,7 +96,7 @@ class TestOfflineEvaluationConfig(unittest.TestCase):
             original = llama3_debugmodel()
             original.hf_assets_path = "/tmp/tokenizer-assets"
             original.model_spec.model.dim = 123
-            original.training.seq_len = 777
+            original.training.max_context_length = 777
 
             older = root / "job_config_20260101-0000.json"
             newest = root / "job_config_20260101-0001.json"
@@ -101,7 +106,7 @@ class TestOfflineEvaluationConfig(unittest.TestCase):
             self.assertEqual(find_latest_job_config(root), newest)
             restored = load_training_config(newest)
             self.assertEqual(restored.config.hf_assets_path, "/tmp/tokenizer-assets")
-            self.assertEqual(restored.config.training.seq_len, 777)
+            self.assertEqual(restored.config.training.max_context_length, 777)
             self.assertEqual(restored.config.model_spec.model.dim, 123)
 
     def test_rejects_model_converter_snapshot(self):
@@ -153,20 +158,14 @@ class TestOfflineEvaluationMetrics(unittest.TestCase):
 
     def test_loader_supports_greedy_packing_with_utf8_bytes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            data_file = Path(temp_dir) / "validation.json"
-            data_file.write_text('{"text": "é"}\n{"text": "a"}\n')
-            config = HuggingFaceTextDataLoader.Config(
-                dataset=["simple_custom"],
-                dataset_path=[temp_dir],
-                dataset_files=["validation.json"],
-                dataset_split=["train"],
-                dataset_key=["text"],
-                infinite=False,
-                pack_strategy="greedy",
-                num_workers=0,
-            )
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            root = Path(temp_dir)
+            pq.write_table(pa.table({"text": ["é", "a"]}), root / "validation.parquet")
+            write_manifest(build_manifest(root), root / MANIFEST_FILENAME)
             dataloader = build_evaluation_dataloader(
-                config,
+                DatasetSpec(alias="validation", path=str(root)),
                 tokenizer=DummyTokenizer(),
                 dp_rank=0,
                 dp_world_size=1,
@@ -253,3 +252,22 @@ class TestOfflineEvaluationCheckpointLoading(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEvaluationDeterminism(unittest.TestCase):
+    def test_num_workers_is_refused(self):
+        """Workers shard documents, but packing sits ABOVE them, so each worker packs its
+        own subsequence and drops its own tail: the scored token set changes with
+        num_workers. A validation set is a measuring stick, so refuse the knob."""
+        from torchtitan.components.data.mix import DatasetSpec
+
+        with self.assertRaisesRegex(EvaluationConfigError, "changes which tokens"):
+            build_evaluation_dataloader(
+                DatasetSpec(alias="v", path="/nonexistent"),
+                tokenizer=DummyTokenizer(),
+                dp_rank=0,
+                dp_world_size=1,
+                seq_len=8,
+                local_batch_size=1,
+                num_workers=2,
+            )

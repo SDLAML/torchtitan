@@ -131,8 +131,11 @@ class EvaluationRuntime:
             tp=1,
             pp=1,
             ep=1,
-            etp=1,
             world_size=world_size,
+            # opt_moe requires this backend (models/opt_moe/config_registry.py);
+            # under "spmd_types" there is no "fsdp" mesh axis, which DiSCO and
+            # the metrics predicate resolve by name.
+            spmd_backend="partial_dtensor",
         )
         parallel_dims.build_mesh()
 
@@ -201,9 +204,14 @@ class EvaluationRuntime:
     ) -> tuple[EvaluationTotals, float]:
         """Score one set, reduce its totals, and return rank-identical metrics."""
 
-        seq_len = dataset.seq_len or self.config.training.seq_len
-        local_batch_size = (
-            dataset.local_batch_size or self.config.training.local_batch_size
+        # The offline-eval dataloader still packs a [B, S] rectangle, so recover it
+        # from the token fields. `training.seq_len` / `training.local_batch_size` were
+        # a fork-only authoring surface and no longer exist; per-set overrides on
+        # EvaluationDatasetConfig still do, and still win.
+        seq_len = dataset.seq_len or self.config.training.max_context_length
+        local_batch_size = dataset.local_batch_size or max(
+            1,
+            self.config.training.num_tokens_per_microbatch_per_dp_rank // seq_len,
         )
         # force_ddp_evaluation_parallelism guarantees dp_shard=cp=tp=pp=ep=1,
         # so "batch" is the only active parallel dimension and the global
@@ -216,12 +224,17 @@ class EvaluationRuntime:
         dp_rank = dist.get_rank()
         dp_world_size = self.parallel_dims.world_size
         dataloader = build_evaluation_dataloader(
-            dataset.dataloader,
+            dataset.dataset,
             tokenizer=self.tokenizer,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             seq_len=seq_len,
             local_batch_size=local_batch_size,
+            drop_long_samples=dataset.drop_long_samples,
+            num_workers=dataset.num_workers,
+            pin_memory=dataset.pin_memory,
+            prefetch_factor=dataset.prefetch_factor,
+            persistent_workers=dataset.persistent_workers,
         )
 
         self.model.eval()
@@ -236,7 +249,27 @@ class EvaluationRuntime:
             inputs = input_dict["input"].to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
             batch_bytes = batch_bytes.to(self.device, non_blocking=True)
-            extra_kwargs = self._attention_kwargs(inputs)
+            # 0.5.0 models are token-flat: [T] in, [T, V] out, with document
+            # boundaries carried by `positions` resetting to 0. The eval packer
+            # emits one independent sequence per row, so each row is its own
+            # document -- flatten [B, S] -> [B*S] and reset positions per row.
+            positions = input_dict.get("positions")
+            if positions is None:
+                if inputs.dim() == 2:
+                    rows, row_len = inputs.shape
+                    positions = torch.arange(
+                        row_len, device=inputs.device, dtype=torch.int64
+                    ).repeat(rows)
+                else:
+                    positions = torch.arange(
+                        inputs.shape[0], device=inputs.device, dtype=torch.int64
+                    )
+            else:
+                positions = positions.to(self.device, non_blocking=True).reshape(-1)
+            inputs = inputs.reshape(-1)
+            labels = labels.reshape(-1)
+            extra_kwargs = self._attention_kwargs(positions)
+            extra_kwargs["positions"] = positions
 
             try:
                 with dist_utils.get_train_context(False)():
@@ -271,15 +304,17 @@ class EvaluationRuntime:
         )
         return totals, time.monotonic() - begin
 
-    def _attention_kwargs(self, inputs: torch.Tensor) -> dict[str, Any]:
-        try:
-            masks = cast(BaseModel, self.model).get_attention_masks(
-                input_batch=inputs,
-                tokenizer=self.tokenizer,
-                extra_inputs={},
-            )
-        except TypeError:
-            return {}
+    def _attention_kwargs(self, positions: torch.Tensor) -> dict[str, Any]:
+        """Build the model's attention masks for this batch.
+
+        0.5.0's signature is ``get_attention_masks(positions)``. The previous
+        code called the 0.4.0 signature and caught ``TypeError``, which meant a
+        signature mismatch silently produced NO attention mask at all -- the
+        model would then attend across every document boundary in the batch and
+        report a plausible but wrong NLL. Only a model that genuinely has no
+        masks (all-SDPA) may return None; anything else must surface.
+        """
+        masks = cast(BaseModel, self.model).get_attention_masks(positions)
         return {} if masks is None else {"attention_masks": masks}
 
 
@@ -311,13 +346,23 @@ def dense_token_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
             "offline evaluation v1 supports dense tensor logits only; "
             f"got {type(logits).__name__}"
         )
-    if logits.ndim != 3:
+    # 0.5.0 models are token-flat and return [T, V]; 0.4.0 returned [B, S, V].
+    # Accept both and reduce to [T, V] / [T].
+    if logits.ndim not in (2, 3):
         raise EvaluationConfigError(
-            f"expected dense logits with shape [batch, seq, vocab], got {logits.shape}"
+            "expected dense logits with shape [tokens, vocab] or "
+            f"[batch, seq, vocab], got {tuple(logits.shape)}"
+        )
+    flat_logits = logits.flatten(0, 1) if logits.ndim == 3 else logits
+    flat_labels = labels.reshape(-1)
+    if flat_logits.shape[0] != flat_labels.shape[0]:
+        raise EvaluationConfigError(
+            f"logits/labels token count mismatch: {flat_logits.shape[0]} vs "
+            f"{flat_labels.shape[0]}"
         )
     return functional.cross_entropy(
-        logits.flatten(0, 1).float(),
-        labels.flatten(),
+        flat_logits.float(),
+        flat_labels,
         reduction="sum",
         ignore_index=IGNORE_INDEX,
     )

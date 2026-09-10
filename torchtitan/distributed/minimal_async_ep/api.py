@@ -101,8 +101,15 @@ def maybe_update_minimal_async_ep_config(model_config: Any, config: Any) -> None
         moe_cfg = getattr(layer_cfg, "moe", None)
         if moe_cfg is None:
             continue
-        # Models with their own MoE (rather than common.moe.MoE) have no
-        # routed_experts and therefore no token dispatcher to configure.
+        # Defensive: a MoE config without `routed_experts` has no token
+        # dispatcher to configure. NOTE the original rationale ("models with
+        # their own MoE have no routed_experts") no longer holds for opt_moe --
+        # its EXPANDED per-layer NormMoE.Config does carry `routed_experts`, so
+        # this never skips today. Kept because upstream added the identical
+        # guard in `token_dispatcher.py::update_ep_token_dispatcher_config`, so
+        # this is now aligned with upstream rather than a fork divergence.
+        # If it ever DOES skip, EP is silently left unconfigured -- worth a
+        # raise rather than a continue if a caller can be shown to depend on it.
         routed_experts_cfg = getattr(moe_cfg, "routed_experts", None)
         if routed_experts_cfg is None:
             continue
@@ -317,6 +324,27 @@ def _copy_rows_to_peers_and_wait_cuda(
     readable buffer, not an async handle. This keeps the operator interface
     simple for graph capture, but means this backend does not provide
     microbatch communication overlap.
+
+    Returns a COPY, not the symmetric-memory buffer itself. All three call sites
+    return this tensor as a custom-op output that outlives subsequent comm calls:
+
+        dispatch_op (:638)          -> routed_input_RD, which GroupedExperts SAVES
+                                       for grad_w = routed_input^T @ grad
+        _combine_to_origin (:505)   -> combine forward
+        _dispatch_to_experts (:486) -> grad for the expert outputs, in combine backward
+
+    The pool holds only _HIDDEN_RECV_BUFFER_COUNT buffers and rotates, so handing
+    out the buffer let the third call land back on the first's and overwrite
+    routed_input_RD DURING ITS OWN BACKWARD -- combine-backward runs before the
+    expert GEMM's backward. Measured before this copy: the dispatch output drifted
+    by 3.5-4.6 with exactly the valid-row count changed, and grad_w came out 230-300%
+    wrong, while the forward, grad_x and grad_scores were all exact. End to end that
+    cost +0.159 val loss at 500 steps (4.4778 vs 4.3186 for the standard backend).
+
+    Copying here rather than enlarging the pool is deliberate: a larger pool only
+    works while the number of simultaneously-live consumers stays below it, so
+    deeper pipelining or a different backward order would silently reintroduce the
+    same corruption.
     """
     assert _buffer_state is not None
 
@@ -344,7 +372,8 @@ def _copy_rows_to_peers_and_wait_cuda(
         num_valid_rows=num_valid_rows,
     )
     _wait_hidden_ready(hidden_recv_handle)
-    return hidden_recv_buffer
+    # Clone AFTER the barrier, so every peer's writes are visible in the copy.
+    return hidden_recv_buffer.clone()
 
 
 def _wait_hidden_ready(hidden_recv_handle: Any) -> None:

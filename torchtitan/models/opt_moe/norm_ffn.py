@@ -5,8 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass
-
-from torch import nn
+from typing import Any
 
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Identity
@@ -14,11 +13,27 @@ from torchtitan.protocols.module import Module
 from .utils.activations import build_activation
 
 from .utils.inits import make_param_init
-from .utils.norms import build_norm
+from .utils.norms import build_norm_config
 
 
+# TODO(fused-swiglu): make this eligible for `overrides/fused_swiglu.py`.
+# Two things block it today:
+#  1. `fused_swiglu` is registered `@override(target=FeedForward.Config,
+#     exact=True)` and reads `cfg.w1.param_init` as a CONFIG field, but this
+#     class builds its `Linear.Config`s inside `__init__`. Lift w1/w2/w3 to
+#     config fields (the `param_init` callables from `make_param_init` carry
+#     over unchanged, and `_make_fused_linear_init` composes w1/w3 for the
+#     fused w13 -- so the scion/orthogonal init survives fusion intact).
+#  2. Stock `FusedSwiGLU.forward` is `w2(silu_and_mul(w13(x)))` with NO slot for
+#     `mid_norm`. 74 of 119 flavors set `norm_everywhere=True`, so fusing them
+#     with the stock class would silently DELETE a norm. Those need a subclass
+#     computing `w2(mid_norm(silu_and_mul(w13(x))))`; it still gets both wins
+#     (w1+w3 in one GEMM, fused silu_and_mul kernel). The other 45 flavors can
+#     use the stock class directly.
+# Checkpoints are safe either way: FusedSwiGLU has _split_w13_on_save /
+# _merge_w13_on_load, so state dicts stay in unfused w1/w3 form.
 class FeedForward(Module):
-    """SwiGLU feed-forward module shared across models.
+    """SwiGLU feed-forward module for OPT MoE.
 
     Config takes the **final** hidden_dim (no internal 2/3 scaling).
     Use compute_ffn_hidden_dim() for Llama3/4-style dim computation.
@@ -43,6 +58,17 @@ class FeedForward(Module):
 
         # Stamped per layer by OPTMoEModel.Config expansion; these used to be
         # build()/init_weights() arguments.
+        linear_sharding_config: Any | None = None
+        """ShardingConfig stamped on w1/w2/w3. Same reason as the
+        attention config: spmd_types requires DTensor params before
+        fully_shard, and this config builds its Linears rather than
+        exposing them as fields."""
+        norm_sharding_config: Any | None = None
+        """ShardingConfig for `mid_norm`, which this config builds internally.
+        Without it a PARAMETRIC `norm_type` leaves `feed_forward.mid_norm` and
+        `moe.shared_experts.mid_norm` as plain tensors and `fully_shard`
+        rejects them under spmd_types -- 74 of 118 flavors. Inert for the
+        parameter-free `np_*` norms."""
         dim: int = 0
         residual_div: float = 1.0
         init_gate_as_residual: bool = False
@@ -64,6 +90,7 @@ class FeedForward(Module):
             param_init={
                 "weight": make_param_init(config.w1_init_fn_type, config.w1_init_std)
             },
+            sharding_config=config.linear_sharding_config,
         ).build()
         self.w2 = Linear.Config(
             in_features=config.hidden_dim,
@@ -73,6 +100,7 @@ class FeedForward(Module):
                     config.w2_init_fn_type, config.w2_init_std, config.residual_div
                 )
             },
+            sharding_config=config.linear_sharding_config,
         ).build()
         self.w3 = Linear.Config(
             in_features=dim,
@@ -82,13 +110,17 @@ class FeedForward(Module):
                     config.w3_init_fn_type, config.w3_init_std, w3_residual_div
                 )
             },
+            sharding_config=config.linear_sharding_config,
         ).build()
         self.act_fn = build_activation(config.activation_type)
 
         if config.norm_everywhere:
-            self.mid_norm = build_norm(
-                config.norm_type, dim=config.hidden_dim, eps=config.norm_eps
-            )
+            self.mid_norm = build_norm_config(
+                config.norm_type,
+                config.hidden_dim,
+                config.norm_eps,
+                sharding_config=config.norm_sharding_config,
+            ).build()
         else:
             self.mid_norm = Identity.Config().build()
 

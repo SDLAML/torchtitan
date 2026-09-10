@@ -28,12 +28,8 @@ from torch.distributed.tensor import DTensor
 from torchtitan.components.checkpointer import BaseCheckpointManager, CheckpointManager
 from torchtitan.components.data.collators import TrainerBatch
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
-from torchtitan.components.data_mix_scheduler import build_data_mix_scheduler
-from torchtitan.hf_datasets.mixed_text_datasets import (
-    infer_dataloader_snapshot_every_n_steps,
-)
+from torchtitan.components.data_mix_metrics import build_data_mix_metrics
 from torchtitan.components.ema import EMAOptimizersContainer
-from torchtitan.optimizers import norm_helper
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer
@@ -64,6 +60,7 @@ from torchtitan.models.common.token_dispatcher import (
 )
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.sdc_replayer import ScalarStateAccessor, SDCReplayer
+from torchtitan.optimizers import norm_helper
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
@@ -555,6 +552,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # PP: only the last stage has lm_head; non-last stages skip this.
         # A loss may wrap the chunked one (MoEAuxLoss does, to add the MoE
         # load-balance term), so look one level in rather than only at the top.
+        # The MoE aux term is added once per microbatch while CE is normalized
+        # over the whole accumulation window, so the aux side needs the count.
+        # Unconditional by design: `MoEAuxLoss` reads it via getattr with a
+        # default of 1, and any other loss simply ignores the attribute. (The
+        # previous `isinstance(..., object)` guard was always True -- everything
+        # including None is an object -- so it read as a filter and was not one.)
+        # Count how many times the loss is CALLED per optimizer step, not just
+        # the accumulation groups: under PP the schedule invokes the loss once
+        # per pipeline microbatch, so the aux term lands
+        # gas * num_pp_microbatches times while `gradient_accumulation_steps`
+        # already has num_pp_microbatches factored out (see the derivation
+        # above). Dividing by gas alone would leave PP runs scaled by
+        # num_pp_microbatches.
+        _loss_calls_per_step = self.gradient_accumulation_steps
+        if parallel_dims.pp_enabled:
+            _loss_calls_per_step *= self.num_pp_microbatches
+        self.loss_fn.gradient_accumulation_steps = _loss_calls_per_step
+
         chunked_loss_fn = (
             self.loss_fn
             if isinstance(self.loss_fn, ChunkedLossWrapper)
@@ -579,7 +594,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 assert (
                     lm_head is not None
                 ), "Model must have lm_head for ChunkedLossWrapper"
-                chunked_loss_fn.set_lm_head(lm_head)  # pyrefly: ignore[bad-argument-type]
+                chunked_loss_fn.set_lm_head(
+                    lm_head
+                )  # pyrefly: ignore[bad-argument-type]
                 self.model_parts[
                     0
                 ]._skip_lm_head = True  # pyrefly: ignore[bad-argument-type]
@@ -651,39 +668,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # build dataloader
         num_tokens_per_batch = config.training.num_tokens_per_microbatch_per_dp_rank
-        # seed and snapshot_every_n_steps are extras the torchdata-backed loader
-        # uses and upstream's grain loader ignores (its build() absorbs **kwargs).
-        # Without the seed the data order is not reproducible; without the
-        # snapshot interval the mixing state is captured every step, which is
-        # correct but needlessly slow for a multi-dataset mix.
-        snapshot_every_n_steps = infer_dataloader_snapshot_every_n_steps(
-            checkpoint_enabled=config.checkpoint.enable,
-            checkpoint_interval=config.checkpoint.interval,
-            gradient_accumulation_steps=self.gradient_accumulation_steps,
-        )
+        # `--debug.seed` does NOT reach the grain dataloader: GrainDataLoader takes its
+        # seed from `dataloader.seed`, and Configurable.build() rejects a build kwarg
+        # that names a config field. Set the seed on the dataloader config.
         self.dataloader = config.dataloader.build(
             dp_world_size=dp_degree,
             dp_rank=dp_rank,
             tokenizer=self.tokenizer,
             max_context_length=config.training.max_context_length,
             num_tokens_per_batch=num_tokens_per_batch,
-            snapshot_every_n_steps=snapshot_every_n_steps,
-            seed=config.debug.seed,
         )
 
-        # Dynamic data mixing: reweights the dataset mix over training and
-        # reports per-dataset document/token counts. No upstream equivalent --
-        # grain's DatasetMixConfig fixes its weights at build time.
-        self.data_mix_scheduler = build_data_mix_scheduler(
-            self.dataloader,
-            getattr(config.dataloader, "data_mixing_scheduler_configs", None),
-            config.training.steps,
-        )
-        self.data_mix_scheduler.dump_mixing_configs(config.dump_folder)
-        self.data_mix_scheduler.step(0)
+        # Per-dataset consumption metrics: `data_docs/{alias}` and the constant
+        # `data_mixing/{alias}` weights. Reporting only -- grain's DatasetMixConfig
+        # resolves mix proportions at build time and there is no way to reweight
+        # during a run. No upstream equivalent.
+        self.data_mix_metrics = build_data_mix_metrics(self.dataloader)
         logger.info(
-            f"mixing weights at step 0: "
-            f"{self.data_mix_scheduler.get_log_dict_at_step(0)[0]}"
+            f"mixing weights: {self.data_mix_metrics.get_log_dict_at_step(0)[0]}"
         )
 
         # build checkpointer
@@ -940,7 +942,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         logging_on = bool(
             metrics_config.enable_wandb or metrics_config.enable_tensorboard
         )
-        if metrics_config.save_all_shard_ranks and not metrics_config.save_for_all_ranks:
+        # `need_to_calculate_norm` in train_step is gated on `should_log`, so a
+        # norms only land on steps divisible by BOTH frequencies, i.e. on
+        # lcm(log_freq, log_norm_freq) rather than the requested cadence. With
+        # log_freq=100 and log_norm_freq=250 you silently get norms every 500
+        # steps, not every 250. Require the multiple so the configured cadence
+        # is the real one.
+        if (
+            metrics_config.log_norm_freq > 0
+            and metrics_config.log_freq > 0
+            and metrics_config.log_norm_freq % metrics_config.log_freq != 0
+        ):
+            raise ValueError(
+                f"metrics.log_norm_freq ({metrics_config.log_norm_freq}) must be a "
+                f"multiple of metrics.log_freq ({metrics_config.log_freq}); norm "
+                "logging only happens on steps that are also metric-logging steps, "
+                "so otherwise norms land on lcm(log_freq, log_norm_freq) "
+                "instead of the cadence you asked for."
+            )
+        if (
+            metrics_config.save_all_shard_ranks
+            and not metrics_config.save_for_all_ranks
+        ):
             raise ValueError(
                 "metrics.save_all_shard_ranks requires metrics.save_for_all_ranks. "
                 "Without it only one rank builds a logger, so skipping the "
@@ -964,7 +987,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             # `number_of_loggers`) on ranks that do not log, and a
             # `LoggerContainer` on ranks that do -- so this must not assume the
             # container type.
-            has_logger = getattr(self.metrics_processor.logger, "number_of_loggers", 0) > 0
+            has_logger = (
+                getattr(self.metrics_processor.logger, "number_of_loggers", 0) > 0
+            )
             # Only the direction that loses data is fatal: this rank owns a slice
             # nobody else will log, and has nowhere to put it. The reverse (a
             # logger with nothing to log) is harmless, and firing on it would turn
@@ -1077,6 +1102,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     global_valid_tokens=global_valid_tokens,
                 )
 
+            # Ported from upstream f6b9152e9b (#4505). Under HSDP the
+            # replicate all-reduce runs on EVERY gradient-accumulation
+            # microbatch, but only the last one needs it -- the earlier ones
+            # just burn inter-node bandwidth. `set_requires_all_reduce` skips
+            # only the replicate reduction; it is deliberately NOT
+            # `set_requires_gradient_sync`, which would also skip the
+            # reduce-scatter that each microbatch does need.
+            #
+            # Left alone under CUDA graphs with accum > 1: one graph is
+            # captured on the first accum group, so recording False there
+            # would skip the all-reduce on every replay. accum == 1 is
+            # unchanged (always True).
+            if self.parallel_dims.dp_replicate_enabled and (
+                self.gradient_accumulation_steps == 1
+                or self.config.training.disable_cuda_graphs
+            ):
+                is_last = fwd_bwd_index == self.gradient_accumulation_steps - 1
+                for part in self.model_parts:
+                    part.set_requires_all_reduce(  # pyrefly: ignore[not-callable]
+                        is_last
+                    )
+
             if self.sdc_replayer is not None and fwd_bwd_index == 0:
                 # Only the step's first gradient-accumulation group is
                 # replay-checked; under PP one group is a complete pipeline
@@ -1159,7 +1206,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 self.optimizers.calculate_norm_at_next_step()
             self.optimizers.step()
             self.lr_schedulers.step()
-            self.data_mix_scheduler.step(self.step + 1)
 
         # log metrics
         if not should_log:
@@ -1203,7 +1249,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
         }
-        data_mix, data_docs, data_tokens = self.data_mix_scheduler.get_log_dict_at_step(
+        data_mix, data_docs, data_tokens = self.data_mix_metrics.get_log_dict_at_step(
             self.step
         )
         extra_metrics.update(data_mix)
@@ -1321,3 +1367,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             self.checkpointer.close()
         if hasattr(self, "metrics_processor") and self.metrics_processor:
             self.metrics_processor.close()
+        # Stops the async MoE metrics worker. Without this its non-daemon
+        # thread blocked forever on an empty queue and the process never
+        # exited -- the "hang in teardown" that made sbatch time jobs out.
+        # getattr on SELF, like the neighbouring teardown lines: a failure
+        # before `self.optimizers` is assigned would otherwise raise
+        # AttributeError inside close() and mask the original error.
+        _optimizers = getattr(self, "optimizers", None)
+        if _optimizers is not None and hasattr(_optimizers, "close"):
+            _optimizers.close()

@@ -441,6 +441,25 @@ class MetricsProcessor(Configurable):
         has_logging_enabled = config.enable_tensorboard or config.enable_wandb
 
         # Determine if this rank should log
+        # `save_first_dp_and_tp` only reaches its branch below when
+        # `save_for_all_ranks` is on and `save_all_shard_ranks` is off -- the
+        # chain is an if/elif. Requesting it in any other combination silently
+        # does nothing, so say so rather than let the config lie.
+        if config.save_first_dp_and_tp and has_logging_enabled:
+            if not config.save_for_all_ranks:
+                logger.warning(
+                    "metrics.save_first_dp_and_tp is ignored because "
+                    "metrics.save_for_all_ranks is False: only one global rank "
+                    "logs at all, so there is nothing to narrow."
+                )
+            elif config.save_all_shard_ranks:
+                logger.warning(
+                    "metrics.save_first_dp_and_tp is ignored because "
+                    "metrics.save_all_shard_ranks takes precedence: logging is "
+                    "already narrowed to the ranks owning a distinct metrics "
+                    "shard."
+                )
+
         should_log = has_logging_enabled
         if (not config.save_for_all_ranks) and should_log:
             metrics_rank = _get_metrics_rank(

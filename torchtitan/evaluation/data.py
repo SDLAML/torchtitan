@@ -9,26 +9,20 @@
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any
 
 import numpy as np
 import torch
-from datasets.distributed import split_dataset_by_node
 from torch.utils.data import DataLoader, get_worker_info, IterableDataset
 
+from torchtitan.components.data.mix import DatasetSpec
+from torchtitan.components.data.parquet_stream import ParquetStreamSource
+from torchtitan.components.data.types import DatasetIterationPolicy
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.evaluation.config import EvaluationConfigError
-from torchtitan.hf_datasets.mixed_text_datasets import (
-    _coerce_to_list,
-    _normalize_list,
-    _prepared_data_files,
-    _replace_none_with_literal,
-    _validate_dataset,
-    HuggingFaceTextDataLoader,
-)
 
 
 CharSpan = tuple[int, int]
@@ -196,41 +190,48 @@ def _validate_char_offset(offset: Any, *, text_length: int) -> CharSpan:
     return start, end
 
 
-class RawTextHuggingFaceDataset(IterableDataset[Document]):
-    """Yield offset-aware tokenized documents from a finite distributed source."""
+class RawTextParquetDataset(IterableDataset[Document]):
+    """Yield offset-aware tokenized documents from one manifest-described corpus.
+
+    Reads through `ParquetStreamSource`, the same source the training path uses, so
+    evaluation and training agree about sharding and about what "this corpus" means.
+    Only the byte attribution below is evaluation-specific -- BPB needs per-token byte
+    lengths, which no packer in the training path produces.
+    """
 
     def __init__(
         self,
         *,
-        dataset_name: str,
-        dataset_path: str | None,
+        dataset: DatasetSpec,
         tokenizer: BaseTokenizer,
         dp_rank: int,
         dp_world_size: int,
-        dataset_inner_name: str | None,
-        dataset_files: str | Sequence[str] | None,
-        dataset_split: str,
-        dataset_streaming: bool,
-        dataset_key: str,
     ) -> None:
-        dataset_name = dataset_name.lower()
-        path, dataset_loader, sample_processor = _validate_dataset(
-            dataset_name=dataset_name,
-            dataset_path=dataset_path,
-            dataset_inner_name=dataset_inner_name,
-            dataset_files=dataset_files,
-            dataset_split=dataset_split,
-            dataset_streaming=dataset_streaming,
-            dataset_key=dataset_key,
-        )
-        self.dataset_name = dataset_name
-        self.dataset_path = dataset_path
-        self._data = split_dataset_by_node(dataset_loader(path), dp_rank, dp_world_size)
+        self.dataset_name = dataset.alias
+        self.dataset_path = dataset.path
+        self._text_key = dataset.text_key
         self._tokenizer = tokenizer
-        self._sample_processor = sample_processor
+        # repeat=False: evaluation must terminate. Disk order, because a validation set
+        # is a measuring stick and must score the same tokens on every run.
+        self._source = ParquetStreamSource.Config(
+            path=dataset.path,
+            manifest_path=dataset.manifest_path,
+            columns=(dataset.text_key,),
+            num_concurrent_spans=1,
+            reshuffle_spans_per_epoch=False,
+        ).build(
+            dataset_iteration_policy=DatasetIterationPolicy(
+                seed=0,
+                shuffle=False,
+                repeat=False,
+                dp_rank=dp_rank,
+                dp_world_size=dp_world_size,
+                streaming_shuffle_buffer_size=0,
+            )
+        )
 
     def __iter__(self) -> Iterator[Document]:
-        data_iter = iter(self._data)
+        data_iter = iter(self._source)
         worker_info = get_worker_info()
         if worker_info is not None:
             data_iter = itertools.islice(
@@ -238,22 +239,14 @@ class RawTextHuggingFaceDataset(IterableDataset[Document]):
             )
 
         for sample in data_iter:
-            try:
-                sample_text = self._sample_processor(sample)
-            except Exception:
-                continue
+            sample_text = sample[self._text_key]
             if not isinstance(sample_text, str):
                 raise EvaluationConfigError(
                     f"validation dataset {self.dataset_name!r} produced non-string text"
                 )
             if not sample_text.strip():
                 continue
-            try:
-                yield tokenize_document_with_byte_spans(self._tokenizer, sample_text)
-            except EvaluationConfigError:
-                raise
-            except Exception:
-                continue
+            yield tokenize_document_with_byte_spans(self._tokenizer, sample_text)
 
 
 class ByteTrackingGreedyPackedDataset(IterableDataset[PackedSample]):
@@ -302,86 +295,55 @@ class ByteTrackingGreedyPackedDataset(IterableDataset[PackedSample]):
 
 
 def build_evaluation_dataloader(
-    config: HuggingFaceTextDataLoader.Config,
+    dataset: DatasetSpec,
     *,
     tokenizer: BaseTokenizer,
     dp_rank: int,
     dp_world_size: int,
     seq_len: int,
     local_batch_size: int,
+    drop_long_samples: bool = False,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    prefetch_factor: int | None = None,
+    persistent_workers: bool = False,
 ) -> DataLoader:
-    """Build a finite offset-aware loader for greedy packing."""
+    """Build a finite offset-aware loader for greedy packing.
 
-    if config.infinite:
+    One corpus per named validation set: scoring a MIXTURE would report a single number
+    over an interleave whose proportions are a training-time decision, which is not what
+    a validation set is for.
+    """
+    if num_workers > 0:
+        # Workers shard DOCUMENTS round-robin inside the source, but the greedy packer
+        # sits above them, so each worker packs its own subsequence and drops its own
+        # tail: the scored token set changes with num_workers. A validation set is a
+        # measuring stick, so refuse rather than let a throughput knob move the number.
+        # (Each worker also decodes the rank's entire range and discards (N-1)/N of it.)
         raise EvaluationConfigError(
-            "offline validation requires dataloader.infinite=False"
-        )
-    if config.pack_strategy != "greedy":
-        raise EvaluationConfigError(
-            "offline validation supports dataloader.pack_strategy='greedy' only"
-        )
-    if config.dataset_mix_in_seq:
-        raise EvaluationConfigError(
-            "offline validation does not support dataset_mix_in_seq; define one named set "
-            "per source dataset"
+            f"num_workers={num_workers} changes which tokens an evaluation set scores, "
+            "because packing happens above the per-worker document sharding. Use 0."
         )
 
-    dataset_names = _coerce_to_list(config.dataset)
-    if dataset_names is None or len(dataset_names) != 1:
-        raise EvaluationConfigError(
-            "offline validation supports exactly one source dataset per named validation set"
-        )
-    dataset_paths = _replace_none_with_literal(config.dataset_path)
-    inner_names = _replace_none_with_literal(config.dataset_inner_name)
-    dataset_splits = _normalize_list(
-        _coerce_to_list(config.dataset_split), 1, duplicate=True
-    )
-    dataset_keys = _normalize_list(
-        _coerce_to_list(config.dataset_key), 1, duplicate=True
-    )
-    if dataset_splits is None or dataset_keys is None:
-        raise EvaluationConfigError("dataset_split and dataset_key must be configured")
-    dataset_paths = _normalize_list(dataset_paths, 1)
-    inner_names = _normalize_list(inner_names, 1)
-    dataset_path = dataset_paths[0]
-    if dataset_path is not None and not isinstance(dataset_path, str):
-        raise EvaluationConfigError("dataset_path must be a string or None")
-    dataset_files = (
-        None
-        if dataset_path is None
-        else _prepared_data_files(
-            dataset_path,
-            config.dataset_files,
-            dataset_splits[0],
-            config.dataset_streaming,
-        )
-    )
-
-    source = RawTextHuggingFaceDataset(
-        dataset_name=dataset_names[0],
-        dataset_path=dataset_path,
+    source = RawTextParquetDataset(
+        dataset=dataset,
         tokenizer=tokenizer,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
-        dataset_inner_name=inner_names[0],
-        dataset_files=dataset_files,
-        dataset_split=dataset_splits[0],
-        dataset_streaming=config.dataset_streaming,
-        dataset_key=dataset_keys[0],
     )
     packed: Iterable[PackedSample] = ByteTrackingGreedyPackedDataset(
         source,
         seq_len=seq_len,
-        drop_long_samples=config.drop_long_samples,
+        drop_long_samples=drop_long_samples,
     )
 
     loader_kwargs: dict[str, Any] = {
         "batch_size": local_batch_size,
-        "num_workers": config.num_workers,
-        "pin_memory": config.pin_memory,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
     }
-    if config.num_workers > 0:
-        loader_kwargs["persistent_workers"] = config.persistent_workers
-        if config.prefetch_factor is not None:
-            loader_kwargs["prefetch_factor"] = config.prefetch_factor
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        if prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
     return DataLoader(packed, **loader_kwargs)

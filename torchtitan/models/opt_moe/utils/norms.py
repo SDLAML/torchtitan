@@ -67,7 +67,52 @@ NORM_CONFIGS = {
 }
 
 
-def build_norm_config(norm_type: str, dim: int, eps: float = 1e-6):
+# Parameters each norm type owns. `np_*` variants are parameter-free, which is
+# exactly why the sharding plan below can be shared: `Module._distribute_states`
+# iterates the module's ACTUAL parameters and looks each one up, so naming a
+# state a given norm does not have is inert, while failing to name one it does
+# have leaves it a plain tensor and `fully_shard` rejects it under spmd_types.
+NORM_PARAM_NAMES: dict[str, tuple[str, ...]] = {
+    "layernorm": ("weight", "bias"),
+    "np_layernorm": (),
+    "rmsnorm": ("weight",),
+    "np_rmsnorm": (),
+    "ss_rmsnorm": ("ssnorm_scale",),
+}
+
+# Union of every norm parameter name. One plan covers all five types, so the
+# sharding code does not have to branch on `norm_type` -- which it usually
+# cannot see anyway, since the type is chosen per-module far from the plan.
+ALL_NORM_PARAM_NAMES: tuple[str, ...] = tuple(
+    dict.fromkeys(n for names in NORM_PARAM_NAMES.values() for n in names)
+)
+
+
+def norm_has_parameters(norm_type: str) -> bool:
+    """Whether ``norm_type`` builds a norm with learnable parameters.
+
+    The drift check lives here, not at module scope: a module-level ``assert``
+    is stripped by ``python -O``, and on a real drift it would make the whole
+    ``opt_moe`` package unimportable (including
+    ``scripts/checkpoint_conversion/convert_to_hf.py``) rather than failing
+    only for the norm type that is actually missing.
+    """
+    key = norm_type.lower()
+    names = NORM_PARAM_NAMES.get(key)
+    if names is None:
+        if key in NORM_CONFIGS:
+            raise KeyError(
+                f"norm_type '{norm_type}' is in NORM_CONFIGS but missing from "
+                "NORM_PARAM_NAMES; add its parameter names there so sharding "
+                "plans can cover it."
+            )
+        raise NotImplementedError(f"Unknown norm_type: '{norm_type}'")
+    return bool(names)
+
+
+def build_norm_config(
+    norm_type: str, dim: int, eps: float = 1e-6, *, sharding_config=None
+):
     """Return the ``Module.Config`` for the requested norm type.
 
     Args:
@@ -75,6 +120,12 @@ def build_norm_config(norm_type: str, dim: int, eps: float = 1e-6):
             ``np_rmsnorm``, ``ss_rmsnorm``.
         dim: Normalized dimension.
         eps: Epsilon for numerical stability.
+        sharding_config: Plan for the norm's parameters. Applied ONLY when
+            ``norm_type`` actually has parameters -- the ``np_*`` variants own
+            none, so stamping them would attach a plan that can never bind to
+            anything and would needlessly take those modules off
+            ``Module.parallelize``'s no-config fast path. Callers can therefore
+            pass this unconditionally without knowing the norm type.
 
     Raises:
         NotImplementedError: If an unknown ``norm_type`` is provided.
@@ -82,10 +133,7 @@ def build_norm_config(norm_type: str, dim: int, eps: float = 1e-6):
     norm_config_fn = NORM_CONFIGS.get(norm_type.lower())
     if norm_config_fn is None:
         raise NotImplementedError(f"Unknown norm_type: '{norm_type}'")
-    return norm_config_fn(dim, eps)
-
-
-def build_norm(norm_type: str, dim: int, eps: float = 1e-6):
-    """Build a norm module directly. Prefer ``build_norm_config`` where the
-    config tree is available, so the module participates in sharding."""
-    return build_norm_config(norm_type, dim, eps).build()
+    cfg = norm_config_fn(dim, eps)
+    if sharding_config is not None and norm_has_parameters(norm_type):
+        cfg.sharding_config = sharding_config
+    return cfg

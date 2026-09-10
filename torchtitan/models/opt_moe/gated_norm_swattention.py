@@ -5,10 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from functools import partial
+
+from typing import Any
 
 import torch
-from torch import nn
 
 from torchtitan.models.common.attention import (
     AttentionMasksType,
@@ -17,15 +17,14 @@ from torchtitan.models.common.attention import (
     FusedQKVLinear,
     GQAttention,
     QKVLinear,
-    ScaledDotProductAttention,
-    VarlenAttention,
 )
+from torchtitan.models.common.config_utils import get_attention_config
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Identity
-from torchtitan.models.common.rope import CosSinRoPE, RoPE
+from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 from .utils.inits import make_param_init
-from .utils.norms import build_norm, build_norm_config
+from .utils.norms import build_norm_config
 
 
 class GatedNormSWAttention(GQAttention):
@@ -68,10 +67,18 @@ class GatedNormSWAttention(GQAttention):
         mid_norm_position: str = "after"  # "after" or "before"
         head_wise_mid_norm: bool = False
         use_rope: bool = True
-        attn_backend: str = "sdpa"
-        attn_mask_type: str = "causal"
+        # flex + block_causal, matching upstream. Upstream removed sdpa as a
+        # language-model backend entirely (config_utils.get_attention_config
+        # raises on it) because sdpa takes only a boolean is_causal and cannot
+        # consume per-document positions. Batches are token-flat, so a plain
+        # causal mask spans the whole concatenated stream and attends across
+        # the document boundaries that `positions` resets mark, while RoPE has
+        # already restarted at each one. Measured cost of flex over sdpa is
+        # ~3% of step time; block_causal over causal is free (flex skips
+        # fully-masked blocks).
+        attn_backend: str = "flex"
+        attn_mask_type: str = "block_causal"
 
-        rope_backend: str = "cos_sin"  # "complex" or "cos_sin"
         qk_rope_dim: int | None = None
         # Number of head dimensions to apply RoPE to.  None (default) means full
         # head_dim (standard RoPE).  Set to a smaller value for partial RoPE where
@@ -81,9 +88,7 @@ class GatedNormSWAttention(GQAttention):
         # Filled in by OPTMoEModel.Config expansion from ``attn_backend`` and the
         # model-level rope/rope_of_swa configs. Declared with defaults so the
         # compact flavor registry in __init__.py does not have to spell them out.
-        inner_attention: Module.Config = field(
-            default_factory=ScaledDotProductAttention.Config
-        )
+        inner_attention: Module.Config = field(default_factory=FlexAttention.Config)
         rope: RoPE.Config | None = None
 
         wq_init_fn_type: str = "scaled_orthogonal"
@@ -102,6 +107,29 @@ class GatedNormSWAttention(GQAttention):
         # model's config expansion (was passed to init_weights(residual_div=...)).
         residual_div: float = 1.0
 
+        linear_sharding_config: Any | None = None
+        """ShardingConfig stamped onto every Linear this config synthesizes
+        (wq/wk/wv or wqkv, wo, gate_proj).
+
+        Needed because `spmd_backend="spmd_types"` requires EVERY parameter to
+        already be a DTensor before `fully_shard(dp_mesh_dims=...)` runs
+        ("all parameters must be DTensors on the full SPMD mesh ... Got plain
+        tensor"). Upstream models express this by exposing their Linears as
+        config FIELDS, so `set_*_sharding` can reach them; this config is flat
+        and builds them in `to_gqa_config`, so the plan has to be threaded in.
+        With TP off, every Linear takes the same Invariant placement, so one
+        config for all of them is sufficient."""
+        norm_sharding_config: Any | None = None
+        """Sharding plan for the norms this config builds internally (qk_norm,
+        v_norm, mid_norm). They are not config fields, so `sharding.py` cannot
+        reach them the way it reaches `attention_norm`/`ffn_norm`; it threads
+        the plan in here instead. Inert for parameter-free norm types."""
+
+        # TODO(fused-qkv): this is implemented (uses upstream FusedQKVLinear
+        # below) but NO flavor sets it -- 0 of 119. Enabling it merges wq/wk/wv
+        # into one GEMM. Gated on wq/wk/wv sharing an initializer, which the
+        # scion/orthogonal init family does not always satisfy; check per flavor
+        # before flipping. Benchmark alongside TODO(fused-swiglu).
         fuse_qkv: bool = False
         """Project Q/K/V with one fused GEMM instead of three.
 
@@ -156,9 +184,7 @@ class GatedNormSWAttention(GQAttention):
                 # Upstream's _fused_qkv_param_init reproduces the exact draws the
                 # split wq/wk/wv would make, so fusing is a pure throughput
                 # change and does not perturb initialization.
-                from torchtitan.models.common.config_utils import (
-                    _fused_qkv_param_init,
-                )
+                from torchtitan.models.common.config_utils import _fused_qkv_param_init
 
                 qkv = FusedQKVLinear.Config(
                     head_dim=head_dim,
@@ -192,7 +218,18 @@ class GatedNormSWAttention(GQAttention):
 
             qk_norm = None
             if self.qk_norm or self.norm_everywhere:
-                qk_norm = build_norm_config(self.norm_type, head_dim, self.norm_eps)
+                qk_norm = build_norm_config(
+                    self.norm_type,
+                    head_dim,
+                    self.norm_eps,
+                    sharding_config=self.norm_sharding_config,
+                )
+
+            if self.linear_sharding_config is not None:
+                for _sub in ("wqkv", "wq", "wkv", "wk", "wv"):
+                    _lin = getattr(qkv, _sub, None)
+                    if _lin is not None:
+                        _lin.sharding_config = self.linear_sharding_config
 
             return GQAttention.Config(
                 n_heads=self.n_heads,
@@ -208,6 +245,7 @@ class GatedNormSWAttention(GQAttention):
                             self.wo_init_fn_type, self.wo_init_std, self.residual_div
                         )
                     },
+                    sharding_config=self.linear_sharding_config,
                 ),
                 qk_norm=qk_norm,
                 inner_attention=self.inner_attention,
@@ -215,16 +253,21 @@ class GatedNormSWAttention(GQAttention):
             )
 
         def build_inner_attention(self) -> Module.Config:
-            """Map ``attn_backend`` onto an upstream inner-attention config."""
-            match self.attn_backend:
-                case "flex":
-                    return FlexAttention.Config()
-                case "varlen":
-                    return VarlenAttention.Config()
-                case "sdpa":
-                    return ScaledDotProductAttention.Config()
-                case _:
-                    raise ValueError(f"Unknown attention type: {self.attn_backend}")
+            """Map ``attn_backend`` onto an upstream inner-attention config.
+
+            Delegates to upstream's `get_attention_config` rather than keeping a
+            private copy of the mapping. The private copy is what let this model
+            drift: upstream deprecated SDPA and the "causal" mask type for
+            language models in pytorch/torchtitan#3571 ("Today, text dataloader
+            and chat dataloader always output `positions` for `Decoder` to
+            consume, which SDPA could not handle"), but the local copy kept the
+            `sdpa` case and defaulted to it, so this was the only language model
+            in the repo training without document masking. Delegating also makes
+            `flex_flash` selectable -- though it does not lower in this torch
+            build ("BACKEND='FLASH' but flash attention not available"), so it
+            is reachable, not usable, here.
+            """
+            return get_attention_config(self.attn_backend)
 
     def __init__(self, config: Config):
         # GQAttention builds qkv_linear, wo, rope, inner_attention, q/k norm and
@@ -241,9 +284,18 @@ class GatedNormSWAttention(GQAttention):
         self.qk_rope_dim: int = (
             config.qk_rope_dim if config.qk_rope_dim is not None else self.head_dim
         )
-        assert self.qk_rope_dim <= self.head_dim, (
-            f"qk_rope_dim ({self.qk_rope_dim}) must be <= head_dim ({self.head_dim})"
-        )
+        assert (
+            self.qk_rope_dim <= self.head_dim
+        ), f"qk_rope_dim ({self.qk_rope_dim}) must be <= head_dim ({self.head_dim})"
+        # `_apply_rope` slices Q/K to qk_rope_dim and hands them to a RoPE whose
+        # cos/sin cache is sized by `rope.dim`. If the two disagree the rotation
+        # silently uses the wrong frequencies (or broadcasts), so pin them.
+        if config.rope is not None and config.rope.dim != self.qk_rope_dim:
+            raise ValueError(
+                f"rope.dim ({config.rope.dim}) must equal the rotated width "
+                f"qk_rope_dim ({self.qk_rope_dim}); the RoPE cache is built at "
+                "rope.dim but only qk_rope_dim head dims are rotated."
+            )
         self.partial_rope = self.qk_rope_dim != self.head_dim
         if not self.use_rope:
             # GQAttention always builds a RoPE; drop it so NoPE layers carry no
@@ -254,9 +306,10 @@ class GatedNormSWAttention(GQAttention):
         self.gate_only = config.gate_only
         self.sliding_window_size = config.sliding_window_size
         self.mid_norm_position = config.mid_norm_position
-        assert self.mid_norm_position in ("after", "before"), (
-            f"mid_norm_position ({self.mid_norm_position}) must be 'after' or 'before'"
-        )
+        assert self.mid_norm_position in (
+            "after",
+            "before",
+        ), f"mid_norm_position ({self.mid_norm_position}) must be 'after' or 'before'"
         self.head_wise_mid_norm = config.head_wise_mid_norm
         self.attn_backend = config.attn_backend
 
@@ -268,7 +321,10 @@ class GatedNormSWAttention(GQAttention):
         dim = config.dim
         if config.v_norm or config.norm_everywhere:
             self.v_norm = build_norm_config(
-                config.norm_type, self.head_dim, config.norm_eps
+                config.norm_type,
+                self.head_dim,
+                config.norm_eps,
+                sharding_config=config.norm_sharding_config,
             ).build()
         if config.mid_norm or config.norm_everywhere:
             mid_dim = (
@@ -277,7 +333,10 @@ class GatedNormSWAttention(GQAttention):
                 else self.head_dim
             )
             self.mid_norm = build_norm_config(
-                config.norm_type, mid_dim, config.norm_eps
+                config.norm_type,
+                mid_dim,
+                config.norm_eps,
+                sharding_config=config.norm_sharding_config,
             ).build()
 
         gate_init = {
@@ -288,7 +347,10 @@ class GatedNormSWAttention(GQAttention):
         if self.gated_attention_type == "head-wise":
             # G1-style: one gate per attention head.
             self.gate_proj = Linear.Config(
-                in_features=dim, out_features=self.n_heads, param_init=gate_init
+                in_features=dim,
+                out_features=self.n_heads,
+                param_init=gate_init,
+                sharding_config=config.linear_sharding_config,
             ).build()
         elif self.gated_attention_type == "element-wise":
             # Dense gate over the full attention output channel dimension.
@@ -296,6 +358,7 @@ class GatedNormSWAttention(GQAttention):
                 in_features=dim,
                 out_features=self.n_heads * self.head_dim,
                 param_init=gate_init,
+                sharding_config=config.linear_sharding_config,
             ).build()
 
     def _apply_rope(
@@ -344,28 +407,21 @@ class GatedNormSWAttention(GQAttention):
         if self.use_rope:
             xq, xk = self._apply_rope(xq, xk, positions)
 
+        # No sdpa branch: `build_inner_attention` delegates to upstream's
+        # `get_attention_config`, which RAISES for "sdpa" ("no longer supported for
+        # language models; positions are always available"), and `model.py:161-168`
+        # independently rejects any backend outside flex/flex_flash/varlen. Language
+        # models always use block_causal masking, which sdpa cannot express. Flex and
+        # varlen are natively token-flat, so there is no batch dim to add or drop.
         scale_kwargs = {"scale": self.scaling} if self.scaling is not None else {}
-        if self.attn_backend == "sdpa":
-            # Upstream's SDPA module still works in (B, L, H, K); add and drop
-            # the singleton batch dim at the kernel boundary. Flex and varlen
-            # are natively token-flat.
-            assert attention_masks is None
-            output = self.inner_attention(
-                xq.unsqueeze(0),
-                xk.unsqueeze(0),
-                xv.unsqueeze(0),
-                enable_gqa=self.enable_gqa,
-                **scale_kwargs,
-            ).squeeze(0)
-        else:
-            output = self.inner_attention(
-                xq,
-                xk,
-                xv,
-                attention_masks=attention_masks,
-                enable_gqa=self.enable_gqa,
-                **scale_kwargs,
-            )
+        output = self.inner_attention(
+            xq,
+            xk,
+            xv,
+            attention_masks=attention_masks,
+            enable_gqa=self.enable_gqa,
+            **scale_kwargs,
+        )
         output = output.contiguous()
 
         # "before" mid-norm: per-head norm applied before gating.
@@ -373,7 +429,11 @@ class GatedNormSWAttention(GQAttention):
         if self.mid_norm_position == "before" and not self.gate_only:
             output = self.mid_norm(output)
 
-        if self.gated_attention_type is not None:
+        # The string "none" is listed as a legal value for this field, but it
+        # is truthy: it entered this block, computed a full fp32 sigmoid over
+        # [T, D] and then matched neither branch below, so the result was
+        # discarded -- no gating, plus the cost of computing one.
+        if self.gated_attention_type not in (None, "none"):
             # Gate in float32 for numeric stability, then cast back.
             orig_dtype = output.dtype
             gate = torch.sigmoid(self.gate_proj(x_TD).float())
@@ -383,6 +443,12 @@ class GatedNormSWAttention(GQAttention):
             elif self.gated_attention_type == "element-wise":
                 # gate: [T, n_local_heads * head_dim]
                 output = (output.reshape(num_tokens, -1).float() * gate).to(orig_dtype)
+            else:
+                raise ValueError(
+                    f"unknown gated_attention_type "
+                    f"{self.gated_attention_type!r}; the gate would be "
+                    "computed and silently discarded."
+                )
 
         # "after" mid-norm: per-head or over the concatenated head output.
         if self.mid_norm_position == "after" and not self.gate_only:

@@ -2,11 +2,12 @@
 # Verification suite for the norm -> radial -> gram reordering, the new radial
 # spectral/radiality metrics, and the norm_helper cost controls.
 #
-#   cd <repo root>  &&  source llm_env/activate.sh
+#   source llm_env/activate.sh
 #   bash resources/torchtitan/tests/unit_tests/disco_metrics/run_all.sh
 #
-# Must be run from the repository root (the scripts add resources/torchtitan to
-# sys.path and the disco_ordering check reads disco.py by relative path).
+# Runs from any working directory: each script resolves the repo from __file__
+# rather than cwd. It used to work only from the outer repository root, and
+# failed elsewhere with a bare FileNotFoundError or ModuleNotFoundError.
 set -u
 D="$(cd "$(dirname "$0")" && pwd)"
 rc=0

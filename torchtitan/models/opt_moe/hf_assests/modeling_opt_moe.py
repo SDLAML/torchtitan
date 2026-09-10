@@ -6,7 +6,7 @@
 
 import logging
 from functools import wraps
-from typing import Any, Callable, Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.utils.checkpoint

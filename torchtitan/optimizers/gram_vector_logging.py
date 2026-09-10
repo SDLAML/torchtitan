@@ -204,7 +204,9 @@ def _parse_gram_short_name(short_name: str) -> tuple[str, int | None, int, str]:
 
     if name == "tok_embeddings":
         return metric_name, expert_idx, _EMBED_ROW, "EMBED" + transposed_suffix
-    if name == "output":
+    # 0.5.0 renamed the unembedding "output" -> "lm_head"; accept both so
+    # this keeps bucketing checkpoints and runs from either version.
+    if name in ("output", "lm_head"):
         return metric_name, expert_idx, _LM_HEAD_ROW, "LM_HEAD" + transposed_suffix
 
     dotted = name.split(".")

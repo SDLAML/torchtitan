@@ -220,6 +220,20 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
         self.load_only = config.load_only
         self.exclude_from_loading = config.exclude_from_loading
+        if config.reconfigure_lrs:
+            # Load the optimizer state but keep this run's learning rates.
+            # Only some containers implement this; setting the attribute on one that
+            # does not would accept the flag and silently ignore it, which is exactly
+            # the "resumed with the stale LR schedule" failure it exists to prevent.
+            if not hasattr(optimizers, "preserve_lrs_when_loading"):
+                raise ValueError(
+                    "checkpoint.reconfigure_lrs is set, but "
+                    f"{type(optimizers).__name__} does not support preserving learning "
+                    "rates across a load. Use torchtitan.optimizers.container."
+                    "OptimizersContainer (or an EMA wrapper around it)."
+                )
+            optimizers.preserve_lrs_when_loading = True
+
         self.initial_load_path = config.initial_load_path
         self.initial_load_model_only = config.initial_load_model_only
         self.initial_load_in_hf = config.initial_load_in_hf

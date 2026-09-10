@@ -23,7 +23,6 @@ sign update, and reports router entropy / max-violation metrics through an
 async logging queue.
 """
 
-import functools
 import queue
 import threading
 from collections.abc import Callable, Iterator
@@ -34,13 +33,15 @@ import torch
 import torch.distributed as dist
 import torch.distributed.tensor
 import torch.nn as nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.optim import Optimizer
+
+from torchtitan.components.checkpointer.utils import canonical_fqn
 
 from torchtitan.components.optimizer.optimizer import (
     OptimizersContainer as BaseOptimizersContainer,
 )
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.utils import fsdp_shard_mesh
 from torchtitan.optimizers import (
     create_disco_optimizer_kwargs_from_optimizer_config,
     create_disco_param_groups,
@@ -264,13 +265,51 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
             enable_export=config.enable_gram_export,
         )
 
+        # `param_groups` and `optimizer_factory_kwargs_by_name` are inherited
+        # from BaseOptimizersContainer.Config but this container does NOT honour
+        # them: DiSCO derives its groups from mesh topology and tensor role via
+        # `create_disco_param_groups` (+ `extra_param_group_split_rules`), and
+        # the non-DiSCO branch below takes a flat `model.parameters()`. Silently
+        # dropping a user's param_groups would mean training with different
+        # hyper-parameters than the config asks for, so refuse instead. Not
+        # implemented rather than not wanted -- wiring upstream's grouping into
+        # DiSCO's role-based split needs its own design.
+        if getattr(config, "param_groups", None):
+            raise ValueError(
+                "optimizers.param_groups is not supported by this container: "
+                "DiSCO builds its own groups from tensor role and mesh topology "
+                "(create_disco_param_groups). Use "
+                "optimizer.extra_param_group_split_rules instead."
+            )
+        if getattr(config, "optimizer_factory_kwargs_by_name", None):
+            raise ValueError(
+                "optimizers.optimizer_factory_kwargs_by_name is not supported "
+                "by this container; it is never read. Set the optimizer kwargs "
+                "directly on the optimizer config."
+            )
+
         for model in self.model_parts:
             if issubclass(optimizer_cls, DiSCO):
                 params, optimizer_kwargs = create_disco_param_groups(
                     model, optimizer_kwargs
                 )
             else:
-                params = [p for p in model.parameters() if p.requires_grad]
+                # `param_names` is REQUIRED by the inherited upstream
+                # `state_dict()` (components/optimizer/utils.py), which the
+                # 0.5.0 port started using when it dropped 0.4.0's override.
+                # Building from a bare parameter list left the group without it,
+                # so a non-DiSCO run (name="AdamW", the Config default) trained
+                # fine and then died at the first checkpoint with
+                # "Optimizer must be built with (name, param) tuples".
+                # Upstream's own `_build_param_groups` always sets it, and
+                # EMAOptimizersContainer already does the same thing.
+                named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+                params = [
+                    {
+                        "params": [p for _, p in named],
+                        "param_names": [canonical_fqn(n) for n, _ in named],
+                    }
+                ]
             self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
             all_params.extend(params)
 
@@ -387,15 +426,34 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
 
     def set_up_async_logging(self, log_fn: Callable):
         self.log_queue = queue.Queue()
-        self.log_thread = threading.Thread(target=log_fn, args=(self.log_queue,))
+        # daemon=True is the safety net for the teardown hang: the worker sits
+        # in a blocking `log_queue.get()` until it receives the None sentinel,
+        # and that sentinel is only sent by `close()`. Nothing in the tree
+        # called `close()`, so a NON-daemon worker kept the process alive after
+        # training finished -- jobs appeared to "hang in teardown" and had to be
+        # killed by the sbatch timeout. `Trainer.close()` now calls `close()`
+        # for a clean drain; daemon=True makes sure a missed call can never
+        # block process exit again.
+        self.log_thread = threading.Thread(
+            target=log_fn, args=(self.log_queue,), daemon=True
+        )
         self.log_thread.start()
         return self.log_queue
 
     def close(self):
+        """Drain and stop the async metrics worker. Idempotent."""
         if self.log_queue is not None:
             self.log_queue.put(None)
         if self.log_thread is not None:
-            self.log_thread.join()
+            # Bounded: a wedged worker must not turn shutdown into a hang.
+            self.log_thread.join(timeout=30.0)
+            if self.log_thread.is_alive():
+                logger.warning(
+                    "async metrics worker did not exit within 30s; abandoning it "
+                    "(it is a daemon thread, so it cannot block process exit)."
+                )
+        self.log_queue = None
+        self.log_thread = None
 
     def join_log_queue(self):
         if self.log_queue is not None:
@@ -433,59 +491,80 @@ def moe_metrics_worker(log_queue: queue.Queue):
         # 1. Wait for data from the main thread
         data = log_queue.get()
         if data is None:  # Sentinel to stop the thread
+            # Balance the get() before leaving, or `join_log_queue()` (called
+            # every logging step from the trainer) waits forever on an
+            # unfinished_tasks count that can never reach zero.
+            log_queue.task_done()
             break
 
-        (
-            moe_layers_info,
-            all_usages_cpu,
-            all_biases_cpu,
-            all_entropies_cpu,
-            all_load_balance_losses_cpu,
-            all_maxvio_batch_cpu,
-            all_maxvio_ema_cpu,
-            num_experts,
-        ) = data
+        # Any exception here used to kill the worker silently -- and then
+        # `join_log_queue()`, which the trainer calls every logging step,
+        # would block the MAIN thread forever on a queue nobody drains.
+        # daemon=True does not help there. Log and keep serving instead.
+        try:
+            (
+                moe_layers_info,
+                all_usages_cpu,
+                all_biases_cpu,
+                all_entropies_cpu,
+                all_load_balance_losses_cpu,
+                all_maxvio_batch_cpu,
+                all_maxvio_ema_cpu,
+                num_experts,
+            ) = data
 
-        usage_offset = bias_offset = 0
-        for i, info in enumerate(moe_layers_info):
-            moe = info["module"]
-            layer_id = info["layer_id"]
+            usage_offset = bias_offset = 0
+            for i, info in enumerate(moe_layers_info):
+                moe = info["module"]
+                layer_id = info["layer_id"]
 
-            layer_usages = all_usages_cpu[usage_offset : usage_offset + num_experts]
-            layer_biases = all_biases_cpu[bias_offset : bias_offset + num_experts]
-            usage_tensor = torch.tensor(layer_usages, dtype=torch.float32)
-            bias_tensor = torch.tensor(layer_biases, dtype=torch.float32)
-            metrics = {
-                f"moe_entropy/L-{layer_id}": all_entropies_cpu[i],
-                f"moe_maxvio_batch/L-{layer_id}": all_maxvio_batch_cpu[i],
-                f"moe_maxvio_ema/L-{layer_id}": all_maxvio_ema_cpu[i],
-                f"moe_load_balance_loss/L-{layer_id}": all_load_balance_losses_cpu[i],
-                f"moe_ep_usage_mean/L-{layer_id}": usage_tensor.mean().item(),
-                f"moe_ep_usage_std/L-{layer_id}": usage_tensor.std(
-                    unbiased=False
-                ).item(),
-                f"moe_bias_mean/L-{layer_id}": bias_tensor.mean().item(),
-                f"moe_bias_std/L-{layer_id}": bias_tensor.std(unbiased=False).item(),
-            }
-            pre_usage = f"moe_ep_usage/L-{layer_id}_EP-"
-            pre_bias = f"moe_bias/L-{layer_id}_EP-"
-            metrics.update({f"{pre_usage}{j}": v for j, v in enumerate(layer_usages)})
-            metrics.update({f"{pre_bias}{j}": v for j, v in enumerate(layer_biases)})
-            moe._log_expert_metrics = metrics
-            usage_offset += num_experts
-            bias_offset += num_experts
+                layer_usages = all_usages_cpu[usage_offset : usage_offset + num_experts]
+                layer_biases = all_biases_cpu[bias_offset : bias_offset + num_experts]
+                usage_tensor = torch.tensor(layer_usages, dtype=torch.float32)
+                bias_tensor = torch.tensor(layer_biases, dtype=torch.float32)
+                metrics = {
+                    f"moe_entropy/L-{layer_id}": all_entropies_cpu[i],
+                    f"moe_maxvio_batch/L-{layer_id}": all_maxvio_batch_cpu[i],
+                    f"moe_maxvio_ema/L-{layer_id}": all_maxvio_ema_cpu[i],
+                    f"moe_load_balance_loss/L-{layer_id}": all_load_balance_losses_cpu[
+                        i
+                    ],
+                    f"moe_ep_usage_mean/L-{layer_id}": usage_tensor.mean().item(),
+                    f"moe_ep_usage_std/L-{layer_id}": usage_tensor.std(
+                        unbiased=False
+                    ).item(),
+                    f"moe_bias_mean/L-{layer_id}": bias_tensor.mean().item(),
+                    f"moe_bias_std/L-{layer_id}": bias_tensor.std(
+                        unbiased=False
+                    ).item(),
+                }
+                pre_usage = f"moe_ep_usage/L-{layer_id}_EP-"
+                pre_bias = f"moe_bias/L-{layer_id}_EP-"
+                metrics.update(
+                    {f"{pre_usage}{j}": v for j, v in enumerate(layer_usages)}
+                )
+                metrics.update(
+                    {f"{pre_bias}{j}": v for j, v in enumerate(layer_biases)}
+                )
+                moe._log_expert_metrics = metrics
+                usage_offset += num_experts
+                bias_offset += num_experts
 
-        # Aggregated scalars across all MoE layers — attached to first layer
-        num_moe_layers = len(moe_layers_info)
-        moe_layers_info[0]["module"]._log_expert_metrics.update(
-            {
-                "moe_maxvio_batch/aggregate": sum(all_maxvio_batch_cpu)
-                / num_moe_layers,
-                "moe_maxvio_ema/aggregate": sum(all_maxvio_ema_cpu) / num_moe_layers,
-            }
-        )
+            # Aggregated scalars across all MoE layers — attached to first layer
+            num_moe_layers = len(moe_layers_info)
+            moe_layers_info[0]["module"]._log_expert_metrics.update(
+                {
+                    "moe_maxvio_batch/aggregate": sum(all_maxvio_batch_cpu)
+                    / num_moe_layers,
+                    "moe_maxvio_ema/aggregate": sum(all_maxvio_ema_cpu)
+                    / num_moe_layers,
+                }
+            )
 
-        log_queue.task_done()
+        except Exception:
+            logger.exception("async MoE metrics worker failed on one payload")
+        finally:
+            log_queue.task_done()
 
 
 def fused_hier_reduce_loss_stats(
@@ -499,16 +578,44 @@ def fused_hier_reduce_loss_stats(
         return
 
     # 1. Determine Topology
-    fsdp_mesh = parallel_dims.get_optional_mesh("fsdp")
+    fsdp_mesh = fsdp_shard_mesh(parallel_dims)
     dp_mesh = parallel_dims.get_optional_mesh("dp_replicate")
 
-    # Check if we can do hierarchical reduction
+    # Hierarchical reduction applies only under HSDP (both meshes present); every
+    # other topology takes the flat path. The two are mathematically equivalent --
+    # both SUM over the same rank set, both normalised by |loss mesh| -- verified
+    # across 18 mesh configurations under a fake process group, so the choice is a
+    # communication-cost one and needs no knob. (An env override lived here to
+    # isolate the reduce while chasing an apparent HSDP loss spread; that turned
+    # out to be seed noise, so the knob is gone.)
     use_hierarchical = (fsdp_mesh is not None) and (dp_mesh is not None)
 
-    # 2. Fuse & Pack (Float64)
-    t0 = all_tokens.reshape(-1).to(torch.float64)
-    t1 = all_entropies.reshape(-1).to(torch.float64)
-    t2 = all_load_balance_losses.reshape(-1).to(torch.float64)
+    # 2. Fuse & Pack (float32)
+    #
+    # fp32 is sufficient here, measured rather than assumed. Simulating the
+    # reduce (sequential-ring and tree orders, E=128, T=40960) at 64/128/1024
+    # ranks across expert spreads of 20%/1%/0.05% gives ZERO sign flips in all
+    # 18 cells. Error: at gas=1 the per-rank values are integral and the fp32
+    # reduce is EXACT; at gas=8 the `/sf` normalisation makes them non-integral
+    # and max relative error is ~1.3e-6 at 1024 ranks.
+    #
+    # Sign flips are the dominant concern because the default
+    # `bias_update_norm_factor` is `sign`, but NOT the only one: the `spectral`
+    # and `rms` factors are magnitude-sensitive, and at least one recorded
+    # config uses `bias_spectral`. 1.3e-6 relative is far below any meaningful
+    # change to those updates, but they are not sign-quantised, so the margin
+    # is the argument rather than exactness.
+    #
+    # Exact integer representation is also not at risk: fp32 is exact to 2^24 =
+    # 16.7M and the summed counts land near 2.6M. That is independent of
+    # gradient accumulation because `_update_expert_bias` divides by
+    # `acc_fwd_times` BEFORE calling this, so each rank contributes a
+    # per-forward mean. Do not move that division after the reduce -- a raw sum
+    # at gas=8 x 1024 ranks reaches 21M and would start rounding.
+    acc = torch.float32
+    t0 = all_tokens.reshape(-1).to(acc)
+    t1 = all_entropies.reshape(-1).to(acc)
+    t2 = all_load_balance_losses.reshape(-1).to(acc)
 
     buf = torch.cat([t0, t1, t2])
 
@@ -548,7 +655,13 @@ def register_moe_load_balancing_hook(
     parallel_dims: ParallelDims,
 ) -> OptimizersContainer:
 
-    log_queue = optimizers.set_up_async_logging(moe_metrics_worker)
+    # NOTE: the worker thread is started lazily, at the bottom of this
+    # function, only once `_should_register_moe_balancing_hook` says the hook
+    # will actually be registered. It cannot be decided here: the predicate is
+    # a nested `def` further down in this same function, so referencing it at
+    # this point makes Python treat the name as an unassigned local
+    # (UnboundLocalError) and kills every run.
+    log_queue = None
 
     def lmo_for_moe_bias(
         g,
@@ -571,13 +684,13 @@ def register_moe_load_balancing_hook(
             g = g / torch.clamp(rms, min=epsilon)
             g = g.squeeze(0) if is_flat else g
             return g
-
-    def need_rescale_stats(module):
-        return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
-
-    # for MoE auxiliary-loss-free load balancing
-    def _is_recomputation_enabled(module):
-        return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
+        raise ValueError(
+            f"unknown bias_update_norm_factor {norm_factor!r}. Returning None "
+            "here would reach torch._foreach_add_ as a None element, and a "
+            "near-miss like 'sign_zeromean' would silently drop zero-centring "
+            "because the zero_mean check is endswith('zero_mean'). Valid: "
+            "sign, spectral, rms, and their *_zero_mean variants."
+        )
 
     def _update_expert_bias(
         model_parts: list[nn.Module],
@@ -590,10 +703,16 @@ def register_moe_load_balancing_hook(
         loss_mesh = parallel_dims.get_optional_mesh("loss")
 
         # above is adapted from the upstream code
-        is_dp_rank_0 = (
-            torch.distributed.get_rank(loss_mesh.get_group()) == 0
-            if loss_mesh is not None
-            else True
+        #
+        # The `loss` mesh is dp_replicate x dp_shard x cp -- it does NOT contain
+        # tp (parallel_dims.py:311). So loss-rank 0 alone is true on EVERY tp
+        # rank, and under tp > 1 every one of them would push a payload for the
+        # same layers. TP ranks hold shards of the same router, not distinct
+        # work, so require tp local rank 0 as well. This mirrors the predicate
+        # in `components/metrics.py:478-481`. Inert at tp=1.
+        tp_mesh = parallel_dims.get_optional_mesh("tp")
+        is_dp_rank_0 = (loss_mesh is None or loss_mesh.get_local_rank() == 0) and (
+            tp_mesh is None or tp_mesh.get_local_rank() == 0
         )
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
         # default compute stream. Need to assess if this is OK performance-wise.
@@ -602,7 +721,6 @@ def register_moe_load_balancing_hook(
         tok_buffers, ent_buffers, load_balance_loss_buffers = [], [], []
         ema_buffers = []
         acc_fwd_times_buffers = []
-        scale_factor = 1
         num_experts = 0
 
         for part in model_parts:
@@ -611,94 +729,87 @@ def register_moe_load_balancing_hook(
                     continue
                 moe = block.moe
                 # Assuming num_experts is the same for all, so we can just grab it once
-                num_experts = moe.tokens_per_expert.numel()
+                layer_num_experts = moe.tokens_per_expert_E.numel()
+                if num_experts and layer_num_experts != num_experts:
+                    raise ValueError(
+                        "All MoE layers must have the same expert count: "
+                        f"layer {block.layer_id} has {layer_num_experts}, an "
+                        f"earlier layer has {num_experts}. The stats below are "
+                        "packed with `.view(num_layers, num_experts)`, which "
+                        "would silently mis-attribute them."
+                    )
+                num_experts = layer_num_experts
                 moe_layers_info.append(
                     {
                         "module": moe,
                         "layer_id": block.layer_id,
                     }
                 )
-                tok_buffers.append(moe.tokens_per_expert)
+                tok_buffers.append(moe.tokens_per_expert_E)
                 ema_buffers.append(moe.tokens_per_expert_cumul)
                 ent_buffers.append(moe.router_entropy)
-                # if need_rescale_stats(moe) or need_rescale_stats(block):
-                #     scale_factor = 0.5
                 acc_fwd_times_buffers.append(moe.acc_fwd_times)
                 load_balance_loss_buffers.append(moe.load_balance_loss)
         # Early exit if no MoE layers were found
         if not moe_layers_info:
             return
 
-        # assume all MoE layers are same
-        scale_factor = acc_fwd_times_buffers[-1]
+        # Everything below is [num_layers, num_experts]. The previous version
+        # flattened to 1-D and then rebuilt the per-layer structure with a
+        # `repeat_interleave` group index plus an `index_add_`; working 2-D
+        # directly drops that index tensor and four gather/scatter kernels, and
+        # removes a duplicated per-layer mean.
+        num_layers = len(moe_layers_info)
+        all_tokens = torch.stack(tok_buffers)  # [L, E]
+        all_entropies = torch.cat(ent_buffers)  # [L]
+        all_load_balance_losses = torch.cat(load_balance_loss_buffers)  # [L]
 
-        all_tokens = torch.cat(tok_buffers)
-        all_entropies = torch.cat(ent_buffers)
-        all_load_balance_losses = torch.cat(load_balance_loss_buffers)
-        if scale_factor != 1:
-            all_tokens = all_tokens // scale_factor  # tokens count are integers
-            all_entropies = all_entropies / scale_factor  # entropies are floats
+        # Every buffer above accumulates once per FORWARD, so each is a sum over
+        # `gradient_accumulation_steps * (1 + AC recomputes)` passes. Divide by
+        # each layer's OWN counter: taking the last layer's and applying it to
+        # all was correct only while activation checkpointing was uniform across
+        # layers, and silently wrong under per-layer/selective AC.
+        #
+        # `all_load_balance_losses` is normalised here too. It was previously
+        # left as a raw sum while `all_entropies` right beside it was averaged,
+        # so the logged `moe_load_balance_loss/L-*` scaled with `gas` and with
+        # AC -- not comparable across configs.
+        #
+        # Division is unconditional: `x / 1.0` is exact, so guarding it on
+        # `sf != 1` bought nothing and cost a `bool()` host sync every step.
+        # True division, not `//`: `tokens_per_expert_E` is float32, so `//`
+        # floored it and could collapse two distinct expert loads onto the same
+        # value, zeroing a bias update that should have been +/-1.
+        sf = torch.cat(acc_fwd_times_buffers).to(all_tokens.dtype).clamp_min(1.0)
+        all_tokens = all_tokens / sf.unsqueeze(1)
+        all_entropies = all_entropies / sf
+        all_load_balance_losses = all_load_balance_losses / sf
 
         if loss_mesh is not None:
-            # pg = loss_mesh.get_group()
-            # torch.distributed.all_reduce(
-            #     all_tokens, group=pg, op=torch.distributed.ReduceOp.SUM
-            # )
-            # torch.distributed.all_reduce(
-            #     all_entropies, group=pg, op=torch.distributed.ReduceOp.AVG
-            # )
-            # torch.distributed.all_reduce(
-            #     all_load_balance_losses, group=pg, op=torch.distributed.ReduceOp.AVG
-            # )
             fused_hier_reduce_loss_stats(
                 parallel_dims, all_tokens, all_entropies, all_load_balance_losses
             )
-        num_layers = len(moe_layers_info)
-        lens = torch.full(
-            (num_layers,), num_experts, device=all_tokens.device, dtype=torch.long
+
+        layer_sums = all_tokens.sum(dim=1, keepdim=True)  # [L, 1]
+        layer_means = layer_sums / num_experts  # [L, 1]
+
+        # Per-layer EMA: ema = beta * ema + (1 - beta) * step_counts.
+        torch._foreach_mul_(ema_buffers, MAXVIO_EMA_BETA)
+        torch._foreach_add_(
+            ema_buffers, list(all_tokens.unbind(0)), alpha=(1.0 - MAXVIO_EMA_BETA)
         )
-        grp = torch.repeat_interleave(
-            torch.arange(num_layers, device=all_tokens.device, dtype=torch.long), lens
-        )
 
-        layer_sums = torch.zeros(
-            num_layers, dtype=all_tokens.dtype, device=all_tokens.device
-        )
-        layer_sums.index_add_(0, grp, all_tokens)
-        layer_means = layer_sums / num_experts
-
-        # Globally-reduced per-step expert loads, used for both maxvio_batch and EMA maxvio.
-        step_counts_2d = all_tokens.view(num_layers, num_experts).float()
-        step_counts_split = list(step_counts_2d.unbind(0))
-
-        # Update per-layer EMA state: ema = beta * ema + (1 - beta) * step_counts.
-        try:
-            torch._foreach_mul_(ema_buffers, MAXVIO_EMA_BETA)
-            torch._foreach_add_(
-                ema_buffers, step_counts_split, alpha=(1.0 - MAXVIO_EMA_BETA)
-            )
-        except Exception:
-            for ema_buf, step_counts in zip(
-                ema_buffers, step_counts_split, strict=True
-            ):
-                ema_buf.mul_(MAXVIO_EMA_BETA).add_(
-                    step_counts, alpha=(1.0 - MAXVIO_EMA_BETA)
-                )
-
-        # MaxVio_batch: worst-case overload in current step window
-        layer_means_f = step_counts_2d.mean(dim=1)
-        max_per_layer = step_counts_2d.max(dim=1).values
-        maxvio_batch = (max_per_layer - layer_means_f) / (layer_means_f + MAXVIO_EPS)
+        # MaxVio_batch: worst-case overload in the current step window.
+        means = layer_means.squeeze(1)  # [L]
+        maxvio_batch = (all_tokens.max(dim=1).values - means) / (means + MAXVIO_EPS)
 
         # MaxVio_ema: worst-case overload over EMA-smoothed expert loads.
-        all_ema = torch.cat(ema_buffers).view(num_layers, num_experts)
+        all_ema = torch.stack(ema_buffers)  # [L, E]
         ema_means = all_ema.mean(dim=1)
         maxvio_ema = (all_ema.max(dim=1).values - ema_means) / (ema_means + MAXVIO_EPS)
 
-        # Vectorised deltas and usage
-        delta_flat = layer_means[grp] - all_tokens
-        recip = torch.clamp(layer_sums, min=1.0).reciprocal()
-        usage_flat = all_tokens * recip[grp]
+        delta_2d = layer_means - all_tokens  # [L, E]
+        usage_2d = all_tokens / layer_sums.clamp_min(1.0)  # [L, E]
 
         # Vectorized bias update calculation (replaces the loop)
         with torch.no_grad():
@@ -706,47 +817,62 @@ def register_moe_load_balancing_hook(
             first_moe = moe_layers_info[0]["module"]
             norm_factor = first_moe.bias_update_norm_factor
             load_balance_coeff = first_moe.load_balance_coeff
+            # Both are read from layer 0 and applied to every layer.
+            # `load_balance_coeff` consistency is already enforced by
+            # `_should_register_moe_balancing_hook`; `bias_update_norm_factor`
+            # was not checked at all, so a per-layer override was silently
+            # ignored rather than rejected.
+            for info in moe_layers_info[1:]:
+                if info["module"].bias_update_norm_factor != norm_factor:
+                    raise ValueError(
+                        "All MoE layers must share bias_update_norm_factor; "
+                        f"layer {info['layer_id']} has "
+                        f"{info['module'].bias_update_norm_factor!r}, layer 0 "
+                        f"has {norm_factor!r}."
+                    )
 
-            # Reshape for batched, per-layer operations
-            delta_2d = delta_flat.view(num_layers, num_experts)
-
-            # Calculate updates for all layers at once
             updates_2d = lmo_for_moe_bias(delta_2d, norm_factor=norm_factor)
 
             if norm_factor.endswith("zero_mean"):
                 updates_2d = updates_2d - updates_2d.mean(dim=1, keepdim=True)
 
             # Collect all bias parameters and update them with a single multi-tensor op
-            bias_params = [info["module"].expert_bias for info in moe_layers_info]
-            updates_list = list(updates_2d.flatten().split(num_experts))
+            bias_params = [info["module"].expert_bias_E for info in moe_layers_info]
+            torch._foreach_add_(
+                bias_params, list(updates_2d.unbind(0)), alpha=load_balance_coeff
+            )
 
-            torch._foreach_add_(bias_params, updates_list, alpha=load_balance_coeff)
-
-            # Reset router stats in bulk
-            try:
-                torch._foreach_mul_(tok_buffers, 0)
-                torch._foreach_mul_(ent_buffers, 0.0)
-                torch._foreach_mul_(acc_fwd_times_buffers, 0)
-                torch._foreach_mul_(load_balance_loss_buffers, 0.0)
-            except Exception:
-                for t in tok_buffers:
-                    t.zero_()
-                for t in ent_buffers:
-                    t.zero_()
-                for t in acc_fwd_times_buffers:
-                    t.zero_()
-                for t in load_balance_loss_buffers:
-                    t.zero_()
+            # Reset router stats in bulk.
+            torch._foreach_zero_(tok_buffers)
+            torch._foreach_zero_(ent_buffers)
+            torch._foreach_zero_(acc_fwd_times_buffers)
+            torch._foreach_zero_(load_balance_loss_buffers)
 
             if is_dp_rank_0:
-                all_usages_cpu = usage_flat.cpu().tolist()
-                all_biases_cpu = torch.cat(bias_params).cpu().tolist()
-                all_entropies_cpu = all_entropies.cpu().float().tolist()
-                all_load_balance_losses_cpu = (
-                    all_load_balance_losses.cpu().float().tolist()
-                )
-                all_maxvio_batch_cpu = maxvio_batch.cpu().tolist()
-                all_maxvio_ema_cpu = maxvio_ema.cpu().tolist()
+                # One packed D2H copy. Six separate `.cpu()` calls meant six
+                # device syncs per logging step for a few KB of scalars.
+                dt = usage_2d.dtype
+                packed = torch.cat(
+                    [
+                        usage_2d.reshape(-1),
+                        torch.stack(bias_params).reshape(-1).to(dt),
+                        all_entropies.to(dt),
+                        all_load_balance_losses.to(dt),
+                        maxvio_batch.to(dt),
+                        maxvio_ema.to(dt),
+                    ]
+                ).cpu()
+                n_le = num_layers * num_experts
+                all_usages_cpu = packed[:n_le].tolist()
+                all_biases_cpu = packed[n_le : 2 * n_le].tolist()
+                off = 2 * n_le
+                all_entropies_cpu = packed[off : off + num_layers].tolist()
+                off += num_layers
+                all_load_balance_losses_cpu = packed[off : off + num_layers].tolist()
+                off += num_layers
+                all_maxvio_batch_cpu = packed[off : off + num_layers].tolist()
+                off += num_layers
+                all_maxvio_ema_cpu = packed[off : off + num_layers].tolist()
                 payload = (
                     moe_layers_info,
                     all_usages_cpu,
@@ -760,15 +886,54 @@ def register_moe_load_balancing_hook(
                 log_queue.put(payload)
 
     def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
+        # Presence of an MoE layer is NOT sufficient -- upstream also requires
+        # `load_balance_coeff is not None`. `NormMoE.__init__` leaves
+        # `expert_bias_E = None` when the coeff is None, so registering the hook
+        # anyway makes `_update_expert_bias` call `torch._foreach_add_` with a
+        # None element and die at the first optimizer step. Mirrors upstream's
+        # `components/optimizer/optimizer.py::_should_register_moe_balancing_hook`,
+        # including its consistency check across layers.
+        moes = []
         for model_part in model_parts:
             layers = model_part.get_submodule("layers")
             assert isinstance(layers, nn.ModuleDict)
             for transformer_block in layers.values():
                 if transformer_block.moe_enabled:
-                    return True
-        return False
+                    moes.append(transformer_block.moe)
+        if not moes:
+            return False
+        enabled = moes[0].load_balance_coeff is not None
+        for moe in moes[1:]:
+            if (moe.load_balance_coeff is not None) != enabled:
+                raise ValueError(
+                    "MoE load_balance_coeff must be configured consistently "
+                    "across all MoE layers. Either set it for every MoE layer "
+                    "or leave it unset for all MoE layers."
+                )
+        return enabled
 
     if _should_register_moe_balancing_hook(model_parts):
+        # Upstream's `_update_expert_bias` all-reduces `tokens_per_expert_E`
+        # over `get_dense_tp_mesh()` when `ep_enabled and tp > 1`
+        # (components/optimizer/optimizer.py). This container reduces only over
+        # the `loss` mesh, which excludes tp, so under EP+TP each rank would
+        # bias its experts on its own tp shard's token counts -- silently wrong,
+        # never crashing. Refuse rather than train on it. No recipe in the tree
+        # sets tensor_parallel_degree > 1, so this is inert today; implementing
+        # the reduction needs a real EP+TP run to validate, not a fake pg.
+        if parallel_dims.ep_enabled and parallel_dims.tp > 1:
+            raise NotImplementedError(
+                "MoE load-balancing bias updates are not implemented for "
+                f"EP + TP (ep={parallel_dims.ep}, tp={parallel_dims.tp}): the "
+                "expert token counts are reduced over the 'loss' mesh only, "
+                "which excludes the tp axis, so each rank would see just its "
+                "own tp shard's counts. Run with tensor_parallel_degree=1, or "
+                "add the dense-tp all_reduce that upstream performs."
+            )
+        # Start the async metrics worker only now: a dense run, or one with
+        # load_balance_coeff=None, would otherwise spawn an idle daemon
+        # thread that nothing ever feeds.
+        log_queue = optimizers.set_up_async_logging(moe_metrics_worker)
         optimizers.register_step_pre_hook(
             lambda *args, **kwargs: _update_expert_bias(
                 model_parts, parallel_dims=parallel_dims

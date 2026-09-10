@@ -10,29 +10,24 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import and_masks
 
 from torchtitan.models.common.attention import (
     AttentionMasksType,
-    FlexAttention,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
-    VarlenAttention,
+    ScaledDotProductAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.rope import RoPE
-from torchtitan.models.utils import (
-    get_nparams_and_active_nparams,
-    quadratic_attention_flops_per_token,
-)
+from torchtitan.models.utils import quadratic_attention_flops_per_token
 from torchtitan.tools.logging import logger
 from .gated_norm_swattention import GatedNormSWAttention
+from .norm_moe import get_nparams_and_active_nparams
 from .utils.inits import (
-    build_init_fn,
     make_param_init,
     parse_depth_init,
     setup_depth_init,
@@ -141,11 +136,31 @@ class OPTMoETransformerBlock(TransformerBlock):
 
         # Pre-compute the mask dict key used in forward() so we avoid string
         # comparisons and conditional logic on every training step.
-        #   None  → SDPA (no mask; PyTorch applies causal masking internally)
         #   "swa" → FlexAttention with sliding-window mask
         #   "full"→ FlexAttention with full-causal mask
-        if self.attn_backend == "sdpa":
-            self._mask_key: str | None = None
+        # SDPA is not reachable through `build_inner_attention` any more (it
+        # delegates to upstream's `get_attention_config`, which raises for
+        # language models), but a hand-built `inner_attention=
+        # ScaledDotProductAttention.Config()` could still land here. Refuse it
+        # rather than silently returning a None mask key, which is what made
+        # attention span document boundaries in the first place.
+        self._mask_key: str | None
+        # "flex_flash" is also a flex backend: get_attention_config maps it to a
+        # FlexAttention.Config with FLASH kernel options, so it takes a mask.
+        # Check the RESOLVED inner attention, not just the backend string: a
+        # hand-built `inner_attention=ScaledDotProductAttention.Config()` keeps
+        # whatever `attn_backend` says while actually running SDPA, and SDPA
+        # cannot take a mask at all (it only has a boolean is_causal), which is
+        # exactly what made attention span document boundaries.
+        _inner = getattr(config.attention, "inner_attention", None)
+        _is_sdpa = isinstance(_inner, ScaledDotProductAttention.Config)
+        if self.attn_backend not in ("flex", "flex_flash", "varlen") or _is_sdpa:
+            raise ValueError(
+                f"attn_backend={self.attn_backend!r} / "
+                f"inner_attention={type(_inner).__name__} cannot carry a "
+                "document mask; token-flat batches need per-document positions. "
+                "Use 'flex', 'flex_flash' or 'varlen'."
+            )
         elif self.use_swa:
             self._mask_key = "swa"
         else:
@@ -173,6 +188,22 @@ class OPTMoETransformerBlock(TransformerBlock):
         self.block_scale, self.identity_scale = setup_residual_scale(
             config.residual_scale, config.n_layers
         )
+        # Skip each multiply INDEPENDENTLY when its scale is 1.0.
+        #
+        # `1.0 * x` is what breaks AC + per-block compile: it makes `x` feed two
+        # branches and the resulting gradient-accumulation add becomes a graph
+        # output the min-cut partitioner rejects. Measured in pure torch, with
+        # checkpoint_wrapper + per-block compile:
+        #     a=1.0 b=1.0     -> FAIL        a=0.5 b=1.0 -> OK
+        #     a=1.0 b=0.5     -> FAIL        a=0.5 b=0.5 -> OK
+        # i.e. it fails iff identity_scale == 1.0. A NON-unit identity scale is
+        # fine, so `depth_scale_R`/`depth_scale_N` were never affected.
+        #
+        # Requiring BOTH scales to be 1.0 would miss `complete_p_R`/`complete_p_N`,
+        # which have identity_scale == 1.0 with a non-unit block_scale -- they
+        # would still take the multiply path and still fail. Hence per-term.
+        self._skip_identity_mul = self.identity_scale == 1.0
+        self._skip_block_mul = self.block_scale == 1.0
 
     def extra_repr(self) -> str:
         return (
@@ -189,6 +220,7 @@ class OPTMoETransformerBlock(TransformerBlock):
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
+        doc_id: torch.Tensor | None = None,
     ) -> "tuple[torch.Tensor, torch.Tensor | None]":
         """Forward pass through the block.
 
@@ -203,25 +235,41 @@ class OPTMoETransformerBlock(TransformerBlock):
             ``(output, lbl_loss)`` -- ``lbl_loss`` is this layer's load-balance
             loss on MoE layers and ``None`` on dense layers.
         """
-        # _mask_key is pre-computed at init; no string comparisons or tensor ops here.
-        if self._mask_key is None:
-            layer_mask = None  # SDPA: causal masking is handled internally by PyTorch
-        elif isinstance(attention_masks, dict):
+        # _mask_key is pre-computed at init; no string comparisons or tensor ops
+        # here. It is never None -- __init__ raises for the only backend that
+        # produced None (sdpa) -- so there is no maskless path left.
+        if isinstance(attention_masks, dict):
             layer_mask = attention_masks[self._mask_key]
         else:
             layer_mask = attention_masks  # single BlockMask (backward compat)
 
-        h = self.identity_scale * x + self.block_scale * self.attention(
-            self.attention_norm(x), layer_mask, positions
-        )
+        # Unit scales are skipped, not multiplied. `residual_scale="identity"`
+        # gives block_scale == identity_scale == 1.0, so `1.0 * x + 1.0 * f(x)`
+        # is mathematically `x + f(x)` -- but the explicit multiplies make `x`
+        # feed two branches, and the resulting gradient-accumulation node breaks
+        # the min-cut partitioner under activation checkpointing + per-block
+        # compile: "AssertionError: Node add_N was invalid, but is output"
+        # (torch 2.15.0.dev20260906). Reproduced in pure torch: a*x + b*f(x)
+        # under checkpoint_wrapper + per-block compile fails, x + f(x) does not.
+        # Taking the plain path when the scales are unit costs nothing and
+        # restores AC. Non-unit scales still hit the torch bug -- see the
+        # migration doc.
+        _attn_out = self.attention(self.attention_norm(x), layer_mask, positions)
+        _lhs = x if self._skip_identity_mul else self.identity_scale * x
+        _rhs = _attn_out if self._skip_block_mul else self.block_scale * _attn_out
+        h = _lhs + _rhs
 
         if self.moe_enabled:
-            mlp_output, lbl_loss = self.moe(self.ffn_norm(h), loss_mask)
+            mlp_output, lbl_loss = self.moe(
+                self.ffn_norm(h), loss_mask, positions=positions, doc_id=doc_id
+            )
         else:
             mlp_output = self.feed_forward(self.ffn_norm(h))
             lbl_loss = None
 
-        return self.identity_scale * h + self.block_scale * mlp_output, lbl_loss
+        _lhs = h if self._skip_identity_mul else self.identity_scale * h
+        _rhs = mlp_output if self._skip_block_mul else self.block_scale * mlp_output
+        return _lhs + _rhs, lbl_loss
 
 
 class OPTMoEModel(Decoder):
@@ -245,6 +293,9 @@ class OPTMoEModel(Decoder):
         rope: RoPE.Config
         norm_eps: float = 1e-30
         norm_type: str = "np_rmsnorm"
+        norm_sharding_config: Any | None = None
+        """Sharding plan for `embeddings_norm`, which this config builds
+        internally. See GatedNormSWAttention.Config.norm_sharding_config."""
 
         first_in_init_fn_type: str = "scion_normal_input"
         first_in_init_std: float = 1.0
@@ -345,16 +396,19 @@ class OPTMoEModel(Decoder):
                         init_gate_as_residual=self.layer.init_gate_as_residual,
                     )
                 else:
-                    assert self.layer.moe is not None, (
-                        f"layer {layer_id} is an MoE layer but no moe config is set"
-                    )
+                    assert (
+                        self.layer.moe is not None
+                    ), f"layer {layer_id} is an MoE layer but no moe config is set"
+                    # Flat authoring config -> upstream-shaped NormMoE.Config,
+                    # so update_ep_token_dispatcher_config can find
+                    # routed_experts and swap in an EP dispatcher.
                     moe_cfg = _dc.replace(
                         self.layer.moe,
                         dim=self.dim,
                         layer_id=layer_id,
                         residual_div=residual_div_ffn,
                         init_gate_as_residual=self.layer.init_gate_as_residual,
-                    )
+                    ).to_norm_moe_config()
 
                 layers.append(
                     _dc.replace(
@@ -458,24 +512,39 @@ class OPTMoEModel(Decoder):
             nparams, active_nparams = get_nparams_and_active_nparams(model)
             base_attn = self.layer.attention
             assert isinstance(base_attn, GatedNormSWAttention.Config)
-            head_dim = (
-                base_attn.head_dim
-                if base_attn.head_dim is not None
-                else self.dim // base_attn.n_heads
-            )
-            attention_op_flops = self.n_layers * quadratic_attention_flops_per_token(
-                num_heads=base_attn.n_heads,
-                qk_head_dim=head_dim,
-                v_head_dim=head_dim,
-                seq_len=seq_len,
-            )
+            # Per layer, not n_layers * template: with `swa_pattern` the windowed
+            # layers cost far less than full attention, and costing them all as
+            # full inflates the attention term (measured 2.91x on a swa_512
+            # flavor) and therefore every reported MFU/TFLOPs number. Matches
+            # gpt_oss, the other SWA model. Note opt_moe encodes "no window" as
+            # -1 while the helper expects None; passing -1 raw would silently
+            # produce min(seq_len, -1).
+            attention_op_flops = 0
+            for layer in self.layers:
+                layer_attn = layer.attention
+                window = getattr(layer_attn, "sliding_window_size", -1)
+                layer_head_dim = (
+                    layer_attn.head_dim
+                    if layer_attn.head_dim is not None
+                    else self.dim // layer_attn.n_heads
+                )
+                attention_op_flops += quadratic_attention_flops_per_token(
+                    num_heads=layer_attn.n_heads,
+                    qk_head_dim=layer_head_dim,
+                    v_head_dim=layer_head_dim,
+                    seq_len=seq_len,
+                    sliding_window_size=window if window > 0 else None,
+                )
             return nparams, 6 * active_nparams + attention_op_flops
 
     def __init__(self, config: Config):
         super().__init__(config)
         if config.use_embeddings_norm:
             self.embeddings_norm = build_norm_config(
-                config.norm_type, config.dim, config.norm_eps
+                config.norm_type,
+                config.dim,
+                config.norm_eps,
+                sharding_config=config.norm_sharding_config,
             ).build()
         else:
             self.embeddings_norm = Identity.Config().build()
@@ -486,6 +555,7 @@ class OPTMoEModel(Decoder):
         positions: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
         loss_mask: torch.Tensor | None = None,
+        doc_id: torch.Tensor | None = None,
         accumulated_load_balance_loss: torch.Tensor | None = None,
     ):
         """Forward pass.
@@ -504,13 +574,21 @@ class OPTMoEModel(Decoder):
         """
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-        h = self.embeddings_norm(h)
+        # PP nulls any root child not in [tok_embeddings, layers.*, norm,
+        # lm_head] (distributed/pipeline_parallel.py::_split_module), and
+        # `embeddings_norm` is not in that list, so under PP every stage
+        # gets None here and an unguarded call raises. Guarding keeps PP
+        # from crashing; note a stage-0 `use_embeddings_norm=True` model
+        # would then lose the norm, so PP + use_embeddings_norm still
+        # needs it folded into tok_embeddings. Not done: PP is unused.
+        if self.embeddings_norm is not None:
+            h = self.embeddings_norm(h)
 
         # Collect per-layer load-balance losses; accumulation happens after the
         # loop so we never thread a running tensor through every layer signature.
         local_lbl_loss: torch.Tensor | None = None
         for layer in self.layers.values():
-            h, lbl = layer(h, attention_masks, positions, loss_mask)
+            h, lbl = layer(h, attention_masks, positions, loss_mask, doc_id)
             if lbl is not None:
                 local_lbl_loss = lbl if local_lbl_loss is None else local_lbl_loss + lbl
 
@@ -544,7 +622,7 @@ class OPTMoEModel(Decoder):
             Delegates to ``super()`` for varlen.
         """
         has_flex = any(
-            getattr(layer, "attn_backend", "sdpa") == "flex"
+            getattr(layer, "attn_backend", "sdpa") in ("flex", "flex_flash")
             for layer in self.layers.values()
         )
         has_swa = any(
@@ -560,7 +638,29 @@ class OPTMoEModel(Decoder):
         if has_varlen:
             return super().get_attention_masks(positions)
         if not has_flex:
-            # All SDPA — PyTorch handles causal masking internally.
+            # All SDPA -- PyTorch handles causal masking internally, which can
+            # only ever be plain causal. SDPA cannot express a document mask,
+            # so silently returning None here would drop a `block_causal`
+            # request on the floor; 0.4.0 rejected this combination explicitly
+            # and that guard must not be lost. It matters more under 0.5.0 than
+            # it did under 0.4.0: batches are token-flat now, so plain causal
+            # spans the whole concatenated stream and attends across the
+            # document boundaries that `positions` resets mark, while RoPE has
+            # already restarted at each one.
+            # Read from the layer *template*, not `self.config.layers[i]`:
+            # attn_mask_type is uniform across layers (it selects which masks to
+            # build for the whole model), and the window has to come from the
+            # template too because expanded non-SWA layers carry -1. A per-layer
+            # attn_mask_type override would therefore be ignored -- that is not
+            # a supported configuration.
+            base_attn = self.config.layer.attention
+            mask_type = getattr(base_attn, "attn_mask_type", "causal")
+            if mask_type != "causal":
+                raise ValueError(
+                    f"attn_mask_type {mask_type!r} requires attn_backend='flex'; "
+                    "SDPA only supports 'causal'. Set the attention's "
+                    "attn_backend to 'flex', or use 'causal'."
+                )
             return None
 
         # Document boundaries now come from `positions` resetting to 0 rather
@@ -586,9 +686,7 @@ class OPTMoEModel(Decoder):
                 positions, attn_config, mask_mods
             )
         else:
-            raise ValueError(
-                f"Unknown attn_mask_type: {base_attn.attn_mask_type!r}"
-            )
+            raise ValueError(f"Unknown attn_mask_type: {base_attn.attn_mask_type!r}")
         if not has_swa:
             return {"full": full_mask}
 
@@ -614,6 +712,31 @@ class OPTMoEModel(Decoder):
         layout matches the hidden states the router sees; building it before CP
         would leave it full-length and break indexing inside the router.
         """
+        # Derive the document id from the GLOBAL positions, BEFORE
+        # `super().preprocess_inputs` CP-shards them. `doc_id` is registered in
+        # `decoder_input_sharding()`, so it is sharded with the same load
+        # balancer as `positions` and returns inside `extra_kwargs`.
+        #
+        # Why: under the default "headtail" balancer a CP rank receives two
+        # NON-adjacent global chunks concatenated, and the join carries no
+        # `positions == 0`. Segmenting on positions alone therefore merges the
+        # tail of one document with the middle of another whenever the two
+        # happen to line up -- ~0.1% of rank/step pairs for ragged packing, but
+        # DETERMINISTIC for equal-length documents. An id computed before
+        # sharding cannot be fooled by the seam.
+        positions = input_dict.get("positions", None)
+        if positions is not None:
+            flat = positions.reshape(-1)
+            starts = torch.ones_like(flat, dtype=torch.bool)
+            starts[1:] = flat[1:] != (flat[:-1] + 1)
+            input_dict = dict(input_dict)
+            # Cast AFTER the cumsum: `torch.cumsum` promotes every integer
+            # dtype to int64, so casting the input was dead code and the
+            # tensor went through `cp_shard` at 8 B/token instead of 4.
+            input_dict["doc_id"] = (
+                torch.cumsum(starts, dim=0).to(torch.int32).reshape(positions.shape)
+            )
+
         inputs, labels, extra_kwargs = super().preprocess_inputs(
             input_dict, parallel_dims=parallel_dims, parallelism=parallelism
         )

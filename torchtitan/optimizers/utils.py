@@ -228,9 +228,28 @@ def create_disco_param_groups(
         assert len(group_params["params"]) == len(group_params["param_names"])
 
         if len(param_names) == 0:
+            # WARN, not raise. Upstream raises here, but this fork has per-flavor
+            # OPTIONAL modules, so a rule can legitimately match nothing: e.g.
+            # `\.attention.gate_proj.weight` matches zero params on any flavor
+            # with `gated_attention_type=None`, because gate_proj is an Identity
+            # with no parameters -- and three live recipes carry exactly that
+            # rule. A raise broke them.
+            #
+            # The risk this warning covers is real though: unmatched params stay
+            # in the DEFAULT group, i.e. trained with a different norm factor
+            # than the recipe asked for. That is what the `_legacy_name` shim
+            # exists to prevent for the 0.5.0 `output.weight` -> `lm_head`
+            # rename. If you see this for a rule you expect to match, check for
+            # a renamed FQN before assuming the module is simply absent.
             logger.warning(
-                f'\033[31m Notice: No parameters found for `str_match` "{str_match}" on '
-                f"global rank {torch.distributed.get_rank()}\033[0m"
+                "\033[31mNo parameters matched optimizer param-group rule "
+                '`str_match` "%s" on global rank %s. Those parameters (if any) '
+                "stay in the default group with its norm factor. This is "
+                "expected when the module is absent for this flavor (e.g. "
+                "gate_proj under gated_attention_type=None), and a BUG if the "
+                "FQN was renamed.\033[0m",
+                str_match,
+                torch.distributed.get_rank(),
             )
             continue
         group_params.update(group_config)

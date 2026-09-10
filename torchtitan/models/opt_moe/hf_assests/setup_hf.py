@@ -157,7 +157,7 @@ def get_hf_config_overrides_from_model_config(model, model_config=None) -> dict:
         ),
         # HF router always runs its matmul in fp32 for deterministic routing behavior.
         "force_router_on_fp32": True,
-        "max_position_embeddings": model_config.rope.max_seq_len,
+        "max_position_embeddings": model_config.rope.max_context_length,
         "num_attention_heads": attn_cfg.n_heads,
         "num_key_value_heads": _num_key_value_heads_from_model_config(model_config),
         "head_dim": head_dim,

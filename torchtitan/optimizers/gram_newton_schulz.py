@@ -77,7 +77,7 @@ def _quack_ops():
     global _QUACK
     if _QUACK is None:
         try:
-            from quack.gemm_interface import gemm, gemm_add, gemm_symmetric
+            from quack.gemm_interface import gemm, gemm_symmetric
 
             _QUACK = (
                 gemm_symmetric,

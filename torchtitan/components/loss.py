@@ -834,7 +834,13 @@ class MoEAuxLoss(BaseLoss):
         )
         self.inner = inner_config.build(compile_config=compile_config)
         # BaseLoss.fn is unused here: __call__ delegates to the inner loss.
-        self.fn = self.inner.fn
+        # getattr, not attribute access: ChunkedLossWrapper deliberately has no
+        # `.fn` (it keeps `self.loss_fn` and chunks around it), so a bare
+        # `self.inner.fn` made `MoEAuxLoss(inner=ChunkedLossWrapper(...))` raise
+        # AttributeError at build -- which is exactly the combination the
+        # trainer's `loss_fn.inner` unwrapping exists to support, and the only
+        # way to bound peak logits memory at this vocab size.
+        self.fn = getattr(self.inner, "fn", None)
 
     def __call__(
         self,
@@ -853,6 +859,21 @@ class MoEAuxLoss(BaseLoss):
         loss, metrics = self.inner(pred, labels, global_valid_tokens, **kwargs)
         if aux_loss is not None:
             # Straight-through: gradient of aux flows, its value does not.
+            #
+            # Divide by the accumulation count. The CE term is normalized by
+            # `global_valid_tokens`, which is summed over the WHOLE accumulation
+            # window, so its gradient is invariant to gradient_accumulation_steps.
+            # The aux term is added once per MICROBATCH, so without this its
+            # gradient scales linearly with `gas` -- measured ratio 2.0000002 at
+            # gas=2 vs gas=1, while CE was bit-identical. That makes
+            # `load_balance_loss_weight` mean something different at every
+            # accumulation setting. NOTE this is deliberately NOT 0.4.0's
+            # behaviour: 0.4.0 also folded the aux term into the
+            # /global_valid_tokens normalization, which made it shrink as the
+            # batch grew.
+            aux_scale = max(1, int(getattr(self, "gradient_accumulation_steps", 1)))
+            if aux_scale != 1:
+                aux_loss = aux_loss / aux_scale
             loss = loss + (aux_loss - aux_loss.detach())
             metrics = {**metrics, "moe_load_balance_loss": aux_loss.detach()}
         return loss, metrics

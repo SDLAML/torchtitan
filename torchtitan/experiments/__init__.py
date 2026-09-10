@@ -14,7 +14,6 @@ _supported_experiments = frozenset(
         "autoparallel.llama3",
         "autoparallel.local_map_deepseek_v3",
         "torchft.llama3",
-        "sft",
         "rl",
         # RL examples own a per-example config_registry under rl/examples/<name>;
         # listed here so `--module <name>` resolves (see ConfigManager).

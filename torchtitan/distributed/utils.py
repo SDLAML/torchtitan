@@ -774,6 +774,46 @@ def get_param_dtype(module: torch.nn.Module) -> torch.dtype | None:
 # ---------------------------------------------------------------------------
 
 
+def fsdp_shard_mesh(parallel_dims: "ParallelDims") -> DeviceMesh | None:
+    """The mesh FSDP shards parameters over, under EITHER spmd backend.
+
+    ``parallelism.spmd_backend`` decides how the device mesh is NAMED, not how
+    it is laid out (``distributed/parallel_dims.py``):
+
+    * ``partial_dtensor`` folds ``dp_shard`` and ``cp`` into a single ``fsdp``
+      axis, so ``get_optional_mesh("fsdp")`` works.
+    * ``spmd_types`` keeps them separate -- there IS no ``fsdp`` axis and asking
+      for one raises ``ValueError: Invalid mesh dim: 'fsdp'``. FSDP shards over
+      ``["dp_shard"] (+ ["cp"] when cp > 1)`` there (``distributed/fsdp.py``),
+      which is the SAME device set.
+
+    Verified equivalent at world_size 8: ``fsdp`` is 8 under partial_dtensor for
+    both cp=1 and cp=2; under spmd_types ``dp_shard`` is 8 at cp=1 and
+    ``["dp_shard", "cp"]`` is 8 at cp=2.
+
+    Resolving by backend instead of hard-coding ``"fsdp"`` is what lets DiSCO
+    run under both. It matters beyond Context Parallel: ``partial_dtensor`` is
+    slated for removal upstream (four ``TODO: remove once the partial_dtensor
+    backend is removed`` markers), so hard-coding the name is on borrowed time.
+    """
+    if not parallel_dims.fsdp_enabled:
+        return None
+    if getattr(parallel_dims, "spmd_backend", "spmd_types") == "partial_dtensor":
+        return parallel_dims.get_optional_mesh("fsdp")
+    if not parallel_dims.cp_enabled:
+        return parallel_dims.get_optional_mesh("dp_shard")
+    # With CP on, FSDP shards over dp_shard AND cp (distributed/fsdp.py builds
+    # DataParallelMeshDims(shard=("dp_shard", "cp"))) and `fully_shard`
+    # FLATTENS them into a single "dp_shard_cp" axis. Returning the 2-D
+    # ("dp_shard", "cp") submesh here looks right by `.size()` but is unusable:
+    # `get_group()` and `get_local_rank()` both raise on a mesh with ndim > 1,
+    # which is every caller that does more than ask for the size.
+    sub = parallel_dims.get_optional_mesh(["dp_shard", "cp"])
+    if sub is None:
+        return None
+    return sub._flatten("dp_shard_cp")
+
+
 def metrics_shard_mesh(parallel_dims: "ParallelDims") -> DeviceMesh | None:
     """The mesh DiSCO spreads per-parameter metric ownership over.
 
@@ -793,7 +833,7 @@ def metrics_shard_mesh(parallel_dims: "ParallelDims") -> DeviceMesh | None:
     or PP/TP only), i.e. one rank owns everything.
     """
     if parallel_dims.fsdp_enabled:
-        return parallel_dims.get_optional_mesh("fsdp")
+        return fsdp_shard_mesh(parallel_dims)
     if parallel_dims.dp_replicate_enabled:
         return parallel_dims.get_optional_mesh("dp_replicate")
     return None

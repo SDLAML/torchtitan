@@ -7,7 +7,14 @@
 """Static checks on disco.py (plan Verification steps 6-7)."""
 import ast, re, sys
 
-SRC = "resources/torchtitan/torchtitan/optimizers/disco.py"
+import os as _os
+
+_REPO = _os.path.abspath(
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "..")
+)
+# Resolved from __file__, not cwd: the suite used to run only from the outer
+# repository root and failed here with a bare FileNotFoundError anywhere else.
+SRC = _os.path.join(_REPO, "torchtitan", "optimizers", "disco.py")
 src = open(SRC).read()
 tree = ast.parse(src)
 fails = []

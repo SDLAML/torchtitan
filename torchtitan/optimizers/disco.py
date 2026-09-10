@@ -16,7 +16,12 @@ from torch.distributed.tensor.placement_types import _StridedShard, Replicate, S
 
 from torch.profiler import record_function  # labels in PyTorch profiler
 
-from torchtitan.distributed.utils import metrics_shard_rank, rank_owns_metrics_shard
+from torchtitan.distributed.utils import (
+    fsdp_shard_mesh,
+    metrics_shard_rank,
+    rank_owns_metrics_shard,
+)
+from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import logger
 
 from . import gram_helper, norm_helper, power_iteration
@@ -121,9 +126,33 @@ def _is_fsdp_row_sharded(p) -> bool:
     if not isinstance(p, DTensor):
         return False
     mesh_dim_names = p.device_mesh.mesh_dim_names
-    if not mesh_dim_names or "fsdp" not in mesh_dim_names:
+    if not mesh_dim_names:
         return False
-    placement = p.placements[mesh_dim_names.index("fsdp")]
+    # The axis FSDP shards over is NAMED differently per spmd backend: it is
+    # "fsdp" under partial_dtensor (which folds dp_shard and cp together) and
+    # "dp_shard" under spmd_types, which keeps them separate. Same devices --
+    # see distributed/utils.fsdp_shard_mesh. Checking only "fsdp" made this
+    # silently return False under spmd_types, so a genuinely row-sharded param
+    # would be treated as replicated.
+    # "fsdp" under partial_dtensor; under spmd_types FSDP shards over
+    # dp_shard (+cp) and flattens them, so the param's mesh axis is named
+    # "dp_shard_cp" when CP is on and "dp_shard" when it is not.
+    axis = next(
+        (n for n in ("fsdp", "dp_shard_cp", "dp_shard") if n in mesh_dim_names),
+        None,
+    )
+    if axis is None:
+        return False
+    idx = mesh_dim_names.index(axis)
+    # Size matters, not just the name: `_mesh_exist` deliberately KEEPS "fsdp"
+    # (partial_dtensor) and "dp_shard" (spmd_types) alive at size 1 so
+    # fully_shard can still install a MixedPrecisionPolicy. A Shard(0) placement
+    # on a size-1 axis means the local view holds ALL the rows, i.e. the param
+    # is not row-sharded at all, and reporting True there mis-keys the pre-norm
+    # shape groups.
+    if p.device_mesh.size(idx) <= 1:
+        return False
+    placement = p.placements[idx]
     return isinstance(placement, Shard) and placement.dim == 0
 
 
@@ -1004,7 +1033,7 @@ class DiSCO(AbstractDiSCO):
         if not self.fsdp_params:
             return
 
-        fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
+        fsdp_mesh = fsdp_shard_mesh(self.parallel_dims)
         world_size = fsdp_mesh.size()
         rank = fsdp_mesh.get_local_rank()
         self._fsdp_world_size = world_size  # cached for _prepare_fsdp_lmo()
@@ -1351,7 +1380,7 @@ class DiSCO(AbstractDiSCO):
         self._fsdp_gram_vec_offsets: list[int] = []
         if not self.fsdp_params:
             return
-        fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
+        fsdp_mesh = fsdp_shard_mesh(self.parallel_dims)
         rank = fsdp_mesh.get_local_rank()
         n_vec = len(self.gram_vector_names)
         self._fsdp_gram_vec_len_by_param = [
@@ -1419,7 +1448,7 @@ class DiSCO(AbstractDiSCO):
         L = total // 3
         assert total == 3 * L, f"Expected 3*L expert params, got {total}"
 
-        fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
+        fsdp_mesh = fsdp_shard_mesh(self.parallel_dims)
         world_size = fsdp_mesh.size()
 
         # Keep the original expert split (2 blocks). Stream pool can still be larger.
@@ -2309,7 +2338,7 @@ class DiSCO(AbstractDiSCO):
         self._pre_normed_grad_cache: dict[int, torch.Tensor] = {}
         self._fsdp_group = None
         if self.fsdp_enabled:
-            fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
+            fsdp_mesh = fsdp_shard_mesh(self.parallel_dims)
             if fsdp_mesh is not None:
                 self._fsdp_group = fsdp_mesh.get_group()
 
@@ -2938,8 +2967,36 @@ class DiSCO(AbstractDiSCO):
             self.groups_pre_norm[group_idx] = group.get("pre_norm", "identity")
             self.groups_pre_norm_eps[group_idx] = group["eps"]
 
-        self.prepare_gradients_and_momentum()
-        self._apply_reduce_pre_norm_pass()
+        # Phase spans. Measured per span: 43.7 us at the DEFAULT config
+        # (enable_structured_logging=True), 14.2 us initialized-but-idle,
+        # 4.0 us with the logger untouched, 0.70 us when explicitly disabled.
+        # A real 24-layer dense step emits 9 disco records (4 spans x 2 plus
+        # 1 scalar; the other 3 spans are behind `if self.<x>_params`), i.e.
+        # ~0.2 ms on a 286 ms step = 0.07%, and an interleaved A/B over
+        # 60 steps x 2 reps was indistinguishable (7508/7573 vs 7574/7496 tps).
+        # STEP 1 IS NOT COMPARABLE. `abstract_disco._orth_and_norm` is
+        # torch.compile'd regardless of `compile.enable`, so the first step
+        # recompiles once per distinct parameter shape INSIDE these spans --
+        # `disco_ddp`/`disco_fsdp`/`disco_experts` can read minutes on step 1
+        # (a shape-heavy small flavor took >11 min). `log_norm_freq` also
+        # changes the branches in step_*, so expect a second recompile wave on
+        # the first norm-logging step. Discard warmup before attributing cost.
+        #
+        # Cost is in the JSONL, not the clock: ~5 KiB/step/rank, which is
+        # 26% of the steady-state log volume and only matters at rank counts
+        # in the hundreds.
+        #
+        # These are WALL
+        # spans on the CPU timeline: DiSCO launches async CUDA work, so a
+        # span covers dispatch plus whatever synchronization happens inside
+        # it (the collectives and .item()/.cpu() calls do sync), not pure
+        # GPU time. That is the useful view here -- the two biggest wins in
+        # the metrics work were CPU-side (AsyncCollectiveTensor dispatch and
+        # a sync-bound gram helper), and neither shows up in GPU time.
+        sl.log_trace_scalar({"disco_logging_step": int(self.need_to_calculate_norm)})
+        with sl.log_trace_span("disco_prepare_grads"):
+            self.prepare_gradients_and_momentum()
+            self._apply_reduce_pre_norm_pass()
 
         # gram_level can change between steps (calculate_norm_at_next_step),
         # unlike the mostly-static structural metadata above -- cheap sentinel
@@ -2951,63 +3008,69 @@ class DiSCO(AbstractDiSCO):
             self._precompute_ddp_gram_vector_metadata()
             self._gram_level_at_last_vector_precompute = self.gram_level
 
-        fsdp_workspace = None
-        if self.fsdp_params and self.fsdp_a2a_mode == "once":
-            fsdp_workspace = self._create_fsdp_step_workspace(
-                cast_dtype=self.communication_dtype,
-                device=self.fsdp_params[0].device,
-                skip_update=False,
-            )
-
-        expert_workspace = (
-            self._create_expert_step_workspace() if self.expert_params else None
-        )
-        ddp_workspace = None
-        if self.ddp_params:
-            ddp_workspace = (
-                self._create_ddp_step_workspace(
+        with sl.log_trace_span("disco_workspaces"):
+            fsdp_workspace = None
+            if self.fsdp_params and self.fsdp_a2a_mode == "once":
+                fsdp_workspace = self._create_fsdp_step_workspace(
                     cast_dtype=self.communication_dtype,
-                    device=self.ddp_params[0].device,
+                    device=self.fsdp_params[0].device,
+                    skip_update=False,
                 )
-                if self.ddp_params
+
+            expert_workspace = (
+                self._create_expert_step_workspace() if self.expert_params else None
+            )
+            ddp_workspace = None
+            if self.ddp_params:
+                ddp_workspace = (
+                    self._create_ddp_step_workspace(
+                        cast_dtype=self.communication_dtype,
+                        device=self.ddp_params[0].device,
+                    )
+                    if self.ddp_params
+                    else None
+                )
+
+            embed_workspace = (
+                self._create_embed_step_workspace(device=self.embed_params[0].device)
+                if self.embed_params
                 else None
             )
 
-        embed_workspace = (
-            self._create_embed_step_workspace(device=self.embed_params[0].device)
-            if self.embed_params
-            else None
-        )
-
         if self.embed_params:
-            self.step_embedding(
-                self.embed_params, self.embed_param_names, embed_workspace
-            )
+            with sl.log_trace_span("disco_embedding"):
+                self.step_embedding(
+                    self.embed_params, self.embed_param_names, embed_workspace
+                )
 
         # Expert LMO launches are coordinated inside step_experts.
         if self.expert_params:
-            self.step_experts(
-                self.expert_params,
-                self.expert_param_names,
-                workspace=expert_workspace,
-            )
+            with sl.log_trace_span("disco_experts"):
+                self.step_experts(
+                    self.expert_params,
+                    self.expert_param_names,
+                    workspace=expert_workspace,
+                )
 
         if self.fsdp_params:
-            self.step_fsdp(
-                self.fsdp_params,
-                self.fsdp_param_names,
-                workspace=fsdp_workspace,
-            )
+            with sl.log_trace_span("disco_fsdp"):
+                self.step_fsdp(
+                    self.fsdp_params,
+                    self.fsdp_param_names,
+                    workspace=fsdp_workspace,
+                )
 
         if self.ddp_params:
-            self.step_ddp(
-                self.ddp_params,
-                self.ddp_param_names,
-                workspace=ddp_workspace,
-            )
+            with sl.log_trace_span("disco_ddp"):
+                self.step_ddp(
+                    self.ddp_params,
+                    self.ddp_param_names,
+                    workspace=ddp_workspace,
+                )
 
         if self.scale_params:
-            self.step_scalar(self.scale_params, self.scale_param_names)
+            with sl.log_trace_span("disco_scalar"):
+                self.step_scalar(self.scale_params, self.scale_param_names)
 
         self.need_to_calculate_norm = False
         return loss
@@ -3627,7 +3690,7 @@ class DiSCO(AbstractDiSCO):
         norms_of_radial = []
 
         device = expert_params[0].device
-        fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
+        fsdp_mesh = fsdp_shard_mesh(self.parallel_dims)
         world_size, local_rank = fsdp_mesh.size(), fsdp_mesh.get_local_rank()
 
         # Use pre-computed structural metadata from init (avoids per-step recomputation).
@@ -4933,7 +4996,7 @@ class DiSCO(AbstractDiSCO):
 
         need_to_calculate_norm = self.need_to_calculate_norm
 
-        fsdp_mesh = self.parallel_dims.get_optional_mesh("fsdp")
+        fsdp_mesh = fsdp_shard_mesh(self.parallel_dims)
         world_size, rank = fsdp_mesh.size(), fsdp_mesh.get_local_rank()
         device = fsdp_params[0].device
         cast_dtype = self.communication_dtype

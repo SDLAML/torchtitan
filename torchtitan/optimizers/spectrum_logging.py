@@ -66,7 +66,6 @@ import functools
 import multiprocessing
 import os
 import re
-import threading
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, NamedTuple
 
@@ -231,7 +230,9 @@ def _parse_spectrum_short_name(short_name: str) -> tuple[str, int | None, int, s
     name = ".".join(rest)
     if name == "tok_embeddings":
         return kind, expert_idx, _EMBED_ROW, "EMBED"
-    if name == "output":
+    # 0.5.0 renamed the unembedding "output" -> "lm_head"; accept both so
+    # this keeps bucketing checkpoints and runs from either version.
+    if name in ("output", "lm_head"):
         return kind, expert_idx, _LM_HEAD_ROW, "LM_HEAD"
 
     dotted = name.split(".")

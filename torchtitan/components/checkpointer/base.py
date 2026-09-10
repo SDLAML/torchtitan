@@ -454,6 +454,19 @@ class BaseCheckpointManager(Configurable, ABC):
         exclude_from_loading: list[str] = field(default_factory=list)
         """Non-model state keys excluded from loading."""
 
+        reconfigure_lrs: bool = False
+        """Keep the learning rates from THIS run's config when loading a checkpoint.
+
+        An optimizer state_dict carries `param_groups[*]["lr"]`, so resuming a run whose
+        LR schedule was changed -- a new decay phase, a different peak -- silently
+        restores the old rates and undoes the new schedule. Set this when starting a new
+        phase from a previous phase's checkpoint.
+
+        Only the optimizer needs it: `LRSchedulersContainer.load_state_dict` restores
+        `last_epoch` only and recomputes rates from each optimizer's `base_lrs`, so the
+        scheduler already follows the new config.
+        """
+
         enable_first_step_checkpoint: bool = False
         """Whether to save immediately after the first training step."""
 

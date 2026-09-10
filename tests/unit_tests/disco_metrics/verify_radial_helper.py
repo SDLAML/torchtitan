@@ -5,9 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 """Verification for optimizers/radial_helper.py (plan Verification steps 4-5)."""
+import os as _os
 import sys
 
-sys.path.insert(0, "resources/torchtitan")
+_REPO = _os.path.abspath(
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "..")
+)
+sys.path.insert(0, _REPO)
 import torch
 from torchtitan.optimizers.radial_helper import (
     calculate_radial_metrics,

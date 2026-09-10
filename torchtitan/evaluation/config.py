@@ -11,11 +11,14 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
+from typing import Any
+
+from torchtitan.components.data.mix import DatasetSpec
 
 from torchtitan.config.configs import ParallelismConfig
-from torchtitan.hf_datasets.mixed_text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.trainer import Trainer
 
@@ -35,10 +38,17 @@ class EvaluationDatasetConfig:
     """
 
     name: str
-    dataloader: HuggingFaceTextDataLoader.Config
+    dataset: DatasetSpec
+    """The single corpus this validation set scores. One corpus per set: a mixture would
+    report one number over an interleave whose proportions are a training-time choice."""
     seq_len: int | None = None
     local_batch_size: int | None = None
     max_batches: int | None = None
+    drop_long_samples: bool = False
+    num_workers: int = 0
+    pin_memory: bool = True
+    prefetch_factor: int | None = None
+    persistent_workers: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -224,7 +234,9 @@ def force_ddp_evaluation_parallelism(config: Trainer.Config, world_size: int) ->
         pipeline_parallel_degree=1,
         context_parallel_degree=1,
         expert_parallel_degree=1,
-        expert_tensor_parallel_degree=1,
+        # `expert_tensor_parallel_degree` was removed from ParallelismConfig in
+        # 0.5.0; ETP is expressed through the mesh instead.
+        spmd_backend="partial_dtensor",
     )
 
 

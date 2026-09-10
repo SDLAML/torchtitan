@@ -467,7 +467,6 @@ def fused_metrics(W, eps=1e-20):
 
     p = (S / (S.sum() + eps)).clamp_min(eps)
     erank = torch.exp(-(p * p.log()).sum())
-    erank_norm = erank / min(fan_out, fan_in)
 
     S_sq = S * S
     p_sq = (S_sq / (S_sq.sum() + eps)).clamp_min(eps)
@@ -485,7 +484,6 @@ def fused_metrics(W, eps=1e-20):
         "average_entry_size": avg_entry,
         "stable_rank": srank,
         "effective_rank": erank,
-        # "effective_rank_normalized": erank_norm,
         "effective_rank_squared": erank_sq,
         "spectrum": S,
         # See diag_metrics' note -- kept out of the norms_to_log projection in
