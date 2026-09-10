@@ -42,6 +42,7 @@ from torchtitan.components.optimizer.optimizer import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.utils import fsdp_shard_mesh
+from torchtitan.models.common.aux_loss import register_aux_loss_zero_hook
 from torchtitan.optimizers import (
     create_disco_optimizer_kwargs_from_optimizer_config,
     create_disco_param_groups,
@@ -749,7 +750,19 @@ def register_moe_load_balancing_hook(
                 ema_buffers.append(moe.tokens_per_expert_cumul)
                 ent_buffers.append(moe.router_entropy)
                 acc_fwd_times_buffers.append(moe.acc_fwd_times)
-                load_balance_loss_buffers.append(moe.load_balance_loss)
+                # Per-layer load-balance value. The old `moe.load_balance_loss`
+                # buffer is gone: the loss now goes through upstream's AuxLoss,
+                # which keeps a PER-INSTANCE (i.e. per-layer) accumulator, so the
+                # `moe_load_balance_loss/L-*` breakdown survives the migration --
+                # upstream's own `collect_aux_loss_metrics` only reports the mean
+                # over layers. Falls back to a zero scalar when the layer has no
+                # aux loss (load_balance_loss_weight == 0).
+                aux = getattr(moe, "aux_loss", None)
+                load_balance_loss_buffers.append(
+                    aux.instance_acc.reshape(1)
+                    if aux is not None
+                    else torch.zeros(1, dtype=torch.float32, device=moe.acc_fwd_times.device)
+                )
         # Early exit if no MoE layers were found
         if not moe_layers_info:
             return
@@ -842,11 +855,16 @@ def register_moe_load_balancing_hook(
                 bias_params, list(updates_2d.unbind(0)), alpha=load_balance_coeff
             )
 
-            # Reset router stats in bulk.
+            # Reset router stats in bulk. NOT load_balance_loss_buffers: those
+            # are now AuxLoss.instance_acc, whose lifecycle upstream's
+            # `register_aux_loss_zero_hook` owns -- it rolls each into the group
+            # registers that `collect_aux_loss_metrics` reduces, then clears it.
+            # Zeroing here too would race that hook: whichever ran second would
+            # see zeros, silently reporting 0 for either our per-layer breakdown
+            # or upstream's layer-mean.
             torch._foreach_zero_(tok_buffers)
             torch._foreach_zero_(ent_buffers)
             torch._foreach_zero_(acc_fwd_times_buffers)
-            torch._foreach_zero_(load_balance_loss_buffers)
 
             if is_dp_rank_0:
                 # One packed D2H copy. Six separate `.cpu()` calls meant six
@@ -939,3 +957,9 @@ def register_moe_load_balancing_hook(
                 model_parts, parallel_dims=parallel_dims
             )
         )
+        # Upstream pairs the load-balancing hook with an aux-loss zero hook (see
+        # deepseek_v3's _post_optimizer_build_fn). It rolls each AuxLoss
+        # instance's `instance_acc` into the group registers that
+        # `collect_aux_loss_metrics` reduces at log time, then clears them, so
+        # the accumulators cover exactly one optimizer step.
+        register_aux_loss_zero_hook(optimizers, model_parts, parallel_dims)

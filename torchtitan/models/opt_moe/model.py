@@ -91,7 +91,7 @@ def _parse_layer_pattern(
 class OPTMoETransformerBlock(TransformerBlock):
     """OPT MoE TransformerBlock.
 
-    Token-flat throughout: ``x`` is ``[T, D]``. Returns ``(output, lbl_loss)``
+    Token-flat throughout: ``x`` is ``[T, D]``. Returns ``output``
     so the model can accumulate per-layer MoE load-balance losses without
     threading a running tensor through every layer signature.
     """
@@ -232,7 +232,8 @@ class OPTMoETransformerBlock(TransformerBlock):
             loss_mask: Optional token loss mask for the MoE load-balance loss.
 
         Returns:
-            ``(output, lbl_loss)`` -- ``lbl_loss`` is this layer's load-balance
+            ``output``. The load-balance gradient is injected inside the MoE
+            (see norm_moe.LoadBalanceLoss), not returned.
             loss on MoE layers and ``None`` on dense layers.
         """
         # _mask_key is pre-computed at init; no string comparisons or tensor ops
@@ -260,16 +261,15 @@ class OPTMoETransformerBlock(TransformerBlock):
         h = _lhs + _rhs
 
         if self.moe_enabled:
-            mlp_output, lbl_loss = self.moe(
+            mlp_output = self.moe(
                 self.ffn_norm(h), loss_mask, positions=positions, doc_id=doc_id
             )
         else:
             mlp_output = self.feed_forward(self.ffn_norm(h))
-            lbl_loss = None
 
         _lhs = h if self._skip_identity_mul else self.identity_scale * h
         _rhs = mlp_output if self._skip_block_mul else self.block_scale * mlp_output
-        return _lhs + _rhs, lbl_loss
+        return _lhs + _rhs
 
 
 class OPTMoEModel(Decoder):
@@ -556,7 +556,6 @@ class OPTMoEModel(Decoder):
         attention_masks: AttentionMasksType | None = None,
         loss_mask: torch.Tensor | None = None,
         doc_id: torch.Tensor | None = None,
-        accumulated_load_balance_loss: torch.Tensor | None = None,
     ):
         """Forward pass.
 
@@ -566,11 +565,10 @@ class OPTMoEModel(Decoder):
             positions: Position indices ``[T]``.
             attention_masks: Per-layer masks (dict) or a single mask.
             loss_mask: Token mask for the MoE load-balance loss.
-            accumulated_load_balance_loss: Load-balance loss carried in from a
                 prior pipeline stage.
 
         Returns:
-            ``(output, total_lbl_loss)``.
+            ``output``.
         """
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
@@ -584,30 +582,16 @@ class OPTMoEModel(Decoder):
         if self.embeddings_norm is not None:
             h = self.embeddings_norm(h)
 
-        # Collect per-layer load-balance losses; accumulation happens after the
-        # loop so we never thread a running tensor through every layer signature.
-        local_lbl_loss: torch.Tensor | None = None
+        # The load-balance loss is no longer returned: NormMoE injects its
+        # gradient at the layer (see LoadBalanceLoss), so nothing has to be
+        # threaded through the blocks or carried across pipeline stages.
         for layer in self.layers.values():
-            h, lbl = layer(h, attention_masks, positions, loss_mask, doc_id)
-            if lbl is not None:
-                local_lbl_loss = lbl if local_lbl_loss is None else local_lbl_loss + lbl
-
-        if accumulated_load_balance_loss is not None:
-            total_lbl_loss = (
-                accumulated_load_balance_loss + local_lbl_loss
-                if local_lbl_loss is not None
-                else accumulated_load_balance_loss
-            )
-        elif local_lbl_loss is not None:
-            total_lbl_loss = local_lbl_loss
-        else:
-            total_lbl_loss = torch.zeros((), device=h.device, dtype=torch.float32)
+            h = layer(h, attention_masks, positions, loss_mask, doc_id)
 
         h = self.norm(h) if self.norm is not None else h
         if self._skip_lm_head:
-            return h, total_lbl_loss
-        output = self.lm_head(h) if self.lm_head is not None else h
-        return output, total_lbl_loss
+            return h
+        return self.lm_head(h) if self.lm_head is not None else h
 
     def get_attention_masks(
         self,

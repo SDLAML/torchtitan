@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan.components.loss import ChunkedLossWrapper, MoEAuxLoss
+from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
@@ -33,7 +33,7 @@ def moe_template_config() -> Trainer.Config:
         # bit-identical loss. `trainer.py` already looks one level into
         # `loss_fn.inner` to wire lm_head, and every token count we run
         # (1024/4096/8192/40960) divides by 8.
-        loss=MoEAuxLoss.Config(inner=ChunkedLossWrapper.Config(num_chunks=8)),
+        loss=ChunkedLossWrapper.Config(num_chunks=8),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=20),
         training=TrainingConfig(
             # 4 sequences x 4096 tokens, expressed the way 0.5.0 expresses it.

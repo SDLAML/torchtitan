@@ -55,6 +55,7 @@ from torchtitan.distributed.spmd_types import spmd_mesh_size
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.config_utils import make_token_dispatcher_config
 from torchtitan.models.common.linear import RouterGateLinear
+from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.protocols.module import Module
@@ -696,6 +697,40 @@ class NormRouter(Module):
         )
 
 
+class LoadBalanceLoss(AuxLoss):
+    """opt_moe's load-balance loss, on upstream's aux-loss injection path.
+
+    Replaces the old ``(logits, load_balance_loss)`` tuple return. That tuple had
+    to be threaded through every transformer block AND across pipeline stages
+    (``model.forward``'s ``accumulated_load_balance_loss``); injecting the
+    gradient at the layer keeps it local, so the model returns logits alone and
+    the training loss is plain cross-entropy again.
+
+    NOTE ON SCALE: our ``sequence_wise_aux_loss`` / ``batch_wise_aux_loss`` fold
+    the coefficient in themselves, while ``AuxLoss.inject`` applies
+    ``coeff / global_valid_tokens``. They are therefore called here with
+    ``aux_loss_alpha=1.0`` and the coefficient is carried by ``Config.coeff``.
+    The per-step ``/ global_valid_tokens`` normalisation is NEW -- it is what
+    makes the term comparable to the main loss and stable across parallelism
+    degrees -- so the effective strength of a given
+    ``load_balance_loss_weight`` differs from the pre-migration behaviour and
+    wants re-measuring.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(AuxLoss.Config):
+        """Same fields as ``AuxLoss.Config``.
+
+        A distinct Config is required even with no new fields: ``Config.build()``
+        constructs the class that owns it, so an ``AuxLoss.Config`` would build a
+        bare ``AuxLoss`` with no ``forward``.
+        """
+
+    def forward(self, raw_sum: torch.Tensor, *, carrier: torch.Tensor):
+        """Inject ``raw_sum``'s gradient onto ``carrier`` and return it unchanged."""
+        return self.inject(raw_sum, carrier=carrier)
+
+
 class NormMoE(Module):
     """MoE with an auxiliary load-balance loss and routing metrics.
 
@@ -746,14 +781,18 @@ class NormMoE(Module):
         )
         self.load_balance_loss_weight = config.load_balance_loss_weight
         self.load_balance_loss_type = config.load_balance_loss_type
+        # Upstream's aux-loss path: the gradient is injected at this layer, so
+        # nothing has to be returned up through the blocks or across PP stages.
+        # `coeff` carries the weight; the loss fns are called with alpha=1.0.
+        self.aux_loss = (
+            LoadBalanceLoss.Config(coeff=config.load_balance_loss_weight).build()
+            if config.load_balance_loss_weight > 0.0
+            else None
+        )
         self.bias_update_norm_factor = config.bias_update_norm_factor
         self.track_router_metrics = config.track_router_metrics
 
         num_experts = config.num_experts
-        # Reported by the trainer; not part of the model's math.
-        self.register_buffer(
-            "load_balance_loss", torch.zeros(1, dtype=torch.float32), persistent=False
-        )
         self.register_buffer(
             "router_entropy", torch.zeros(1, dtype=torch.float32), persistent=False
         )
@@ -833,7 +872,7 @@ class NormMoE(Module):
                     1,
                     x_TD.shape[0],
                     self.router.top_k,
-                    self.load_balance_loss_weight,
+                    1.0,  # weight lives in LoadBalanceLoss.coeff
                     loss_mask=loss_mask,
                     # segments the packed stream back into documents; falls
                     # back to whole-stream scoring when unavailable
@@ -850,16 +889,13 @@ class NormMoE(Module):
                     scores_TE,
                     aux_map_TE.sum(dim=0),
                     self.router.top_k,
-                    self.load_balance_loss_weight,
+                    1.0,  # weight lives in LoadBalanceLoss.coeff
                     loss_mask=loss_mask,
                 )
             else:
                 raise ValueError(
                     f"Invalid load_balance_loss_type: {self.load_balance_loss_type}"
                 )
-            with torch.no_grad():
-                self.load_balance_loss.add_(aux_loss.detach())
-
         out_TD = self.routed_experts(
             x_TD,
             topk_scores_TK,
@@ -868,7 +904,34 @@ class NormMoE(Module):
         )
         if self.shared_experts is not None:
             out_TD = out_TD + self.shared_experts(x_TD)
-        return out_TD, aux_loss
+        if aux_loss is not None and self.aux_loss is not None:
+            # SCALE: our loss fns end in `loss_per_seq.mean()`, an O(1)
+            # per-token-normalised value, but `AuxLoss.inject` expects an
+            # UNNORMALISED sum and divides by the step's GLOBAL valid tokens.
+            #
+            # Weight by THIS microbatch's valid-token count, not the global
+            # denominator. Multiplying by the global one cancels exactly and
+            # makes every microbatch contribute a full `coeff * mean`, so the
+            # aux gradient scales with gradient_accumulation_steps -- the bug
+            # the deleted MoEAuxLoss `/gradient_accumulation_steps` used to
+            # paper over. Weighting per microbatch makes inject()'s
+            # `/global_valid_tokens` a proper token-weighted mean across both
+            # the accumulation window and DP, which is the whole point of
+            # upstream normalising on that count.
+            n_valid = (
+                loss_mask.sum()
+                if loss_mask is not None
+                else torch.tensor(
+                    x_TD.shape[0], device=x_TD.device, dtype=torch.float32
+                )
+            )
+            aux_loss = aux_loss * n_valid.to(aux_loss.dtype)
+            # Identity forward: `out_TD` is unchanged, but its backward now
+            # carries the load-balance gradient. Nothing is returned upward, so
+            # blocks and PP stages stay free of aux-loss plumbing, and the
+            # per-layer metric accumulates in `self.aux_loss.instance_acc`.
+            out_TD = self.aux_loss(aux_loss, carrier=out_TD)
+        return out_TD
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         """Reset the MoE counters, honouring an explicit ``buffer_device``.
@@ -908,7 +971,6 @@ class NormMoE(Module):
         for _name in (
             "expert_bias_E",
             "tokens_per_expert_E",
-            "load_balance_loss",
             "router_entropy",
             "acc_fwd_times",
             "tokens_per_expert_cumul",

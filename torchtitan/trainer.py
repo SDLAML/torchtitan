@@ -562,26 +562,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Set lm_head reference for ChunkedLossWrapper after model construction.
         # Non-PP: single model part always has lm_head.
         # PP: only the last stage has lm_head; non-last stages skip this.
-        # A loss may wrap the chunked one (MoEAuxLoss does, to add the MoE
-        # load-balance term), so look one level in rather than only at the top.
-        # The MoE aux term is added once per microbatch while CE is normalized
-        # over the whole accumulation window, so the aux side needs the count.
-        # Unconditional by design: `MoEAuxLoss` reads it via getattr with a
-        # default of 1, and any other loss simply ignores the attribute. (The
-        # previous `isinstance(..., object)` guard was always True -- everything
-        # including None is an object -- so it read as a filter and was not one.)
-        # Count how many times the loss is CALLED per optimizer step, not just
-        # the accumulation groups: under PP the schedule invokes the loss once
-        # per pipeline microbatch, so the aux term lands
-        # gas * num_pp_microbatches times while `gradient_accumulation_steps`
-        # already has num_pp_microbatches factored out (see the derivation
-        # above). Dividing by gas alone would leave PP runs scaled by
-        # num_pp_microbatches.
-        _loss_calls_per_step = self.gradient_accumulation_steps
-        if parallel_dims.pp_enabled:
-            _loss_calls_per_step *= self.num_pp_microbatches
-        self.loss_fn.gradient_accumulation_steps = _loss_calls_per_step
-
+        # A loss may wrap the chunked one, so look one level in rather than only
+        # at the top.
+        #
+        # The old `loss_fn.gradient_accumulation_steps` assignment lived here to
+        # normalise MoEAuxLoss's term across the accumulation window. That class
+        # is gone: the load-balance gradient is now injected inside the MoE by
+        # `norm_moe.LoadBalanceLoss`, and upstream's AuxLoss normalises by the
+        # step's global valid-token count (`AuxLoss.set_step_denominator`), which
+        # is PP- and accumulation-invariant on its own.
         chunked_loss_fn = (
             self.loss_fn
             if isinstance(self.loss_fn, ChunkedLossWrapper)
