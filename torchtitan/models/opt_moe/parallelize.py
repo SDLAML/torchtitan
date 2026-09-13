@@ -52,6 +52,7 @@ from torchtitan.models.llama3.parallelize import apply_ddp
 from torchtitan.models.llama4.parallelize import apply_fsdp
 from torchtitan.models.opt_moe import norm_moe as moe_module
 from torchtitan.models.opt_moe.model import OPTMoEModel
+from torchtitan.models.opt_moe.utils.polar import PolarLinear
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.tools.logging import logger
 
@@ -96,6 +97,19 @@ def parallelize_opt_moe(
     model_compile_enabled = (
         compile_config.enable and "model" in compile_config.components
     )
+    if any(isinstance(module, PolarLinear) for module in model.modules()):
+        if (
+            parallel_dims.fsdp_enabled
+            or parallel_dims.tp_enabled
+            or parallel_dims.pp_enabled
+            or parallel_dims.cp_enabled
+            or parallel_dims.ep_enabled
+        ):
+            raise NotImplementedError(
+                "The polar-weight proof of concept supports single-device/DDP only; "
+                "set data_parallel_shard_degree=1 and disable TP/PP/CP/EP"
+            )
+
     tp_only_attention = parallelism.tensor_parallel_only_attention
     enable_approx_mid_norm_for_tensor_parallel = (
         parallelism.enable_approx_mid_norm_for_tensor_parallel

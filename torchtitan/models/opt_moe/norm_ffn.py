@@ -13,6 +13,7 @@ from .utils.activations import build_activation
 
 from .utils.inits import build_init_fn
 from .utils.norms import build_norm
+from .utils.polar import PolarLinear
 
 
 class FeedForward(Module):
@@ -30,6 +31,7 @@ class FeedForward(Module):
         norm_type: str = "np_rmsnorm"
         norm_eps: float = 1e-30
         activation_type: str = "silu"
+        polar_weights: bool = False
 
         w1_init_fn_type: str = "scaled_orthogonal"
         w2_init_fn_type: str = "scaled_orthogonal"
@@ -42,9 +44,10 @@ class FeedForward(Module):
     def __init__(self, config: Config, *, dim: int):
         super().__init__()
         self.config = config
-        self.w1 = nn.Linear(dim, config.hidden_dim, bias=False)
-        self.w2 = nn.Linear(config.hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, config.hidden_dim, bias=False)
+        linear = PolarLinear if config.polar_weights else nn.Linear
+        self.w1 = linear(dim, config.hidden_dim, bias=False)
+        self.w2 = linear(config.hidden_dim, dim, bias=False)
+        self.w3 = linear(dim, config.hidden_dim, bias=False)
         self.act_fn = build_activation(config.activation_type)
 
         if config.norm_everywhere:

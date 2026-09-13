@@ -30,6 +30,7 @@ from .utils.inits import (
     setup_residual_scale,
 )
 from .utils.norms import build_norm
+from .utils.polar import CosineLinear
 
 
 def _parse_layer_pattern(
@@ -240,6 +241,8 @@ class OPTMoEModel(Decoder):
 
         final_out_init_fn_type: str = "scion_normal_output"
         final_out_init_std: float = 1.0
+        normalized_output: bool = False
+        output_logit_scale: float = 1.0
 
         # --- Flexible per-layer attention configuration ---
 
@@ -364,6 +367,12 @@ class OPTMoEModel(Decoder):
     def __init__(self, config: Config):
         super().__init__(config)
         self.norm = build_norm(config.norm_type, dim=config.dim, eps=config.norm_eps)
+        if config.normalized_output:
+            self.output = CosineLinear(
+                config.dim,
+                config.vocab_size,
+                initial_logit_scale=config.output_logit_scale,
+            )
 
         n_layers = config.n_layers
         base_attn = config.layer.attention
@@ -517,6 +526,8 @@ class OPTMoEModel(Decoder):
                 mean=0.0,
                 std=self.config.final_out_init_std,
             )
+            if isinstance(self.output, CosineLinear):
+                self.output.reset_logit_scale()
 
     def forward(
         self,

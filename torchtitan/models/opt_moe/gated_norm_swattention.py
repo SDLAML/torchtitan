@@ -25,6 +25,7 @@ from torchtitan.models.common.rope import (
 )
 from .utils.inits import build_init_fn
 from .utils.norms import build_norm
+from .utils.polar import PolarLinear
 
 
 class GatedNormSWAttention(BaseAttention):
@@ -38,6 +39,7 @@ class GatedNormSWAttention(BaseAttention):
         qk_norm: bool = False
         mid_norm: bool = False
         norm_everywhere: bool = False
+        polar_weights: bool = False
         gated_attention_type: str | None = None  # "none", "head-wise", "element-wise"
         gate_only: bool = False
         norm_eps: float = 1e-30
@@ -137,10 +139,13 @@ class GatedNormSWAttention(BaseAttention):
         # Scaling factor (needed when head_dim differs from dim // n_heads)
         self.scaling = self.head_dim**-0.5 if config.head_dim is not None else None
 
-        self.wq = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
+        if config.polar_weights and self.gated_attention_type is not None:
+            raise ValueError("The polar-weight experiment requires ungated attention")
+        linear = PolarLinear if config.polar_weights else nn.Linear
+        self.wq = linear(dim, self.n_heads * self.head_dim, bias=False)
+        self.wk = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = linear(self.n_heads * self.head_dim, dim, bias=False)
 
         self.attn_backend = config.attn_backend
         self.inner_attention: nn.Module
