@@ -4,10 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Slow reference layers for the square-polar scale-invariance experiment.
+"""Mixed-precision layers for the square-polar scale-invariance experiment.
 
 Raw parameters keep their usual ``weight`` names. Optimizer metrics therefore
 measure the raw weights, not the normalized matrices used by the forward pass.
+Polar decompositions and their derivatives use FP64, while linear projections
+respect the enclosing autocast context.
 """
 
 import math
@@ -60,8 +62,9 @@ class PolarLinear(nn.Linear):
 
     def forward(self, input):
         dtype = torch.float64 if self.weight.dtype == torch.float64 else torch.float32
-        with torch.autocast(device_type=input.device.type, enabled=False):
-            return F.linear(input.to(dtype), square_polar(self.weight).to(dtype))
+        # square_polar disables autocast internally; only the projection uses AMP.
+        weight = square_polar(self.weight).to(dtype)
+        return F.linear(input.to(dtype), weight)
 
 
 class CosineLinear(nn.Linear):
@@ -84,4 +87,7 @@ class CosineLinear(nn.Linear):
         with torch.autocast(device_type=input.device.type, enabled=False):
             weight = F.normalize(self.weight.to(dtype), dim=-1, eps=1e-30)
             hidden = F.normalize(input.to(dtype), dim=-1, eps=1e-30)
-            return F.linear(hidden, weight) * self.logit_scale.to(dtype).exp()
+            # Scale before expanding to the vocabulary so the scale's backward
+            # saves hidden states instead of another full logits tensor.
+            hidden = hidden * self.logit_scale.to(dtype).exp()
+        return F.linear(hidden, weight)

@@ -13,7 +13,7 @@ import torch
 
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.models.opt_moe import moe_opt_moe_configs
-from torchtitan.models.opt_moe.config_registry import polar_si_config
+from torchtitan.models.opt_moe.config_registry import moe_template_config
 from torchtitan.models.opt_moe.parallelize import parallelize_opt_moe
 from torchtitan.models.opt_moe.utils.polar import (
     CosineLinear,
@@ -36,6 +36,34 @@ class _LocalParallelDims:
 
     def get_optional_mesh(self, _name):
         return None
+
+
+def _test_config():
+    config = moe_template_config()
+    config.activation_checkpoint.mode = "none"
+    config.optimizer.name = "DiSCO"
+    config.optimizer.zeropower_backend = "polar_express_triton"
+    config.optimizer.momentum = 1.0
+    config.optimizer.weight_decay = 0.0
+    config.optimizer.eps = 1e-20
+    config.optimizer.extra_param_group_split_rules = [
+        {
+            "str_match": "tok_embeddings.weight",
+            "norm_factor": "embed_sqrt",
+            "backend": "identity",
+        },
+        {
+            "str_match": "output.weight",
+            "norm_factor": "unembed_sqrt",
+            "backend": "identity",
+        },
+        {
+            "str_match": r"^output\.logit_scale$",
+            "norm_factor": "sign",
+            "backend": "identity",
+        },
+    ]
+    return config
 
 
 def _tiny_config():
@@ -115,6 +143,78 @@ def test_normalized_output_has_independent_row_invariance():
     assert head.logit_scale.grad.abs() > 0
 
 
+@pytest.mark.parametrize("layer_cls", [PolarLinear, CosineLinear])
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
+def test_bf16_projection_preserves_parameter_gradients(layer_cls, input_dtype):
+    torch.manual_seed(17)
+    layer = layer_cls(16, 16)
+    inputs = torch.randn(2, 3, 16).to(input_dtype).requires_grad_()
+    leaves = (inputs, *layer.parameters())
+    reference = layer(inputs)
+    upstream = torch.randn_like(reference)
+    expected_grads = torch.autograd.grad((reference * upstream).sum(), leaves)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = layer(inputs)
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.float(), reference, atol=0.02, rtol=0.02)
+    actual_grads = torch.autograd.grad((actual.float() * upstream).sum(), leaves)
+    for leaf, actual_grad, expected_grad in zip(
+        leaves, actual_grads, expected_grads, strict=True
+    ):
+        assert actual_grad.dtype == leaf.dtype
+        assert torch.isfinite(actual_grad).all()
+        relative_error = (actual_grad.float() - expected_grad.float()).norm()
+        relative_error = relative_error / expected_grad.float().norm()
+        assert relative_error < 0.02
+    assert all(p.dtype == torch.float32 for p in layer.parameters())
+
+    if isinstance(layer, PolarLinear):
+        q = square_polar(layer.weight.detach()).double()
+        grad = actual_grads[1].double()
+        tangency_error = (q.mT @ grad + grad.mT @ q).norm() / grad.norm()
+        assert tangency_error < 1e-5
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_output_scale_before_projection_matches_reference_gradients(dtype):
+    torch.manual_seed(18)
+    head = CosineLinear(8, 19, initial_logit_scale=2.3).to(dtype)
+    inputs = torch.randn(2, 3, 8, dtype=dtype, requires_grad=True)
+    hidden = torch.nn.functional.normalize(inputs, dim=-1, eps=1e-30)
+    weight = torch.nn.functional.normalize(head.weight, dim=-1, eps=1e-30)
+    reference = torch.nn.functional.linear(hidden, weight) * head.logit_scale.exp()
+    actual = head(inputs)
+    torch.testing.assert_close(actual, reference)
+    upstream = torch.randn_like(reference)
+    leaves = (inputs, head.weight, head.logit_scale)
+    expected_grads = torch.autograd.grad((reference * upstream).sum(), leaves)
+    actual_grads = torch.autograd.grad((actual * upstream).sum(), leaves)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
+@pytest.mark.parametrize("enable_amp", [False, True])
+def test_output_head_does_not_save_full_logits_for_backward(enable_amp):
+    head = CosineLinear(8, 19, initial_logit_scale=2.3)
+    inputs = torch.randn(2, 3, 8, requires_grad=True)
+    saved_shapes = []
+
+    def pack(tensor):
+        saved_shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with (
+        torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor),
+        torch.autocast("cpu", dtype=torch.bfloat16, enabled=enable_amp),
+    ):
+        logits = head(inputs)
+    assert tuple(logits.shape) not in saved_shapes
+    assert (6, 19) not in saved_shapes
+    logits.float().square().mean().backward()
+    assert torch.isfinite(head.logit_scale.grad)
+
+
 def test_meta_initialization_and_existing_flavor_are_unchanged():
     cfg = _tiny_config()
     with torch.device("meta"):
@@ -133,7 +233,10 @@ def test_meta_initialization_and_existing_flavor_are_unchanged():
 
 
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
-def test_fullgraph_cpu_model_matches_eager_forward_and_backward(backend, tmp_path):
+@pytest.mark.parametrize("enable_amp", [False, True])
+def test_fullgraph_cpu_model_matches_eager_forward_and_backward(
+    backend, enable_amp, tmp_path
+):
     # Avoid all-zero ReLU outputs: eps=1e-30 RMSNorm can give NaN gradients
     # there even in eager mode, independently of the polar implementation.
     torch.manual_seed(14)
@@ -145,7 +248,7 @@ def test_fullgraph_cpu_model_matches_eager_forward_and_backward(backend, tmp_pat
                 # Exactly repeated singular values exercise the custom backward.
                 module.weight.copy_(torch.eye(module.in_features))
     compiled = copy.deepcopy(eager)
-    config = polar_si_config()
+    config = _test_config()
     config.training.seq_len = 8
     config.compile.enable = True
     config.compile.backend = backend
@@ -167,12 +270,16 @@ def test_fullgraph_cpu_model_matches_eager_forward_and_backward(backend, tmp_pat
     for _ in range(2):
         eager.zero_grad()
         compiled.zero_grad()
-        expected, _ = eager(tokens)
-        actual, _ = compiled(tokens)
-        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=1e-4)
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=enable_amp):
+            expected, _ = eager(tokens)
+            actual, _ = compiled(tokens)
+        expected_dtype = torch.bfloat16 if enable_amp else torch.float32
+        assert expected.dtype == actual.dtype == expected_dtype
+        atol, rtol = (0.01, 0.02) if enable_amp else (2e-6, 1e-4)
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
         for logits in (expected, actual):
             torch.nn.functional.cross_entropy(
-                logits.flatten(0, 1), labels.flatten()
+                logits.flatten(0, 1).float(), labels.flatten()
             ).backward()
         with torch.no_grad():
             for original, traced in zip(
@@ -181,7 +288,7 @@ def test_fullgraph_cpu_model_matches_eager_forward_and_backward(backend, tmp_pat
                 assert torch.isfinite(original.grad).all()
                 assert torch.isfinite(traced.grad).all()
                 torch.testing.assert_close(
-                    traced.grad, original.grad, atol=2e-6, rtol=1e-4
+                    traced.grad, original.grad, atol=atol, rtol=rtol
                 )
                 original.add_(original.grad, alpha=-0.01)
                 traced.add_(traced.grad, alpha=-0.01)
@@ -196,12 +303,13 @@ def test_actual_disco_steps_with_triton_backend():
     torch.manual_seed(14)
     model = _tiny_config().build().to(device)
     model.init_weights(buffer_device=torch.device(device))
-    config = polar_si_config()
+    config = _test_config()
     config.optimizer.lr = 0.05
     assert config.optimizer.zeropower_backend == "polar_express_triton"
     kwargs = create_disco_optimizer_kwargs_from_optimizer_config(
         config.optimizer, _LocalParallelDims()
     )
+    kwargs["communication_dtype"] = torch.float32
     groups, kwargs = create_disco_param_groups(model, kwargs)
     with patch("torchtitan.optimizers.disco.dist.get_rank", return_value=0):
         optimizer = DiSCO(groups, **kwargs)
