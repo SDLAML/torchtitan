@@ -188,8 +188,13 @@ class OPTMoETransformerBlock(TransformerBlock):
         else:
             layer_mask = attention_masks  # single BlockMask (backward compat)
 
-        h = self.identity_scale * x + self.block_scale * self.attention(
-            self.attention_norm(x), freqs_cis, layer_mask, positions
+        x_norm = self.attention_norm(x)
+        residual = x
+        if self.layer_id == 0 and self.attention.config.polar_weights:
+            residual = x_norm
+
+        h = self.identity_scale * residual + self.block_scale * self.attention(
+            x_norm, freqs_cis, layer_mask, positions
         )
 
         if self.moe_enabled:
