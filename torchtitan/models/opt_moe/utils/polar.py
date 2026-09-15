@@ -68,14 +68,23 @@ class PolarLinear(nn.Linear):
 
 
 class CosineLinear(nn.Linear):
-    """Normalized output rows and inputs, with a learned positive temperature."""
+    """Normalized output rows and inputs, with a learned or fixed positive scale."""
 
-    def __init__(self, in_features, out_features, *, initial_logit_scale=1.0):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        *,
+        initial_logit_scale=1.0,
+        logit_scale_trainable=True,
+    ):
         if not math.isfinite(initial_logit_scale) or initial_logit_scale <= 0:
             raise ValueError("initial_logit_scale must be finite and positive")
         super().__init__(in_features, out_features, bias=False)
         self.initial_logit_scale = initial_logit_scale
-        self.logit_scale = nn.Parameter(torch.empty(()))
+        self.logit_scale = nn.Parameter(
+            torch.empty(()), requires_grad=logit_scale_trainable
+        )
         self.reset_logit_scale()
 
     def reset_logit_scale(self):

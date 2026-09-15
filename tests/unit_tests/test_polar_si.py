@@ -232,6 +232,46 @@ def test_meta_initialization_and_existing_flavor_are_unchanged():
     assert not old.normalized_output
 
 
+def test_fixed_output_scale_initialization_and_optimizer_step():
+    torch.manual_seed(19)
+    cfg = _tiny_config()
+    cfg.output_logit_scale = 2.3
+    cfg.output_logit_scale_trainable = False
+    with torch.device("meta"):
+        model = cfg.build()
+    model.to_empty(device="cpu")
+    model.init_weights(buffer_device=torch.device("cpu"))
+    head = model.output
+    assert not head.logit_scale.requires_grad
+    assert head.logit_scale.exp().item() == pytest.approx(cfg.output_logit_scale)
+    assert "output.logit_scale" in model.state_dict()
+
+    config = _test_config()
+    kwargs = create_disco_optimizer_kwargs_from_optimizer_config(
+        config.optimizer, _LocalParallelDims()
+    )
+    with patch("torch.distributed.get_rank", return_value=0):
+        groups, _ = create_disco_param_groups(model, kwargs)
+    assert all(head.logit_scale is not p for group in groups for p in group["params"])
+
+    inputs = torch.randn(2, 3, cfg.dim, requires_grad=True)
+    expected = torch.nn.functional.linear(
+        torch.nn.functional.normalize(inputs, dim=-1, eps=1e-30),
+        torch.nn.functional.normalize(head.weight, dim=-1, eps=1e-30),
+    ) * cfg.output_logit_scale
+    logits = head(inputs)
+    torch.testing.assert_close(logits, expected)
+    original_weight = head.weight.detach().clone()
+    original_scale = head.logit_scale.detach().clone()
+    optimizer = torch.optim.AdamW(head.parameters(), lr=0.01, weight_decay=0.1)
+    logits.square().mean().backward()
+    assert head.logit_scale.grad is None
+    assert torch.isfinite(inputs.grad).all() and inputs.grad.norm() > 0
+    optimizer.step()
+    torch.testing.assert_close(head.logit_scale, original_scale, rtol=0, atol=0)
+    assert not torch.equal(head.weight, original_weight)
+
+
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
 @pytest.mark.parametrize("enable_amp", [False, True])
 def test_fullgraph_cpu_model_matches_eager_forward_and_backward(

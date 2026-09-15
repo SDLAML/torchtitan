@@ -504,6 +504,7 @@ moe_opt_moe_configs = {
         dim=256,
         normalized_output=True,
         output_logit_scale=1.0,
+        output_logit_scale_trainable=True,
         layer=OPTMoETransformerBlock.Config(
             n_dense_layers=1,
             depth_init="none",

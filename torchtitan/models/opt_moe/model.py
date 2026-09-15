@@ -248,6 +248,8 @@ class OPTMoEModel(Decoder):
         final_out_init_std: float = 1.0
         normalized_output: bool = False
         output_logit_scale: float = 1.0
+        # With normalized_output, False keeps the scale fixed during training.
+        output_logit_scale_trainable: bool = True
 
         # --- Flexible per-layer attention configuration ---
 
@@ -377,6 +379,7 @@ class OPTMoEModel(Decoder):
                 config.dim,
                 config.vocab_size,
                 initial_logit_scale=config.output_logit_scale,
+                logit_scale_trainable=config.output_logit_scale_trainable,
             )
 
         n_layers = config.n_layers
