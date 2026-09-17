@@ -66,8 +66,8 @@ def _test_config():
     return config
 
 
-def _tiny_config():
-    cfg = copy.deepcopy(moe_opt_moe_configs["synth-proxy-1layer-polar-si"])
+def _tiny_config(flavor="synth-proxy-1layer-polar-si"):
+    cfg = copy.deepcopy(moe_opt_moe_configs[flavor])
     cfg.dim = 8
     cfg.vocab_size = 16
     cfg.layer.feed_forward.hidden_dim = 8
@@ -230,6 +230,80 @@ def test_meta_initialization_and_existing_flavor_are_unchanged():
     assert not old.layer.feed_forward.polar_weights
     assert not old.layer.attention.polar_weights
     assert not old.normalized_output
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "n_layers,rope_pattern", [(1, None), (3, None), (3, "RNR")]
+)
+def test_minimal_norm_residual_model_preserves_scale_invariance(
+    dtype, n_layers, rope_pattern
+):
+    torch.manual_seed(20)
+    cfg = _tiny_config("s-1layer-residual-learnable-logit-minimal-norm")
+    cfg.n_layers = n_layers
+    cfg.layer.n_dense_layers = n_layers
+    cfg.rope_pattern = rope_pattern
+    with torch.device("meta"):
+        model = cfg.build()
+    model.to_empty(device="cpu")
+    model.to(dtype)
+    model.init_weights(buffer_device=torch.device("cpu"))
+
+    # The first attention input also feeds the residual, normalizing embeddings.
+    assert [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, (torch.nn.RMSNorm, torch.nn.LayerNorm))
+    ] == ["layers.0.attention_norm"]
+    assert isinstance(model.output, CosineLinear)
+    assert sum(isinstance(m, PolarLinear) for m in model.modules()) == 7 * n_layers
+
+    tokens = torch.arange(16).reshape(2, 8)
+    labels = torch.roll(tokens, 1, dims=1)
+    expected, _ = model(tokens)
+    tolerance = 2e-6 if dtype == torch.float32 else 1e-10
+    # Check each weight independently, including per-token embedding/output rows.
+    for name, weight in model.named_parameters():
+        if weight.ndim != 2:
+            continue
+        original = weight.detach().clone()
+        with torch.no_grad():
+            if name in ("tok_embeddings.weight", "output.weight"):
+                weight.mul_(torch.linspace(0.5, 2.0, weight.shape[0]).unsqueeze(1))
+            else:
+                weight.mul_(2.0)
+        actual, _ = model(tokens)
+        torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+        with torch.no_grad():
+            weight.copy_(original)
+
+    logits, _ = model(tokens)
+    torch.nn.functional.cross_entropy(
+        logits.flatten(0, 1), labels.flatten()
+    ).backward()
+    for module in model.modules():
+        if isinstance(module, PolarLinear):
+            assert module.weight.grad.norm() > 0
+            assert abs(_spectral_radiality(module.weight, module.weight.grad)) < tolerance
+    for weight in (model.tok_embeddings.weight, model.output.weight):
+        gradient = weight.grad
+        radiality = (weight * gradient).sum(dim=1)
+        radiality /= (weight.norm(dim=1) * gradient.norm(dim=1)).clamp_min(1e-30)
+        assert radiality.abs().max() < tolerance
+    assert torch.isfinite(model.output.logit_scale.grad)
+    assert model.output.logit_scale.grad.abs() > 0
+
+
+def test_default_attention_input_norm_is_kept_in_every_layer():
+    cfg = _tiny_config("s-1layer-residual-learnable-logit")
+    cfg.n_layers = cfg.layer.n_dense_layers = 3
+    with torch.device("meta"):
+        model = cfg.build()
+    assert all(
+        isinstance(layer.attention_norm, torch.nn.RMSNorm)
+        for layer in model.layers.values()
+    )
 
 
 def test_fixed_output_scale_initialization_and_optimizer_step():

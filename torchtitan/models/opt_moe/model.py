@@ -98,13 +98,24 @@ class OPTMoETransformerBlock(TransformerBlock):
         residual_scale: str = "identity"
         norm_eps: float = 1e-30
         norm_type: str = "np_rmsnorm"
+        # Normalize embeddings once; later blocks can use the raw residual stream.
+        attention_norm_first_layer_only: bool = False
+        ffn_norm: bool = True
 
     def __init__(self, config: Config, *, layer_id: int, dim: int, n_layers: int):
         super().__init__()
         self.layer_id = layer_id
         self.attention = config.attention.build(dim=dim)
-        self.attention_norm = build_norm(config.norm_type, dim=dim, eps=config.norm_eps)
-        self.ffn_norm = build_norm(config.norm_type, dim=dim, eps=config.norm_eps)
+        self.attention_norm = (
+            build_norm(config.norm_type, dim=dim, eps=config.norm_eps)
+            if not config.attention_norm_first_layer_only or layer_id == 0
+            else nn.Identity()
+        )
+        self.ffn_norm = (
+            build_norm(config.norm_type, dim=dim, eps=config.norm_eps)
+            if config.ffn_norm
+            else nn.Identity()
+        )
 
         # Per-layer attention-mode flags (derived from the per-layer attention config).
         assert isinstance(config.attention, GatedNormSWAttention.Config)
@@ -207,7 +218,8 @@ class OPTMoETransformerBlock(TransformerBlock):
 
     def init_weights(self, skip_init: bool = False):
         for norm in (self.attention_norm, self.ffn_norm):
-            norm.reset_parameters()
+            if not isinstance(norm, nn.Identity):
+                norm.reset_parameters()
         self.attention.init_weights(
             residual_div=self.residual_div_attn,
             skip_init=skip_init,
@@ -240,6 +252,7 @@ class OPTMoEModel(Decoder):
 
         norm_eps: float = 1e-30
         norm_type: str = "np_rmsnorm"
+        final_norm: bool = True
 
         first_in_init_fn_type: str = "scion_normal_input"
         first_in_init_std: float = 1.0
@@ -373,7 +386,11 @@ class OPTMoEModel(Decoder):
 
     def __init__(self, config: Config):
         super().__init__(config)
-        self.norm = build_norm(config.norm_type, dim=config.dim, eps=config.norm_eps)
+        self.norm = (
+            build_norm(config.norm_type, dim=config.dim, eps=config.norm_eps)
+            if config.final_norm
+            else nn.Identity()
+        )
         if config.normalized_output:
             self.output = CosineLinear(
                 config.dim,
@@ -510,7 +527,7 @@ class OPTMoEModel(Decoder):
         We always init/reset the norm parameters, because its cheap.
         Then we pass the skip_init flag to the layer init_weights to skip the weight initialization.
         """
-        if self.norm is not None:
+        if self.norm is not None and not isinstance(self.norm, nn.Identity):
             self.norm.reset_parameters()
 
         skip_init = kwargs.get("skip_init", False)
