@@ -2238,7 +2238,7 @@ class DiSCO(AbstractDiSCO):
             self.step_embedding(
                 self.embed_params, self.embed_param_names, embed_workspace
             )
-            # dist.barrier()
+            dist.barrier()
 
         # Expert LMO launches are coordinated inside step_experts.
         if self.expert_params:

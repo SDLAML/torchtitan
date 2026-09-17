@@ -118,12 +118,12 @@ class GroupedExperts(nn.Module):
         self.act_fn = build_activation(activation_type)
 
         if norm_everywhere:
-            assert (
-                norm_type is not None
-            ), "`norm_type` needs to be passed when `norm_everywhere=True`"
-            assert (
-                norm_eps is not None
-            ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            assert norm_type is not None, (
+                "`norm_type` needs to be passed when `norm_everywhere=True`"
+            )
+            assert norm_eps is not None, (
+                "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            )
             self.mid_norm = build_norm(norm_type, dim=hidden_dim, eps=norm_eps)
         else:
             self.mid_norm = nn.Identity()

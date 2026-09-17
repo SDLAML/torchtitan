@@ -792,7 +792,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             # token count. Count from the actual CPU microbatches to avoid any
             # communication while staying robust to shape drift.
             local_valid_tokens = 0
-            
+
             for _microbatch in range(self.gradient_accumulation_steps):
                 input_dict, labels = next(data_iterator)
                 local_valid_tokens += labels.numel()
@@ -839,7 +839,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
         fwd_bwd_start = time.perf_counter()
-        for input_dict, labels in microbatches:
+        for fwd_bwd_index, (input_dict, labels) in enumerate(microbatches):
+            # HSDP replicate all-reduce is a no-op until the last accumulation
+            # group: reduce-scatter still runs every microbatch and accumulates
+            # into the sharded grad buffer, so deferring the cross-replica sum
+            # to the final microbatch yields identical gradients while doing
+            # (accum - 1) fewer all-reduces over the replicate dimension.
+            # if (
+            #     getattr(self.parallel_dims, "dp_replicate_enabled", False)
+            #     and self.gradient_accumulation_steps > 1
+            # ):
+            #     is_last = fwd_bwd_index == self.gradient_accumulation_steps - 1
+            #     for part in self.model_parts:
+            #         part.set_requires_all_reduce(  # pyrefly: ignore[not-callable]
+            #             is_last
+            #         )
+
             # Move tensors to GPU
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):

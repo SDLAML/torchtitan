@@ -284,6 +284,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
                 # all_norms.update(
                 #     naive_param_norm.get_parameter_norms([model_part], [optimizer])
                 # )
+        dist.barrier()
         return all_norms
 
     def get_lrs(self):

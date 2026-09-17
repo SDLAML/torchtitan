@@ -7,6 +7,7 @@
 # This file applies the PT-D parallelisms (except pipeline parallelism) and various
 # training techniques (e.g. activation checkpointing and compile) to the Llama model.
 
+import os
 from collections.abc import Callable
 
 import torch
@@ -243,6 +244,21 @@ def parallelize_opt_moe(
             edp_mesh=edp_mesh,
             gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor,
         )
+
+        # PyTorch >= 2.13: give reduce-scatter its own process group so it can
+        # overlap with all-gather instead of serializing on the shared NCCL
+        # communicator. This is a collective call (it runs dist.new_group
+        # internally), so the gate must evaluate identically on every rank.
+        if os.environ.get("TT_SEPARATE_RS", "0") == "1":
+            model.set_separate_reduce_scatter_group(enable=True)
+            logger.info("Enabled separate reduce-scatter process group (FSDP2)")
+
+        # Symmetric-memory staging buffers for FSDP comms. force_sum is required
+        # because NCCL only supports zero-copy transfers for sum-type reductions;
+        # it is numerically a no-op here since gradient_divide_factor is 1.0.
+        if os.environ.get("TT_SYMM_MEM", "0") == "1":
+            enable_fsdp_symm_mem(model)
+            logger.info("Enabled FSDP symmetric-memory comms (force_sum + symm_mem)")
 
         if parallel_dims.dp_replicate_enabled:
             logger.info("Applied HSDP to the model")
@@ -666,3 +682,15 @@ class PrepareMidNormInputOutput(torch.distributed.tensor.parallel.ParallelStyle)
             lambda m, i, o: self._prep_out(o, mesh)
         )
         return module
+
+
+def enable_fsdp_symm_mem(model: nn.Module) -> None:
+    """
+    Enable symmetric-memory communication optimizations for all FSDP modules.
+    """
+    from torch.distributed.fsdp import FSDPModule
+
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.set_force_sum_reduction_for_comms(True)
+            module.set_symm_mem_for_comm()
