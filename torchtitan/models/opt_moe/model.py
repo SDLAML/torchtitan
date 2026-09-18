@@ -98,6 +98,7 @@ class OPTMoETransformerBlock(TransformerBlock):
         residual_scale: str = "identity"
         norm_eps: float = 1e-30
         norm_type: str = "np_rmsnorm"
+        attention_norm: bool = True
         # Normalize embeddings once; later blocks can use the raw residual stream.
         attention_norm_first_layer_only: bool = False
         ffn_norm: bool = True
@@ -108,7 +109,8 @@ class OPTMoETransformerBlock(TransformerBlock):
         self.attention = config.attention.build(dim=dim)
         self.attention_norm = (
             build_norm(config.norm_type, dim=dim, eps=config.norm_eps)
-            if not config.attention_norm_first_layer_only or layer_id == 0
+            if config.attention_norm
+            and (not config.attention_norm_first_layer_only or layer_id == 0)
             else nn.Identity()
         )
         self.ffn_norm = (
