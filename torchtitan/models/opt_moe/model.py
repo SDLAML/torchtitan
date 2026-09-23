@@ -101,11 +101,14 @@ class OPTMoETransformerBlock(TransformerBlock):
         attention_norm: bool = True
         # Normalize embeddings once; later blocks can use the raw residual stream.
         attention_norm_first_layer_only: bool = False
+        # Use the normalized attention input for the first layer's residual.
+        normalize_first_layer_residual: bool = False
         ffn_norm: bool = True
 
     def __init__(self, config: Config, *, layer_id: int, dim: int, n_layers: int):
         super().__init__()
         self.layer_id = layer_id
+        self.normalize_first_layer_residual = config.normalize_first_layer_residual
         self.attention = config.attention.build(dim=dim)
         self.attention_norm = (
             build_norm(config.norm_type, dim=dim, eps=config.norm_eps)
@@ -203,7 +206,7 @@ class OPTMoETransformerBlock(TransformerBlock):
 
         x_norm = self.attention_norm(x)
         residual = x
-        if self.layer_id == 0 and self.attention.config.polar_weights:
+        if self.layer_id == 0 and self.normalize_first_layer_residual:
             residual = x_norm
 
         h = self.identity_scale * residual + self.block_scale * self.attention(
