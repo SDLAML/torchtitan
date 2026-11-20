@@ -470,6 +470,15 @@ class OptMoeModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
+        if (
+            getattr(config, "polar_weights", False)
+            or not all(getattr(config, "ffn_norm_layers", None) or ())
+            or getattr(config, "hidden_act", "silu") != "silu"
+            or getattr(config, "output_logit_scale", None) is not None
+        ):
+            raise ValueError(
+                "Use the Hugging Face model for the OPT MoE symmetry-study architecture"
+            )
         cache_config, quant_config = vllm_config.cache_config, vllm_config.quant_config
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(

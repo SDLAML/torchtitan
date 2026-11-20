@@ -62,6 +62,42 @@ not TP-invariant: under FSDP x TP the random-normal inits of TP-sharded weights
 other values than without TP (orthogonal, conv and expert inits draw the full
 matrix); start TP vs no-TP comparisons from one seed checkpoint.
 
+## Symmetry studies
+
+The `s-1layer` flavor and its variants use a square ReGLU FFN without an
+input norm. Query/key normalization is off by default. Select a flavor with
+`build_model_config` in a training recipe.
+
+```python
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.opt_moe import build_model_config
+
+parallelism = ParallelismConfig(data_parallel_shard_degree=1)
+model = build_model_config(
+    "s-1layer",
+    parallelism=parallelism,
+)
+```
+
+`s-1layer` normalizes each token embedding for attention and its residual,
+uses the polar factors of all seven hidden matrices, and applies a cosine
+output head with fixed scale 32.
+
+| Flavor | Normalized attention input and residual | Polar hidden weights | Output head |
+| --- | --- | --- | --- |
+| `s-1layer` | Yes | Yes | Cosine, scale 32 |
+| `s-1layer-logit-scale-256` | Yes | Yes | Cosine, scale 256 |
+| `s-1layer-broken-input` | No | Yes | Cosine, scale 32 |
+| `s-1layer-broken-hidden` | Yes | No | Cosine, scale 32 |
+| `s-1layer-broken-input-hidden` | No | No | Cosine, scale 32 |
+| `s-1layer-broken-input-output` | No | Yes | RMSNorm and linear |
+| `s-1layer-broken-all` | No | No | RMSNorm and linear |
+
+Use `output_logit_scale_trainable=True` to learn the scale of a cosine head.
+Polar models support a single device or replicated data parallelism. The
+packed-token loader supplies document boundaries to FlexAttention. The
+attention head and RoPE dimensions default to 64.
+
 ## Building a model
 
 `build_model_config(flavor, *, parallelism, seq_len, rope_length, **overrides)`

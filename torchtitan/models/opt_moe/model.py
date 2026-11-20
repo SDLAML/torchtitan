@@ -93,6 +93,7 @@ class OPTMoETransformerBlock(TransformerBlock):
 
     @dataclass(kw_only=True, slots=True)
     class Config(TransformerBlock.Config):
+        normalized_attention_residual: bool = False
         block_scale: float = 1.0
         identity_scale: float = 1.0
         """The residual scales: ``x = identity_scale * x + block_scale * f(x)``
@@ -104,6 +105,7 @@ class OPTMoETransformerBlock(TransformerBlock):
         self.attention_norm = config.attention_norm.build()
         self.ffn_norm = config.ffn_norm.build()
         self.feed_forward = config.feed_forward.build()
+        self.normalized_attention_residual = config.normalized_attention_residual
         self.block_scale = config.block_scale
         self.identity_scale = config.identity_scale
         # A unit scale is not multiplied (x * 1.0 == x). Block side: two [T, D]
@@ -130,15 +132,21 @@ class OPTMoETransformerBlock(TransformerBlock):
         document offsets; ``padding_mask`` (True: not counted): upstream's
         padding mask, the tokens the MoE leaves out of its balance statistics;
         ``routed_experts_TK``: routing replay (RL), see ``TokenChoiceTopKRouter``."""
+        attn_input_normalised = self.attention_norm(x)
         _attn_out = self.attention(
-            self.attention_norm(x),
+            attn_input_normalised,
             attention_metadata,
             positions,
             conv_metadata=conv_metadata,
         )
         # The residual add reads the attention output with bare ops.
         remat.recompute_needs_tensor(_attn_out)
-        lhs = x if self._skip_identity_mul else self.identity_scale * x
+        residual_TD = attn_input_normalised if self.normalized_attention_residual else x
+        lhs = (
+            residual_TD
+            if self._skip_identity_mul
+            else self.identity_scale * residual_TD
+        )
         rhs = _attn_out if self._skip_block_mul else self.block_scale * _attn_out
         h = lhs + rhs
         h_normed = self.ffn_norm(h)
@@ -282,6 +290,14 @@ class OPTMoEModel(Decoder):
         ``parallelize`` that walk ``layers`` (activation remat, FSDP wrapping
         and prefetch), the MTP blocks are listed there after the decoder
         blocks, as decoder blocks, until ``parallelize`` returns."""
+        from .polar import PolarLinear
+
+        if parallelism_context.fsdp_enabled and any(
+            isinstance(m, PolarLinear) for m in self.modules()
+        ):
+            raise ValueError(
+                "Polar weights require single-device or replicated data parallelism"
+            )
         super()._parallelize(parallelism_context)
         for i, block in enumerate(self.mtp_layers or ()):
             key = str(len(self.config.layers) + i)

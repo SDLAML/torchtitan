@@ -151,7 +151,7 @@ def _write_hf_files(
     if OptMoeConfig.from_pretrained(output_dir).to_dict() != config.to_dict():
         raise RuntimeError(f"{output_dir}/config.json does not read back as written")
     hf_dir = Path(hf_files.__file__).parent
-    for name in ("configuration_opt_moe.py", "modeling_opt_moe.py"):
+    for name in ("configuration_opt_moe.py", "modeling_opt_moe.py", "polar.py"):
         shutil.copy(hf_dir / name, output_dir / name)
     for name in _TOKENIZER_FILES:
         if (hf_assets_path / name).is_file():

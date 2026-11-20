@@ -85,6 +85,13 @@ class OptMoeConfig(PretrainedConfig):
         num_nextn_predict_layers: int = 0,
         hidden_act: str = "silu",
         use_cache: bool = True,
+        attention_norm_layers: list[bool] | None = None,
+        ffn_norm_layers: list[bool] | None = None,
+        normalized_residual_layers: list[bool] | None = None,
+        final_norm: bool = True,
+        polar_weights: bool = False,
+        output_logit_scale: float | None = None,
+        output_logit_scale_trainable: bool = False,
         **kwargs: Any,
     ):
         self.vocab_size = vocab_size
@@ -123,6 +130,15 @@ class OptMoeConfig(PretrainedConfig):
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.hidden_act = hidden_act
         self.use_cache = use_cache
+        self.attention_norm_layers = attention_norm_layers or [True] * num_hidden_layers
+        self.ffn_norm_layers = ffn_norm_layers or [True] * num_hidden_layers
+        self.normalized_residual_layers = (
+            normalized_residual_layers or [False] * num_hidden_layers
+        )
+        self.final_norm = final_norm
+        self.polar_weights = polar_weights
+        self.output_logit_scale = output_logit_scale
+        self.output_logit_scale_trainable = output_logit_scale_trainable
         # with a conv: the conv layers are hybrid, the others may have none
         allowed = _CONV_LAYER_TYPES | _LAYER_TYPES if conv_kernel_size else _LAYER_TYPES
         if not set(self.layer_types) <= allowed:
@@ -141,11 +157,18 @@ class OptMoeConfig(PretrainedConfig):
             t in ("sliding_attention", "hybrid_sliding") for t in self.layer_types
         ):
             raise ValueError("sliding-window layers need sliding_window")
-        if hidden_act != "silu":
-            raise ValueError(f"hidden_act {hidden_act!r}: the FFNs are SwiGLU ('silu')")
+        if hidden_act not in ("silu", "relu") or (
+            hidden_act == "relu" and first_k_dense_replace != num_hidden_layers
+        ):
+            raise ValueError(
+                "ReGLU requires all-dense layers; supported activations are silu and relu"
+            )
         for name in (
             "layer_types",
             "rope_layers",
+            "attention_norm_layers",
+            "ffn_norm_layers",
+            "normalized_residual_layers",
             "residual_block_scales",
             "residual_identity_scales",
         ):

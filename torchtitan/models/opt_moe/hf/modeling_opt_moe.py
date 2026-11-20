@@ -22,6 +22,7 @@ Tensor suffixes: ``B`` rows, ``T`` tokens, ``S`` cached + new tokens, ``D``
 model dim, ``H`` heads, ``G`` KV heads, ``K`` head dim, ``C`` conv channels,
 ``E`` experts, ``F`` FFN dim, ``N`` routed (token, expert) pairs."""
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -46,6 +47,7 @@ from transformers.modeling_outputs import (
 )
 
 from .configuration_opt_moe import OptMoeConfig
+from .polar import cosine_linear, square_polar
 
 # torchtitan's FlexInnerAttention compile (models/common/attention/attention.py).
 _FLEX_OPTIONS = {
@@ -190,6 +192,7 @@ class OptMoeAttention(nn.Module):
         self.k_proj = nn.Linear(d, kv * k, bias=False)
         self.v_proj = nn.Linear(d, kv * k, bias=False)
         self.o_proj = nn.Linear(h * k, d, bias=False)
+        self.polar_weights = config.polar_weights
         self.q_norm = _rms_norm(config, k) if config.qk_norm else None
         self.k_norm = _rms_norm(config, k) if config.qk_norm else None
         self.gate_proj = (
@@ -218,6 +221,11 @@ class OptMoeAttention(nn.Module):
         """torchtitan's ``wqkv``: per KV group, its q heads, then k, then v."""
         kv, k = self.n_kv_heads, self.head_dim
         d = self.q_proj.weight.shape[1]
+        if self.polar_weights:
+            qkv = square_polar(
+                torch.stack([p.weight for p in (self.q_proj, self.k_proj, self.v_proj)])
+            )
+            return qkv.view(3, kv, k, d).transpose(0, 1).reshape(-1, d)
         return torch.cat(
             [
                 self.q_proj.weight.view(kv, -1, d),
@@ -252,6 +260,8 @@ class OptMoeAttention(nn.Module):
         out_TF = out_THK.contiguous().reshape(*lead, -1)
         if gate is not None:
             out_TF = (out_TF.float() * torch.sigmoid(gate.float())).to(out_TF.dtype)
+        if self.polar_weights:
+            return F.linear(out_TF, square_polar(self.o_proj.weight))
         return self.o_proj(out_TF)
 
     def _conv(self, x_THK, conv, rows, state_idx):
@@ -322,17 +332,27 @@ class OptMoeAttention(nn.Module):
 class OptMoeMLP(nn.Module):
     """SwiGLU; gate and up as one GEMM (torchtitan's ``w13``)."""
 
-    def __init__(self, hidden_size: int, intermediate_size: int):
+    def __init__(self, hidden_size: int, intermediate_size: int, config: OptMoeConfig):
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.polar_weights = config.polar_weights
+        self.activation = F.relu if config.hidden_act == "relu" else F.silu
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x_TD):
-        w13 = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
+        if self.polar_weights:
+            w13 = square_polar(
+                torch.stack([self.gate_proj.weight, self.up_proj.weight])
+            ).flatten(0, 1)
+        else:
+            w13 = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
         gate_up = F.linear(x_TD, w13).unflatten(-1, (2, -1))
         gate, up = gate_up.unbind(-2)
-        return self.down_proj(F.silu(gate) * up)
+        hidden_TF = self.activation(gate) * up
+        if self.polar_weights:
+            return F.linear(hidden_TF, square_polar(self.down_proj.weight))
+        return self.down_proj(hidden_TF)
 
 
 class OptMoeRouter(nn.Module):
@@ -377,7 +397,9 @@ class OptMoeSparseMoe(nn.Module):
         self.gate = OptMoeRouter(config)
         self.experts = OptMoeExperts(config)
         self.shared_experts = (
-            OptMoeMLP(config.hidden_size, config.shared_expert_intermediate_size)
+            OptMoeMLP(
+                config.hidden_size, config.shared_expert_intermediate_size, config
+            )
             if config.shared_expert_intermediate_size
             else None
         )
@@ -450,10 +472,17 @@ class OptMoeDecoderLayer(nn.Module):
         super().__init__()
         d = config.hidden_size
         self.self_attn = OptMoeAttention(config, layer_idx)
-        self.input_layernorm = _rms_norm(config, d)
-        self.post_attention_layernorm = _rms_norm(config, d)
+        self.normalized_residual = config.normalized_residual_layers[layer_idx]
+        self.input_layernorm = (
+            _rms_norm(config, d)
+            if config.attention_norm_layers[layer_idx]
+            else nn.Identity()
+        )
+        self.post_attention_layernorm = (
+            _rms_norm(config, d) if config.ffn_norm_layers[layer_idx] else nn.Identity()
+        )
         self.mlp = (
-            OptMoeMLP(d, config.intermediate_size)
+            OptMoeMLP(d, config.intermediate_size, config)
             if layer_idx < config.first_k_dense_replace
             else OptMoeSparseMoe(config)
         )
@@ -466,8 +495,9 @@ class OptMoeDecoderLayer(nn.Module):
         return lhs + rhs
 
     def forward(self, x_TD, rows):
-        attn = self.self_attn(self.input_layernorm(x_TD), rows)
-        h = self._residual(x_TD, attn)
+        input_TD = self.input_layernorm(x_TD)
+        attn = self.self_attn(input_TD, rows)
+        h = self._residual(input_TD if self.normalized_residual else x_TD, attn)
         return self._residual(h, self.mlp(self.post_attention_layernorm(h)))
 
 
@@ -500,7 +530,10 @@ class OptMoePreTrainedModel(PreTrainedModel):
     def _init_weights(self, module: nn.Module) -> None:
         """Fills fresh tensors only: the weights come from a checkpoint."""
         for p in module.parameters(recurse=False):
-            nn.init.normal_(p, std=0.02)
+            if isinstance(module, _CosineHead) and p is module.logit_scale:
+                nn.init.constant_(p, math.log(self.config.output_logit_scale))
+            else:
+                nn.init.normal_(p, std=0.02)
 
 
 class OptMoeModel(OptMoePreTrainedModel):
@@ -515,7 +548,11 @@ class OptMoeModel(OptMoePreTrainedModel):
                 for i in range(config.num_nextn_predict_layers)
             ]
         )
-        self.norm = _rms_norm(config, config.hidden_size)
+        self.norm = (
+            _rms_norm(config, config.hidden_size)
+            if config.final_norm
+            else nn.Identity()
+        )
         self.post_init()
 
     def packed_forward(
@@ -604,13 +641,31 @@ class OptMoeModel(OptMoePreTrainedModel):
         )
 
 
+class _CosineHead(nn.Linear):
+    def __init__(self, config: OptMoeConfig):
+        super().__init__(config.hidden_size, config.vocab_size, bias=False)
+        scale = torch.tensor([math.log(config.output_logit_scale)], dtype=torch.float32)
+        if config.output_logit_scale_trainable:
+            self.logit_scale = nn.Parameter(scale)
+        else:
+            self.register_buffer("logit_scale", scale)
+
+    def forward(self, input):
+        return cosine_linear(input, self.weight, self.logit_scale)
+
+
 class OptMoeForCausalLM(OptMoePreTrainedModel, GenerationMixin):
+    _keep_in_fp32_modules_strict = ["logit_scale"]
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: OptMoeConfig):
         super().__init__(config)
         self.model = OptMoeModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = (
+            nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            if config.output_logit_scale is None
+            else _CosineHead(config)
+        )
         self.post_init()
 
     def forward(

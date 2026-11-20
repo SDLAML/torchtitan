@@ -19,12 +19,16 @@ from typing import Any
 from torchtitan.models.base.state_dict_adapter import StateDictAdapter
 from torchtitan.models.common.activation import Sigmoid, Softmax, SqrtSoftplus
 from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.nn_modules import RMSNorm
+
+from .polar import CosineLinear, PolarLinear, ReGLU
 
 # Native key (fused projections split) -> HF key; `{}` is the layer index.
 _TO_HF = {
     "tok_embeddings.weight": "model.embed_tokens.weight",
     "norm.weight": "model.norm.weight",
     "lm_head.weight": "lm_head.weight",
+    "lm_head.logit_scale": "lm_head.logit_scale",
     "layers.{}.attention_norm.weight": "model.layers.{}.input_layernorm.weight",
     "layers.{}.ffn_norm.weight": "model.layers.{}.post_attention_layernorm.weight",
     "layers.{}.attention.qkv_linear.wq.weight": "model.layers.{}.self_attn.q_proj.weight",
@@ -127,6 +131,12 @@ def hf_config(model_config: Any) -> dict[str, Any]:
             raise NotImplementedError(f"hf_config: RoPE scaling {r.scaling!r}")
         return {"dim": r.dim, "theta": r.theta}
 
+    norm = model_config.norm
+    if not isinstance(norm, RMSNorm.Config):
+        norm = next(
+            (cfg for _, cfg, _, _ in model_config.traverse(RMSNorm.Config)), None
+        )
+    cosine = isinstance(model_config.lm_head, CosineLinear.Config)
     convs = [l.attention.k_conv for l in layers]
     conv = next((c for c in convs if c is not None), None)
     return {
@@ -141,8 +151,21 @@ def hf_config(model_config: Any) -> dict[str, Any]:
         "num_hidden_layers": len(layers),
         "max_position_embeddings": model_config.max_context_length,
         "tie_word_embeddings": model_config.enable_weight_tying,
-        "rms_norm_eps": model_config.norm.eps,
-        "norm_has_weight": model_config.norm.elementwise_affine,
+        "rms_norm_eps": norm.eps if norm is not None else 1e-30,
+        "norm_has_weight": norm.elementwise_affine if norm is not None else False,
+        "attention_norm_layers": [
+            isinstance(l.attention_norm, RMSNorm.Config) for l in layers
+        ],
+        "ffn_norm_layers": [isinstance(l.ffn_norm, RMSNorm.Config) for l in layers],
+        "normalized_residual_layers": [l.normalized_attention_residual for l in layers],
+        "final_norm": isinstance(model_config.norm, RMSNorm.Config),
+        "polar_weights": isinstance(attn.wo, PolarLinear.Config),
+        "output_logit_scale": (
+            model_config.lm_head.initial_logit_scale if cosine else None
+        ),
+        "output_logit_scale_trainable": (
+            model_config.lm_head.logit_scale_trainable if cosine else False
+        ),
         "num_attention_heads": attn.n_heads,
         "num_key_value_heads": attn.n_kv_heads,
         "head_dim": qkv.head_dim,
@@ -178,13 +201,17 @@ def hf_config(model_config: Any) -> dict[str, Any]:
         "residual_block_scales": [l.block_scale for l in layers],
         "residual_identity_scales": [l.identity_scale for l in layers],
         "num_nextn_predict_layers": len(model_config.mtp_layers),
-        "hidden_act": "silu",
+        "hidden_act": (
+            "relu"
+            if dense and isinstance(dense[0].activation_fn, ReGLU.Config)
+            else "silu"
+        ),
     }
 
 
 class OPTMoEStateDictAdapter(StateDictAdapter):
     # HF tensors the model computes with in fp32 whatever the export dtype.
-    keep_in_fp32 = ("e_score_correction_bias",)
+    keep_in_fp32 = ("e_score_correction_bias", "logit_scale")
 
     def _qkv_args(self) -> dict[str, int]:
         attn = self.model_config.layers[0].attention

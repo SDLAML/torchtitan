@@ -28,6 +28,7 @@ import functools
 from collections.abc import Callable
 from typing import Any, Literal
 
+import spmd_types as spmd
 from torch import nn
 
 from torchtitan.config.parallelism import ParallelismConfig
@@ -51,6 +52,7 @@ from torchtitan.models.common.config_utils import (
     make_shared_expert_down_proj_config,
 )
 from torchtitan.models.common.decoder_sharding import (
+    dense_param_placement,
     feed_forward_sharding_config,
     lm_head_sharding_config,
     norm_sharding_config,
@@ -85,7 +87,7 @@ from torchtitan.models.common.moe.sharding import (
     shared_experts_sharding_config,
 )
 from torchtitan.models.common.moe.token_dispatcher import AllToAllTokenDispatcher
-from torchtitan.models.common.nn_modules import Conv1d, RMSNorm
+from torchtitan.models.common.nn_modules import Conv1d, Identity, RMSNorm
 from torchtitan.models.common.rope import CosSinRoPE, RoPE
 from .deepgemm_experts import DEEPGEMM_ALIGN, DeepGEMMGroupedLinear
 
@@ -104,6 +106,7 @@ from .param_init import (
     setup_depth_init,
     setup_residual_scale,
 )
+from .polar import CosineLinear, PolarLinear, ReGLU
 from .sharding import (
     attention_sharding_config,
     conv_weight_sharding_config,
@@ -907,8 +910,184 @@ def _production_moe_336m(**overrides: Any) -> OPTMoEModel.Config:
     )
 
 
+def _polar_projection(
+    linear: Linear.Config, *, qkv_head_dim: int | None = None
+) -> PolarLinear.Config:
+    layout = residual_activation_placement(enable_sp=False)
+    return PolarLinear.Config(
+        in_features=linear.in_features,
+        out_features=linear.out_features,
+        num_linears=linear.num_linears,
+        param_init=linear.param_init,
+        qkv_head_dim=qkv_head_dim,
+        sharding_config=ShardingConfig(
+            state_shardings={"weight": dense_param_placement(tp=spmd.I)},
+            in_src_shardings={"input": layout},
+            in_dst_shardings={"input": layout},
+            out_src_shardings=layout,
+            local_spmd=True,
+        ),
+    )
+
+
+def _symmetry(
+    *,
+    parallelism: ParallelismConfig,
+    dim: int = 256,
+    head_dim: int = 64,
+    n_layers: int = 1,
+    square_ffn: bool = False,
+    polar_weights: bool = False,
+    relu: bool = False,
+    attention_norm: Literal["all", "first", "none"] = "all",
+    normalize_first_layer_residual: bool = False,
+    final_norm: bool = True,
+    output_logit_scale: float | None = None,
+    output_logit_scale_trainable: bool = False,
+    **overrides: Any,
+) -> OPTMoEModel.Config:
+    """Build a dense model for studying input, hidden and output symmetries."""
+    if (
+        polar_weights
+        and max(
+            parallelism.data_parallel_shard_degree,
+            parallelism.tensor_parallel_degree,
+            parallelism.pipeline_parallel_degree,
+            parallelism.context_parallel_degree,
+            parallelism.expert_parallel_degree,
+        )
+        > 1
+    ):
+        raise ValueError(
+            "Polar weights require single-device or replicated data parallelism"
+        )
+    if attention_norm not in ("all", "first", "none"):
+        raise ValueError(f"Unknown attention norm placement {attention_norm!r}")
+    settings: dict[str, Any] = (
+        dict(
+            n_heads=dim // head_dim,
+            n_kv_heads=dim // head_dim,
+            qk_norm=False,
+            attn_backend="flex",
+            rope=dict(dim=head_dim, theta=10000.0),
+            n_dense_layers=n_layers,
+            dense_hidden_dim=dim if square_ffn else 4 * dim,
+            norm_type="np_rmsnorm",
+            norm_eps=1e-30,
+        )
+        | overrides
+    )
+    if settings["n_dense_layers"] != n_layers or settings.get("num_mtp_layers", 0):
+        raise ValueError("The symmetry studies require dense decoder layers")
+    model = _opt_moe_config(
+        dim=dim,
+        n_layers=n_layers,
+        head_dim=head_dim,
+        parallelism=parallelism,
+        **settings,
+    )
+    norm = model.norm
+    for i, block in enumerate(model.layers):
+        assert isinstance(block, OPTMoETransformerBlock.Config)
+        attn, ffn = block.attention, block.feed_forward
+        assert isinstance(attn, GatedSWAttention.Config)
+        assert isinstance(ffn, DenseFeedForward.Config)
+        if relu:
+            ffn.activation_fn = ReGLU.Config()
+        if polar_weights:
+            if (
+                attn.n_heads != attn.n_kv_heads
+                or attn.n_heads * head_dim != dim
+                or attn.gate_proj is not None
+            ):
+                raise ValueError(
+                    "Polar attention requires ungated, square Q, K and V projections"
+                )
+            attn.qkv_linear.wqkv = _polar_projection(
+                attn.qkv_linear.wqkv, qkv_head_dim=head_dim
+            )
+            attn.wo = _polar_projection(attn.wo)
+            ffn.w13 = _polar_projection(ffn.w13)
+            ffn.w2 = _polar_projection(ffn.w2)
+        block.ffn_norm = Identity.Config(sharding_config=block.ffn_norm.sharding_config)
+        if attention_norm == "none" or (attention_norm == "first" and i > 0):
+            block.attention_norm = Identity.Config(
+                sharding_config=block.attention_norm.sharding_config
+            )
+        block.normalized_attention_residual = i == 0 and normalize_first_layer_residual
+    if not final_norm:
+        model.norm = Identity.Config(  # pyrefly: ignore[bad-assignment]
+            sharding_config=norm.sharding_config
+        )
+    if output_logit_scale is not None:
+        head = model.lm_head
+        sharding = head.sharding_config
+        assert sharding is not None
+        model.lm_head = CosineLinear.Config(
+            in_features=head.in_features,
+            out_features=head.out_features,
+            initial_logit_scale=output_logit_scale,
+            logit_scale_trainable=output_logit_scale_trainable,
+            param_init=head.param_init,
+            preserve_dtype_params=("logit_scale",),
+            sharding_config=dataclasses.replace(
+                sharding,
+                local_spmd=True,
+                state_shardings=sharding.state_shardings
+                | {"logit_scale": dense_param_placement(tp=spmd.R)},
+            ),
+        )
+    return model
+
+
+_SYMMETRY_DEFAULTS: dict[str, Any] = dict(
+    square_ffn=True,
+    polar_weights=True,
+    relu=True,
+    depth_init="identity",
+    normalize_first_layer_residual=True,
+    attention_norm="first",
+    final_norm=False,
+    output_logit_scale=32.0,
+)
+
+_SYMMETRY_SETTINGS = {
+    "s-1layer": dict(_SYMMETRY_DEFAULTS),
+    "s-1layer-logit-scale-256": dict(_SYMMETRY_DEFAULTS, output_logit_scale=256.0),
+    "s-1layer-broken-input": dict(
+        _SYMMETRY_DEFAULTS, attention_norm="none", normalize_first_layer_residual=False
+    ),
+    "s-1layer-broken-hidden": dict(_SYMMETRY_DEFAULTS, polar_weights=False),
+    "s-1layer-broken-input-hidden": dict(
+        _SYMMETRY_DEFAULTS,
+        attention_norm="none",
+        normalize_first_layer_residual=False,
+        polar_weights=False,
+    ),
+    "s-1layer-broken-input-output": dict(
+        _SYMMETRY_DEFAULTS,
+        attention_norm="none",
+        normalize_first_layer_residual=False,
+        output_logit_scale=None,
+        final_norm=True,
+    ),
+    "s-1layer-broken-all": dict(
+        _SYMMETRY_DEFAULTS,
+        attention_norm="none",
+        normalize_first_layer_residual=False,
+        output_logit_scale=None,
+        final_norm=True,
+        polar_weights=False,
+    ),
+}
+
+
 # Each entry: the flavor's function and its default training context length.
 MODEL_FLAVORS: dict[str, tuple[Callable[..., OPTMoEModel.Config], int]] = {
+    **{
+        name: (functools.partial(_symmetry, **settings), 4096)
+        for name, settings in _SYMMETRY_SETTINGS.items()
+    },
     "mis-8b": (_mis_8b, 4096),
     "mis-8b-proxy": (_mis_8b_proxy, 4096),
     "mis-8b-proxy-qbalance": (
