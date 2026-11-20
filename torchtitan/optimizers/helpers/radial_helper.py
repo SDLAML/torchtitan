@@ -237,7 +237,8 @@ def _axis_aus_direct(A: torch.Tensor, B: torch.Tensor, dim: int) -> torch.Tensor
         *b.shape, *shape[b.ndim :]
     ).clamp_min(tiny)
     raw = torch.linalg.vector_norm(D, dim=dim).amax(-1)
-    return _guarded_radiality(raw, a, b)
+    # Each weight has its own direction whenever its norm is positive.
+    return torch.where((a > 0) & (b > 0), raw, torch.zeros_like(raw))
 
 
 def new_radial_state(

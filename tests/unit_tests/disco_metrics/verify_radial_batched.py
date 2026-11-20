@@ -185,6 +185,21 @@ for W, bn, sh in cases:
         f"{len(out)} keys",
     )
 
+identity = torch.eye(2, device=dev)
+rotated = 1e-7 * torch.tensor([[0.0, -1.0], [1.0, 0.0]], device=dev)
+zero = torch.zeros_like(identity)
+before = torch.stack((identity, rotated, identity, zero))
+after = torch.stack((rotated, identity, zero, identity))
+out = calculate_radial_metrics(
+    before, after, new_radial_state(before.device, shape=(4,)), batch_ndim=1
+)
+expected = torch.tensor([2**0.5, 2**0.5, 0.0, 0.0], device=dev)
+for name in ("aus_rms_to_inf", "aus_l1_to_rms"):
+    check(
+        f"{name} is symmetric across weight scales and zero for a zero weight",
+        torch.allclose(out[name], expected),
+    )
+
 print()
 if fails:
     print(f"FAILED {len(fails)}: {fails}")
